@@ -1,0 +1,19 @@
+.env
+.env.*
+!.env.example
+.data/
+node_modules/
+
+# 本地保留的旧版粉丝导出流程及其测试
+/scripts/backup/
+/test/export-followers.test.ts
+/test/export-retry.test.ts
+/test/find-blogger.test.ts
+
+# 本地生成文件
+.DS_Store
+*.log
+dist/
+coverage/
+*.tsbuildinfo
+

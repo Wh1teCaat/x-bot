@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>X 账号授权</title>
+  <style>
+    body{font:16px/1.6 system-ui,sans-serif;background:#f4f6f8;color:#17212b;margin:0}
+    main{max-width:560px;margin:10vh auto;padding:32px;background:white;border-radius:16px;box-shadow:0 10px 35px #17212b10}
+    h1{font-size:25px;margin:0 0 12px} p{color:#536170} button{background:#111;color:white;border:0;border-radius:24px;padding:11px 22px;font-weight:600;cursor:pointer}
+    ul{padding-left:22px} li{margin:8px 0} small{color:#66727e} @media(max-width:620px){main{margin:20px;padding:24px}}
+  </style>
+</head>
+<body><main>
+  <h1>授权 X 账号</h1>
+  <p>在 X 登录并确认授权，允许本地程序读取用户信息和管理关注关系。每个账号需要分别授权。</p>
+  <form method="post" action="/oauth/start"><button type="submit">前往 X 授权</button></form>
+  <h2>已授权账号</h2>
+  <ul id="accounts"><li>正在读取…</li></ul>
+  <small>授权完成后会返回此页面。启用自动启动时，会用系统命令打开该账号的独立浏览器。请手动登录并安装、授权 CommentCrate，再在终端执行 npm run account:ready -- 账号数字ID。账号密码只在 X 输入。</small>
+</main>
+<script>
+  fetch('/api/accounts', {headers:{'X-Local-Request':'1'}}).then(async response => {
+    if (!response.ok) throw new Error('读取失败');
+    const {accounts} = await response.json();
+    const list = document.querySelector('#accounts'); list.replaceChildren();
+    for (const account of accounts) {
+      const item = document.createElement('li');
+      const scopes = (account.scope || '').split(/\s+/);
+      item.textContent = `${account.user.name} (@${account.user.username}) · ID ${account.user.id} · ${scopes.includes('follows.write') ? '已授权关注' : '需要重新授权关注权限'}`;
+      list.append(item);
+    }
+    if (!accounts.length) list.textContent = '尚未授权账号';
+  }).catch(() => {document.querySelector('#accounts').textContent = '无法读取账号，请检查本地服务。';});
+</script></body></html>

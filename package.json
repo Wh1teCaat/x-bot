@@ -1,0 +1,28 @@
+{
+  "name": "x-multi-account-readonly",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "browser": "node scripts/open-testing-browser.ts",
+    "start": "node src/server.ts",
+    "test": "node --test test/*.test.ts",
+    "test-loop": "node scripts/test-loop.ts",
+    "account": "node scripts/account-control.ts",
+    "account:ready": "node scripts/account-control.ts ready",
+    "loop:health": "node scripts/loop-health.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.10",
+    "openai": "^7.55.0",
+    "playwright": "^1.65.0"
+  }
+}
