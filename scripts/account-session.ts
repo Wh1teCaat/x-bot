@@ -1,6 +1,5 @@
 /** 为一个账号维护持久工作池位，使用系统进程打开独立浏览器。 */
 import 'dotenv/config';
-import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
 import { mkdir, open, readFile, unlink, chmod, access } from 'node:fs/promises';
 import { constants } from 'node:fs';
@@ -10,7 +9,6 @@ import { connectTestingBrowser } from './browser-connection.ts';
 import { accountReadiness } from './account-readiness.ts';
 import { AccountPoolSlot } from './account-pool.ts';
 import { accountSocketPath } from './account-socket.ts';
-import { resolveCommentCratePath } from './commentcrate-extension.ts';
 
 const [accountId, username] = process.argv.slice(2);
 if (process.argv.length !== 4 || !/^\d{1,19}$/.test(accountId || '') || !/^[A-Za-z0-9_]{1,15}$/.test(username || '')) {
@@ -127,12 +125,10 @@ try {
   const port = await allocatePort();
   await mkdir(profile, { recursive: true, mode: 0o700 });
   // 不使用 Playwright 启动：直接执行 Chrome 命令，用户自行完成登录。
-  const executable = process.env.X_BROWSER_EXECUTABLE || chromium.executablePath();
+  const executable = process.env.X_BROWSER_EXECUTABLE || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
   await access(executable, constants.X_OK);
-  const extension = await resolveCommentCratePath(process.env.X_COMMENTCRATE_EXTENSION_PATH);
-  if (!extension) console.log('未找到本机 CommentCrate 插件，请在新浏览器手动安装。');
   browserProcess = spawn(executable, [`--user-data-dir=${profile}`, `--remote-debugging-port=${port}`,
-    ...(extension ? [`--load-extension=${extension}`] : []), '--no-first-run', 'https://x.com/home'], { stdio: 'ignore' });
+    '--no-first-run', 'https://x.com/home'], { stdio: 'ignore' });
   await new Promise<void>((resolve, reject) => { browserProcess.once('spawn', resolve); browserProcess.once('error', reject); });
   browserProcess.once('exit', () => shutdown());
   pool = new AccountPoolSlot({

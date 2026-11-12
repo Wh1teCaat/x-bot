@@ -1,21 +1,21 @@
-/** 验证并连接指定的 Chrome for Testing 调试端口。 */
+/** 验证并连接指定的 Google Chrome 调试端口。 */
 import { chromium } from 'playwright';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
-const testingPath = /(?:^|\/)Google Chrome for Testing\.app\/Contents\/MacOS\/Google Chrome for Testing(?:\s|$)/;
+const chromePath = /(?:^|\/)Google Chrome\.app\/Contents\/MacOS\/Google Chrome(?:\s|$)/;
 
-/** 验证端口只有一个监听进程且属于 Chrome for Testing。 */
+/** 验证端口只有一个监听进程且属于正式版 Google Chrome。 */
 export async function verifyTestingListener(port: number, run: (command: string, args: string[]) => Promise<{ stdout: string }> = execFileAsync, platform: NodeJS.Platform = process.platform) {
-  if (platform !== 'darwin') throw new Error('目前只能在 macOS 上验证 Chrome for Testing 的调试端口');
+  if (platform !== 'darwin') throw new Error('目前只能在 macOS 上验证 Google Chrome 的调试端口');
   let listeners: string[];
   try { listeners = (await run('/usr/sbin/lsof', ['-nP', '-t', `-iTCP:${port}`, '-sTCP:LISTEN'])).stdout.trim().split(/\s+/).filter(Boolean); }
-  catch { throw new Error(`无法确认端口 ${port} 的监听进程，请检查 Chrome for Testing 的远程调试设置`); }
+  catch { throw new Error(`无法确认端口 ${port} 的监听进程，请检查 Google Chrome 的远程调试设置`); }
   const pids = [...new Set(listeners)];
   if (pids.length !== 1 || !/^\d+$/.test(pids[0])) throw new Error(`端口 ${port} 没有唯一的浏览器监听进程`);
   const command = (await run('/bin/ps', ['-p', pids[0], '-o', 'command='])).stdout.trim();
-  if (!testingPath.test(command)) throw new Error(`端口 ${port} 不是 Chrome for Testing；为避免误连日常浏览器已停止`);
+  if (!chromePath.test(command)) throw new Error(`端口 ${port} 不是正式版 Google Chrome`);
   return Number(pids[0]);
 }
 

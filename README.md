@@ -1,13 +1,13 @@
 # X 回复筛选与 API 关注
 
-流程使用 Chrome for Testing 与 CommentCrate 搜索帖子、导出回复；按阿拉伯文字初筛后，将其余回复交给模型评估；最后通过 X 官方 API 关注候选用户。阿拉伯文字和回复内容不能证明用户所在地或国籍。
+流程使用正式版 Google Chrome 与 CommentCrate 搜索帖子、导出回复；按阿拉伯文字初筛后，将其余回复交给模型评估；最后通过 X 官方 API 关注候选用户。阿拉伯文字和回复内容不能证明用户所在地或国籍。
 
 ## 授权
 
 1. 配置 `.env`：参考 `.env.example` 填写 X 开发者应用的客户端 ID、客户端密钥（public client 可省略）和模型配置。开发者控制台的 OAuth 回调必须与 `X_REDIRECT_URI` 一致，默认为 `http://127.0.0.1:3000/oauth/callback`。应用需要读取用户和关注关系及关注写入权限。
 2. 执行 `npm start`，打开 [本机授权页面](http://127.0.0.1:3000/)，点击「前往 X 授权」，由账号所有者在 X 完成登录和授权。授权页面仅用于授权与查看已授权账号。
-3. 授权成功后，程序默认通过系统命令启动该账号的独立 Chrome for Testing 窗口；登录之前不会使用 Playwright 连接。首次使用时，在新窗口手动登录**相同的 X 账号**、安装 CommentCrate 并授予 X 访问权限，然后执行 `npm run account:ready -- <账号数字ID>`。程序连接并核对账号和插件后执行一轮。OAuth 令牌不会自动登录浏览器。浏览器资料保存在 `.data/browser-profiles/<账号数字ID>`，各账号的资料和调试端口独立，不会复制日常浏览器资料。
-4. 在 `.env` 设置 `X_AUTO_START_LOOP=false` 可关闭授权后的实例启动。启动信息和等待原因写入 `.data/account-sessions/<账号数字ID>.log`；浏览器登录失败时可在窗口中人工处理。程序优先从 Chrome for Testing 的默认资料中查找已有 CommentCrate 包，也可用 `X_COMMENTCRATE_EXTENSION_PATH` 指定已解压插件目录；找不到时需要手动安装。普通配置文件不能替用户授予 CommentCrate 的可选 X 站点权限，首次需在该资料目录中人工允许；之后可复用该目录中的授权。
+3. 授权成功后，程序默认通过系统命令启动该账号的独立正式版 Google Chrome 窗口；登录之前不会使用 Playwright 连接。首次使用时，在新窗口手动登录**相同的 X 账号**、安装 CommentCrate 并授予 X 访问权限，然后执行 `npm run account:ready -- <账号数字ID>`。程序连接并核对账号和插件后执行一轮。OAuth 令牌不会自动登录浏览器。浏览器资料保存在 `.data/browser-profiles/<账号数字ID>`，各账号的资料和调试端口独立，不会复制日常浏览器资料。
+4. 在 `.env` 设置 `X_AUTO_START_LOOP=false` 可关闭授权后的实例启动。启动信息和等待原因写入 `.data/account-sessions/<账号数字ID>.log`；浏览器登录失败时可在窗口中人工处理。请在每个账号的独立浏览器资料中手动安装 CommentCrate。普通配置文件不能替用户授予 CommentCrate 的可选 X 站点权限，首次需在该资料目录中人工允许；之后可复用该目录中的授权。
 
 同一账号优先复用已打开且空闲的实例：再次授权或执行 `npm run account -- run <账号数字ID>` 可以启动下一轮。`npm run account -- status <账号数字ID>` 查看状态及错误；`npm run account -- stop <账号数字ID>` 关闭该账号的实例，保留其资料目录。实例只复用给绑定的账号，不在账号间共享登录状态。
 
@@ -15,7 +15,7 @@
 
 ## 单轮流程
 
-手动模式可启动 `npm run browser`，在 Chrome for Testing 登录 X 并启用 CommentCrate；另开终端启动 `npm start`，再运行：
+手动模式可启动 `npm run browser`，在正式版 Google Chrome 的独立资料目录（`.data/manual-chrome-profile`）中登录 X 并安装、启用 CommentCrate；另开终端启动 `npm start`，再运行：
 
 ```sh
 npm run test-loop
