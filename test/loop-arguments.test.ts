@@ -1,7 +1,7 @@
 /** 验证账号、浏览器及恢复参数不会串用到其他任务。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseLoopArguments } from '../scripts/loop-arguments.ts';
+import { parseLoopArguments } from '../scripts/loop/loop-arguments.ts';
 
 test('accepts account-bound browser arguments without environment variables', () => {
   assert.deepEqual(parseLoopArguments(['--account-id', '123', '--username', 'Alice', '--cdp-port', '9334']), {

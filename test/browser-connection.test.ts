@@ -1,7 +1,7 @@
 /** 验证测试浏览器调试端口校验的行为与边界。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { verifyTestingListener } from '../scripts/browser-connection.ts';
+import { verifyTestingListener } from '../scripts/browser/browser-connection.ts';
 
 function runner(command, listeners = '123\n') {
   return async (file) => ({ stdout: file.endsWith('lsof') ? listeners : command });

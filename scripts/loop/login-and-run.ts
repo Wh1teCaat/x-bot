@@ -7,7 +7,7 @@ import { constants } from 'node:fs';
 import { createServer } from 'node:net';
 import { resolve, join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { accountReadiness } from './account-readiness.ts';
+import { accountReadiness } from '../account/account-readiness.ts';
 
 const accountId = process.argv[2];
 if (process.argv.length !== 3 || !/^\d{1,19}$/.test(accountId || '')) {
@@ -119,7 +119,7 @@ try {
   finally { await helper.close().catch(() => {}); }
   if (stopping) throw new Error('已取消');
   console.log('账号及插件检查通过，开始执行单轮任务；任务可能发送关注请求。');
-  worker = spawn(process.execPath, ['scripts/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(cdpPort)], { stdio: 'inherit', detached: true });
+  worker = spawn(process.execPath, ['scripts/loop/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(cdpPort)], { stdio: 'inherit', detached: true });
   const code = await new Promise<number>((resolve, reject) => { worker.once('error', reject); worker.once('exit', value => resolve(value ?? 1)); });
   if (code !== 0) throw new Error(`单轮任务停止，退出码 ${code}`);
   console.log('单轮任务已完成。');

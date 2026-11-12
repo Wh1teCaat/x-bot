@@ -7,15 +7,16 @@
     "node": ">=22.18"
   },
   "scripts": {
-    "browser": "node scripts/open-testing-browser.ts",
+    "browser": "node scripts/browser/open-testing-browser.ts",
     "start": "node src/server.ts",
     "test": "node --test test/*.test.ts",
-    "test-loop": "node scripts/test-loop.ts",
-    "account": "node scripts/account-control.ts",
-    "account:ready": "node scripts/account-control.ts ready",
-    "loop:health": "node scripts/loop-health.ts",
+    "test-loop": "node scripts/loop/test-loop.ts",
+    "account": "node scripts/account/account-control.ts",
+    "account:ready": "node scripts/account/account-control.ts ready",
+    "loop:health": "node scripts/loop/loop-health.ts",
     "typecheck": "tsc --noEmit",
-    "loop": "node scripts/login-and-run.ts"
+    "loop": "node scripts/loop/login-and-run.ts",
+    "clone_user": "node scripts/clone_user/clone_user.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

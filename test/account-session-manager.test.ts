@@ -12,7 +12,7 @@ test('requires both scopes and respects the auto-start setting', () => {
 });
 
 test('passes only a validated account identity to the isolated session', () => {
-  assert.deepEqual(accountSessionArguments({ id: '123', username: 'Alice' }), ['scripts/account-session.ts', '123', 'Alice']);
+  assert.deepEqual(accountSessionArguments({ id: '123', username: 'Alice' }), ['scripts/account/account-session.ts', '123', 'Alice']);
   assert.throws(() => accountSessionArguments({ id: '../123', username: 'Alice' }));
   assert.throws(() => accountSessionArguments({ id: '123', username: '../Alice' }));
 });

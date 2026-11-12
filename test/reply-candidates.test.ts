@@ -1,7 +1,7 @@
 /** 验证回复 CSV 解析和候选筛选的行为与边界。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCsv, collectCandidates } from '../scripts/reply-candidates.ts';
+import { parseCsv, collectCandidates } from '../scripts/replies/reply-candidates.ts';
 
 test('parses multiline CSV and merges authors across case and host', () => {
   const csv = '\uFEFFtext,profileUrl\r\n"hello,\n""world""",https://x.com/Hello\r\nSecond,https://twitter.com/HELLO\r\nno,https://evil.example/Hello\r\n';
@@ -15,7 +15,7 @@ test('rejects malformed and incomplete exports', () => {
 });
 
 test('prioritizes matching replies only among profiles with Saudi location evidence', async () => {
-  const { hasSaudiLocation, rankCandidates } = await import('../scripts/reply-candidates.ts');
+  const { hasSaudiLocation, rankCandidates } = await import('../scripts/replies/reply-candidates.ts');
   assert.equal(hasSaudiLocation('Riyadh, Saudi Arabia'), true);
   assert.equal(hasSaudiLocation('الرياض'), true);
   assert.equal(hasSaudiLocation('Paris'), false);

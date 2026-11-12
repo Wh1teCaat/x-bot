@@ -1,14 +1,14 @@
 /** 执行关键词、搜索、导出、筛选、评估和关注的单轮阶段。 */
 import 'dotenv/config';
-import { connectTestingBrowser } from './browser-connection.ts';
+import { connectTestingBrowser } from '../browser/browser-connection.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdir, readFile, readdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { bestPost, findPosts, getCollectorPage, scanAndExport } from './reply-export.ts';
-import { partitionReplyCandidates } from './reply-candidates.ts';
+import { bestPost, findPosts, getCollectorPage, scanAndExport } from '../replies/reply-export.ts';
+import { partitionReplyCandidates } from '../replies/reply-candidates.ts';
 import { makeLlm, generateKeyword, evaluateCandidates } from './loop-llm.ts';
-import { LocalFollowClient, followCandidatesApi } from './api-follow.ts';
+import { LocalFollowClient, followCandidatesApi } from '../follow/api-follow.ts';
 import { ResilienceStore, classifyFailure, retryTransient } from './resilience.ts';
 import { parseLoopArguments } from './loop-arguments.ts';
 

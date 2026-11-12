@@ -1,7 +1,7 @@
 /** 搜索帖子并控制 CommentCrate 扫描和导出回复。 */
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import { actionDelay } from './action-delay.ts';
+import { actionDelay } from '../browser/action-delay.ts';
 
 // 此对象只在浏览器扩展的页面执行上下文中存在，不在 Node 进程中使用。
 declare const chrome: any;

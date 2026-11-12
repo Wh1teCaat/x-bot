@@ -56,3 +56,12 @@ npm run loop:health -- resolve-api-follow <授权账号数字ID> <目标账号�
 ## 备用与测试
 
 脚本和测试均使用 TypeScript，Node.js 22.18 及以上版本可直接运行。`npm run typecheck` 检查源码、脚本和测试；当前配置尚未开启 TypeScript 严格模式。`npm test` 使用本地模拟接口，不访问真实 X API；浏览器测试可用 `XBOT_BROWSER_TEST=1 npm test` 启用。
+
+## 脚本目录
+
+- `scripts/account/`：账号实例、状态与登录检查。
+- `scripts/browser/`：浏览器连接和启动。
+- `scripts/clone_user/`：独立的账号资料复制，使用 `npm run clone_user -- <目标用户名> <子账号资料名>`。
+- `scripts/follow/`：关注操作。
+- `scripts/loop/`：单轮任务、队列和恢复。
+- `scripts/replies/`：回复导出和筛选。

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { matchesCommentCrateKey, resolveCommentCratePath } from '../scripts/commentcrate-extension.ts';
+import { matchesCommentCrateKey, resolveCommentCratePath } from '../scripts/browser/commentcrate-extension.ts';
 
 test('rejects a different extension and permits a missing default installation', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'xbot-extension-test-'));

@@ -1,7 +1,7 @@
 /** 验证限流冷却与探测时间持久化的行为与边界。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { RateLimitCooldown } from '../scripts/rate-limit-cooldown.ts';
+import { RateLimitCooldown } from '../scripts/loop/rate-limit-cooldown.ts';
 
 test('waits 15 minutes, reschedules on failure and clears only after recovery', async () => {
   let clock = 0, next = null, result = false, recovered = 0; const delays = [];
@@ -14,7 +14,7 @@ test('waits 15 minutes, reschedules on failure and clears only after recovery', 
 
 test('cooldown deadline persists when store is recreated', async () => {
   const { DatabaseSync } = await import('node:sqlite');
-  const { SqliteCooldownStore } = await import('../scripts/rate-limit-cooldown.ts');
+  const { SqliteCooldownStore } = await import('../scripts/loop/rate-limit-cooldown.ts');
   const db = new DatabaseSync(':memory:');
   await new SqliteCooldownStore(db, 'x').setNext(900000);
   assert.equal(await new SqliteCooldownStore(db, 'x').getNext(), 900000);

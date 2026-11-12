@@ -2,14 +2,14 @@
 import { spawn } from 'node:child_process';
 import { mkdirSync, openSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
-import { sendAccountCommand } from '../scripts/account-socket.ts';
+import { sendAccountCommand } from '../scripts/account/account-socket.ts';
 
 type AuthenticatedUser = { id: string; username: string };
 
 /** 校验授权身份并构造进程参数，避免将令牌或任意路径交给子进程。 */
 export function accountSessionArguments(user: AuthenticatedUser): string[] {
   if (!/^\d{1,19}$/.test(user.id) || !/^[A-Za-z0-9_]{1,15}$/.test(user.username)) throw new Error('授权账号信息无效');
-  return ['scripts/account-session.ts', user.id, user.username];
+  return ['scripts/account/account-session.ts', user.id, user.username];
 }
 
 /** 测试环境或用户关闭自动启动时，不因 OAuth 回调启动浏览器。 */

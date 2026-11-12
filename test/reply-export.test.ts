@@ -1,7 +1,7 @@
 /** 验证帖子回复数解析与页面选择的行为与边界。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseReplyCount, bestPost, panelAction } from '../scripts/reply-export.ts';
+import { parseReplyCount, bestPost, panelAction } from '../scripts/replies/reply-export.ts';
 import { chromium } from 'playwright';
 
 test('parses visible reply counts and rejects unrecognized text', () => {
@@ -16,7 +16,7 @@ test('chooses the first highest count and ignores unreadable counts', () => {
 });
 
 test('reuses a marked X tab, then an existing X tab, before opening a new tab', async () => {
-  const { getCollectorPage } = await import('../scripts/reply-export.ts');
+  const { getCollectorPage } = await import('../scripts/replies/reply-export.ts');
   const tab = (url, marked = false) => ({ url: () => url, evaluate: async () => marked });
   const marked = tab('https://x.com/search?q=first', true);
   const other = tab('https://x.com/home');

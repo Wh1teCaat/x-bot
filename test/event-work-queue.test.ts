@@ -1,7 +1,7 @@
 /** 验证事件队列唤醒与空闲行为的行为与边界。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { EventWorkQueue } from '../scripts/event-work-queue.ts';
+import { EventWorkQueue } from '../scripts/loop/event-work-queue.ts';
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 test('idle queue creates no timer and starts a newly enqueued job', async () => {

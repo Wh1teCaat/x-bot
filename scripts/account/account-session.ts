@@ -5,14 +5,14 @@ import { mkdir, open, readFile, unlink, chmod, access } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
-import { connectTestingBrowser } from './browser-connection.ts';
+import { connectTestingBrowser } from '../browser/browser-connection.ts';
 import { accountReadiness } from './account-readiness.ts';
 import { AccountPoolSlot } from './account-pool.ts';
 import { accountSocketPath } from './account-socket.ts';
 
 const [accountId, username] = process.argv.slice(2);
 if (process.argv.length !== 4 || !/^\d{1,19}$/.test(accountId || '') || !/^[A-Za-z0-9_]{1,15}$/.test(username || '')) {
-  console.error('用法：node scripts/account-session.ts <授权账号 ID> <用户名>'); process.exit(1);
+  console.error('用法：node scripts/account/account-session.ts <授权账号 ID> <用户名>'); process.exit(1);
 }
 if (process.platform !== 'darwin') { console.error('账号浏览器目前只支持 macOS'); process.exit(1); }
 const root = join('.data', 'browser-profiles');
@@ -134,7 +134,7 @@ try {
   pool = new AccountPoolSlot({
     check: () => checkBrowser(port),
     run: () => new Promise<void>((resolve, reject) => {
-      worker = spawn(process.execPath, ['scripts/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(port)], { stdio: 'inherit', detached: true });
+      worker = spawn(process.execPath, ['scripts/loop/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(port)], { stdio: 'inherit', detached: true });
       worker.once('error', reject);
       worker.once('exit', code => code === 0 ? resolve() : reject(new Error(`单轮任务停止，退出码 ${code ?? 'signal'}`)));
     }),

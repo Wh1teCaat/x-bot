@@ -17,3 +17,6 @@ dist/
 coverage/
 *.tsbuildinfo
 
+
+# 独立资料复制工具的浏览器登录资料
+.profile-copy/

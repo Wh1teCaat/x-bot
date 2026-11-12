@@ -1,7 +1,7 @@
 /** 验证模型关键词与候选评估校验的行为与边界。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyword, evaluateCandidates } from '../scripts/loop-llm.ts';
+import { generateKeyword, evaluateCandidates } from '../scripts/loop/loop-llm.ts';
 function client(content) { return { chat: { completions: { create: async () => ({ choices: [{ finish_reason: 'stop', message: { content } }] }) } } }; }
 test('accepts a plain keyword and rejects query operators', async () => {
   assert.equal(await generateKeyword(client('{"keyword":"Saudi Arabia"}'), 'target'), 'Saudi Arabia');

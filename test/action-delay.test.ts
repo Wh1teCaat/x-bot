@@ -1,7 +1,7 @@
 /** 验证浏览器操作随机等待及访问计数的行为与边界。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { actionDelay, createProfileVisitDelay } from '../scripts/action-delay.ts';
+import { actionDelay, createProfileVisitDelay } from '../scripts/browser/action-delay.ts';
 
 test('adds a random delay within the requested inclusive range', async () => {
   const delays = [];

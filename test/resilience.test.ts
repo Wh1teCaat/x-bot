@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { classifyFailure, ResilienceStore, retryTransient } from '../scripts/resilience.ts';
+import { classifyFailure, ResilienceStore, retryTransient } from '../scripts/loop/resilience.ts';
 
 test('never automatically retries actions with uncertain external effects', () => {
   assert.equal(classifyFailure({ code: 'ETIMEDOUT' }, 'follow').retryable, false);

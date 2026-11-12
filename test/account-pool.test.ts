@@ -1,8 +1,8 @@
 /** 验证账号池位在人工登录确认前不连接浏览器，并在空闲时复用。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AccountPoolSlot } from '../scripts/account-pool.ts';
-import { accountSocketPath } from '../scripts/account-socket.ts';
+import { AccountPoolSlot } from '../scripts/account/account-pool.ts';
+import { accountSocketPath } from '../scripts/account/account-socket.ts';
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 test('waits for manual ready, then reuses an idle account slot', async () => {

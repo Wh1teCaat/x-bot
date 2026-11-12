@@ -4,8 +4,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { connectTestingBrowser } from './browser-connection.ts';
-import { findPosts, getCollectorPage } from './reply-export.ts';
+import { connectTestingBrowser } from '../browser/browser-connection.ts';
+import { findPosts, getCollectorPage } from '../replies/reply-export.ts';
 import { ResilienceStore } from './resilience.ts';
 import { createLoopOrchestrator } from './loop-orchestrator.ts';
 import { parseLoopArguments } from './loop-arguments.ts';
@@ -22,7 +22,7 @@ if (args.resumeId && !db.prepare('SELECT id FROM runs WHERE id=?').get(runId)) {
 console.log(`队列任务 ID：${runId}`);
 /** 启动单轮子进程；探测模式只允许一次新的关注请求。 */
 const execute = ({ resume, probe = false }) => new Promise<number>((resolve, reject) => {
-  const childArgs = ['scripts/loop-run.ts', ...(resume ? ['--resume', runId] : ['--run-id', runId]),
+  const childArgs = ['scripts/loop/loop-run.ts', ...(resume ? ['--resume', runId] : ['--run-id', runId]),
     ...(args.accountId ? ['--account-id', args.accountId] : []), ...(args.username ? ['--username', args.username] : []),
     ...(args.cdpPort ? ['--cdp-port', String(args.cdpPort)] : []), ...(probe ? ['--follow-probe'] : [])];
   const child = spawn(process.execPath, childArgs, { stdio: 'inherit' });

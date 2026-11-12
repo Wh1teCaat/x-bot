@@ -1,7 +1,7 @@
 /** 验证API 授权账号选择、用户解析和关注断点的行为与边界。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { LocalFollowClient, followCandidatesApi } from '../scripts/api-follow.ts';
+import { LocalFollowClient, followCandidatesApi } from '../scripts/follow/api-follow.ts';
 
 test('pins authorization and resolves usernames in a batch', async () => {
   const calls = [];

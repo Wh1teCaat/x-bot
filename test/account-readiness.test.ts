@@ -1,7 +1,7 @@
 /** 验证授权账号与浏览器登录和插件状态的绑定规则。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { accountReadiness, waitForAccountReady } from '../scripts/account-readiness.ts';
+import { accountReadiness, waitForAccountReady } from '../scripts/account/account-readiness.ts';
 
 test('starts only after the matching browser account and plugin are ready', () => {
   assert.equal(accountReadiness(null, 'Alice', true), 'login');

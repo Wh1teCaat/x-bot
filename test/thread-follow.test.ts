@@ -2,8 +2,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright';
-import { collectArabicReplyCandidates, partitionReplyCandidates } from '../scripts/reply-candidates.ts';
-import { followFromThread, matchThreadReply } from '../scripts/thread-follow.ts';
+import { collectArabicReplyCandidates, partitionReplyCandidates } from '../scripts/replies/reply-candidates.ts';
+import { followFromThread, matchThreadReply } from '../scripts/follow/thread-follow.ts';
 
 test('filters CSV reply language, validates post ID and deduplicates authors', () => {
   const csv = 'id,text,profileUrl,postUrl\n11,مرحبا,https://x.com/User,https://x.com/root/status/10\n12,hello,https://x.com/User,https://x.com/root/status/10\n13,السعودية,https://x.com/user,https://x.com/root/status/10\n14,مرحبا,https://x.com/Other,https://x.com/root/status/99\n';

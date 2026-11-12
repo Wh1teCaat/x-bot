@@ -1,5 +1,5 @@
 /** 保留原帖回复菜单的浏览器关注实现，供旧流程参考。 */
-import { actionDelay } from './action-delay.ts';
+import { actionDelay } from '../browser/action-delay.ts';
 
 // Only interact with a reply whose timestamp URL matches the exported reply ID
 // and author. The page can contain unrelated recommendations and quoted posts.

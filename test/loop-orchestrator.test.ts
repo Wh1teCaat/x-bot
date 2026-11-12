@@ -2,8 +2,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { ResilienceStore } from '../scripts/resilience.ts';
-import { createLoopOrchestrator } from '../scripts/loop-orchestrator.ts';
+import { ResilienceStore } from '../scripts/loop/resilience.ts';
+import { createLoopOrchestrator } from '../scripts/loop/loop-orchestrator.ts';
 
 const tick = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 function setup() {
