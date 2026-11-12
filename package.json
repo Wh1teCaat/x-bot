@@ -14,7 +14,8 @@
     "account": "node scripts/account-control.ts",
     "account:ready": "node scripts/account-control.ts ready",
     "loop:health": "node scripts/loop-health.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "loop": "node scripts/login-and-run.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

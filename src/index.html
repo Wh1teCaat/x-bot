@@ -17,7 +17,7 @@
   <form method="post" action="/oauth/start"><button type="submit">前往 X 授权</button></form>
   <h2>已授权账号</h2>
   <ul id="accounts"><li>正在读取…</li></ul>
-  <small>授权完成后会返回此页面。启用自动启动时，会用系统命令打开该账号的独立浏览器。请手动登录并安装、授权 CommentCrate，再在终端执行 npm run account:ready -- 账号数字ID。账号密码只在 X 输入。</small>
+  <small>授权完成后会返回此页面。授权后，在终端执行 npm run loop -- 账号数字ID，然后在打开的浏览器中登录并安装、授权 CommentCrate。账号密码只在 X 输入。</small>
 </main>
 <script>
   fetch('/api/accounts', {headers:{'X-Local-Request':'1'}}).then(async response => {

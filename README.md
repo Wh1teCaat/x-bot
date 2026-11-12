@@ -2,18 +2,22 @@
 
 流程使用正式版 Google Chrome 与 CommentCrate 搜索帖子、导出回复；按阿拉伯文字初筛后，将其余回复交给模型评估；最后通过 X 官方 API 关注候选用户。阿拉伯文字和回复内容不能证明用户所在地或国籍。
 
-## 授权
+## 授权与启动
 
-1. 配置 `.env`：参考 `.env.example` 填写 X 开发者应用的客户端 ID、客户端密钥（public client 可省略）和模型配置。开发者控制台的 OAuth 回调必须与 `X_REDIRECT_URI` 一致，默认为 `http://127.0.0.1:3000/oauth/callback`。应用需要读取用户和关注关系及关注写入权限。
-2. 执行 `npm start`，打开 [本机授权页面](http://127.0.0.1:3000/)，点击「前往 X 授权」，由账号所有者在 X 完成登录和授权。授权页面仅用于授权与查看已授权账号。
-3. 授权成功后，程序默认通过系统命令启动该账号的独立正式版 Google Chrome 窗口；登录之前不会使用 Playwright 连接。首次使用时，在新窗口手动登录**相同的 X 账号**、安装 CommentCrate 并授予 X 访问权限，然后执行 `npm run account:ready -- <账号数字ID>`。程序连接并核对账号和插件后执行一轮。OAuth 令牌不会自动登录浏览器。浏览器资料保存在 `.data/browser-profiles/<账号数字ID>`，各账号的资料和调试端口独立，不会复制日常浏览器资料。
-4. 在 `.env` 设置 `X_AUTO_START_LOOP=false` 可关闭授权后的实例启动。启动信息和等待原因写入 `.data/account-sessions/<账号数字ID>.log`；浏览器登录失败时可在窗口中人工处理。请在每个账号的独立浏览器资料中手动安装 CommentCrate。普通配置文件不能替用户授予 CommentCrate 的可选 X 站点权限，首次需在该资料目录中人工允许；之后可复用该目录中的授权。
+1. 参考 `.env.example` 配置 X 应用和模型，并将 `X_AUTO_START_LOOP` 设为 `false`。X 开发者控制台的 OAuth 回调须与 `X_REDIRECT_URI` 一致，默认为 `http://127.0.0.1:3000/oauth/callback`。
+2. 在一个终端运行 `npm start`，打开 [本机授权页面](http://127.0.0.1:3000/)，完成账号授权并记下数字 ID。运行任务期间保持该服务运行。
+3. 在另一个终端运行 `npm run loop -- <账号数字ID>`。程序使用该账号独立资料打开正式版 Google Chrome；手动登录相同的 X 账号，安装 CommentCrate 并授予 X 访问权限。
+4. 关闭登录窗口；若关闭后终端未继续，按 Enter。程序会用 Playwright 重新打开同一份资料，检查账号和插件，然后自动执行一轮，进度直接显示在当前终端。下一次运行同一账号会复用这些资料。
+
+每个账号使用独立的 `.data/browser-profiles/<账号数字ID>`；不同账号需要分别授权和登录。正式版 Chrome 不会通过旧的 `X_COMMENTCRATE_EXTENSION_PATH` 参数自动加载扩展，需在账号浏览器中手动安装。**单轮任务会实际发送关注请求。**
+
+`X_AUTO_START_LOOP=true` 可以启用旧版后台账号实例。切换到前台命令前，先用 `npm run account -- stop <账号数字ID>` 停止该账号的旧实例，避免资料目录被占用。
 
 同一账号优先复用已打开且空闲的实例：再次授权或执行 `npm run account -- run <账号数字ID>` 可以启动下一轮。`npm run account -- status <账号数字ID>` 查看状态及错误；`npm run account -- stop <账号数字ID>` 关闭该账号的实例，保留其资料目录。实例只复用给绑定的账号，不在账号间共享登录状态。
 
 授权申请 `tweet.read`、`users.read`、`follows.read`、`follows.write` 和 `offline.access`。已有账号如缺少权限需重新授权。令牌加密保存在 `.data/accounts.enc`，密钥在 `.data/key`；二者位于同一机器，保护范围限于避免意外查看。服务只监听本机，不要将其公开到网络。用户查询和关注会消耗 API 额度，具体权限、费用及限额以 X 开发者控制台为准。
 
-## 单轮流程
+## 其他单轮启动方式
 
 手动模式可启动 `npm run browser`，在正式版 Google Chrome 的独立资料目录（`.data/manual-chrome-profile`）中登录 X 并安装、启用 CommentCrate；另开终端启动 `npm start`，再运行：
 

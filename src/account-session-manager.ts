@@ -15,7 +15,7 @@ export function accountSessionArguments(user: AuthenticatedUser): string[] {
 /** 测试环境或用户关闭自动启动时，不因 OAuth 回调启动浏览器。 */
 export function shouldAutoStartAccountSession(scope: string, { nodeEnv, setting }: { nodeEnv?: string; setting?: string }): boolean {
   const granted = new Set(scope.split(/\s+/));
-  return nodeEnv !== 'test' && setting !== 'false' && granted.has('users.read') && granted.has('follows.write');
+  return nodeEnv !== 'test' && setting === 'true' && granted.has('users.read') && granted.has('follows.write');
 }
 
 /** 启动独立的账号会话；账号锁由会话进程持有并负责清理。 */
