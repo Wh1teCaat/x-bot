@@ -16,7 +16,8 @@
     "loop:health": "node scripts/loop/loop-health.ts",
     "typecheck": "tsc --noEmit",
     "loop": "node scripts/loop/login-and-run.ts",
-    "clone_user": "node scripts/clone_user/clone_user.ts"
+    "clone_user": "node scripts/clone_user/clone_user.ts",
+    "mirror": "node scripts/mirror/mirror-loop.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

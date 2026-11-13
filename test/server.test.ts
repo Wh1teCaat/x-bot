@@ -163,6 +163,33 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
           meta: { result_count: 1, next_token: "next2" },
         }),
       );
+    } else if (url.pathname === "/2/tweets" && req.method === "POST") {
+      assert.equal(req.headers.authorization, "Bearer new1");
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const { text, media } = JSON.parse(body);
+      assert.ok(text);
+      if (media) assert.deepEqual(media.media_ids, ["1234567890123456789"]);
+      res.end(JSON.stringify({ data: { id: "5000", text } }));
+    } else if (url.pathname === "/2/tweets/777") {
+      assert.equal(req.headers.authorization, "Bearer new1");
+      res.end(JSON.stringify({ data: { id: "777" }, includes: { media: [{ media_key: "k1", type: "photo", url: "https://pbs.twimg.com/media/foo.jpg" }, { media_key: "k2", type: "video" }] } }));
+    } else if (url.pathname === "/2/users/77/tweets") {
+      assert.equal(req.headers.authorization, "Bearer new1");
+      assert.equal(url.searchParams.get("max_results"), "100");
+      assert.equal(url.searchParams.get("since_id"), "900");
+      assert.equal(url.searchParams.get("exclude"), "retweets");
+      res.end(JSON.stringify({ data: [{ id: "777", text: "mirror me" }], meta: { newest_id: "777" } }));
+    } else if (url.pathname === "/2/tweets/search/stream/rules" && req.method === "GET") {
+      assert.equal(req.headers.authorization, "Bearer new1");
+      res.end(JSON.stringify({ data: [] }));
+    } else if (url.pathname === "/2/tweets/search/stream/rules" && req.method === "POST") {
+      res.end(JSON.stringify({ data: [{ id: "r1", value: "from:Alice -is:retweet" }] }));
+    } else if (url.pathname === "/2/tweets/search/stream") {
+      assert.equal(req.headers.authorization, "Bearer new1");
+      res.write('{"id":"77-9","text":"streamed"}\n');
+      res.write("\n");
+      res.end('{"id":"77-10","text":"streamed2"}\n');
     } else {
       res.statusCode = 404;
       res.end("{}");
@@ -244,8 +271,10 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
     );
     assert.equal(JSON.stringify(accounts).includes("access1"), false);
     assert.equal(JSON.stringify(accounts).includes("access2"), false);
-    const encrypted = readFileSync(join(dir, "accounts.enc"));
-    assert.equal(encrypted.includes(Buffer.from("refresh1")), false);
+    const sqlite = readFileSync(join(dir, "accounts.sqlite"));
+    for (const secret of ["access1", "refresh1", "refresh2"]) {
+      assert.equal(sqlite.includes(Buffer.from(secret)), false);
+    }
     const [a, b] = await Promise.all([
       fetch(`${base}/api/accounts/1/me`, { headers: header }),
       fetch(`${base}/api/accounts/1/me`, { headers: header }),
@@ -405,6 +434,33 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
         "/2/users/123/followers?max_results=500&pagination_token=next+page",
       ),
     );
+
+    // 发帖与目标时间线端点：账号 2 无 tweet.write，账号 1 具备。
+    assert.equal((await fetch(`${base}/api/accounts/2/tweets`, { method: "POST", headers: followHeaders, body: JSON.stringify({ text: "mirror me" }) })).status, 403);
+    assert.equal((await fetch(`${base}/api/accounts/1/tweets`, { method: "POST", headers: followHeaders, body: JSON.stringify({ text: "" }) })).status, 400);
+    assert.equal((await fetch(`${base}/api/accounts/1/tweets`, { method: "POST", headers: followHeaders, body: JSON.stringify({ text: "x".repeat(281) }) })).status, 400);
+    const posted = await fetch(`${base}/api/accounts/1/tweets`, { method: "POST", headers: { ...followHeaders, "Content-Type": "application/json" }, body: JSON.stringify({ text: "mirror me" }) });
+    assert.equal(posted.status, 200);
+    assert.equal(((await posted.json()) as any).data.id, "5000");
+    const timeline = await fetch(`${base}/api/accounts/1/users/77/tweets?since_id=900&exclude=retweets`, { headers: header });
+    assert.equal(timeline.status, 200);
+    assert.equal(((await timeline.json()) as any).data[0].text, "mirror me");
+    const streamRes = await fetch(`${base}/api/accounts/1/stream/tweets?username=Alice`, { headers: header });
+    assert.equal(streamRes.status, 200);
+    const streamBody = await streamRes.text();
+    assert.match(streamBody, /streamed/);
+    assert.match(streamBody, /streamed2/);
+    assert.equal((await fetch(`${base}/api/accounts/2/stream/tweets?username=Alice`, { headers: header })).status, 403);
+
+    // 发帖带媒体、媒体上传校验、单帖媒体查询。
+    const postedWithMedia = await fetch(`${base}/api/accounts/1/tweets`, { method: "POST", headers: { ...followHeaders, "Content-Type": "application/json" }, body: JSON.stringify({ text: "with image", media_ids: ["1234567890123456789"] }) });
+    assert.equal(postedWithMedia.status, 200);
+    assert.equal((await fetch(`${base}/api/accounts/1/tweets`, { method: "POST", headers: followHeaders, body: JSON.stringify({ text: "x", media_ids: ["bad"] }) })).status, 400);
+    assert.equal((await fetch(`${base}/api/accounts/2/media`, { method: "POST", headers: followHeaders, body: JSON.stringify({ url: "https://pbs.twimg.com/x.jpg" }) })).status, 403);
+    assert.equal((await fetch(`${base}/api/accounts/1/media`, { method: "POST", headers: followHeaders, body: JSON.stringify({ url: "https://evil.example/x.jpg" }) })).status, 400);
+    const tweetMedia = await fetch(`${base}/api/accounts/1/tweets/777/media`, { headers: header });
+    assert.equal(tweetMedia.status, 200);
+    assert.deepEqual(((await tweetMedia.json()) as any).data.images, ["https://pbs.twimg.com/media/foo.jpg"]);
   } finally {
     child.kill();
     mock.close();

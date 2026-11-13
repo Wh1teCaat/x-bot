@@ -9,6 +9,8 @@ import { connectTestingBrowser } from '../browser/browser-connection.ts';
 import { accountReadiness } from './account-readiness.ts';
 import { AccountPoolSlot } from './account-pool.ts';
 import { accountSocketPath } from './account-socket.ts';
+import { fingerprintFor } from '../browser/fingerprint.ts';
+import { AccountStore } from '../../src/account-store.ts';
 
 const [accountId, username] = process.argv.slice(2);
 if (process.argv.length !== 4 || !/^\d{1,19}$/.test(accountId || '') || !/^[A-Za-z0-9_]{1,15}$/.test(username || '')) {
@@ -22,7 +24,7 @@ const socketPath = accountSocketPath(accountId);
 await mkdir(root, { recursive: true, mode: 0o700 });
 await mkdir(join('.data', 'account-sessions'), { recursive: true, mode: 0o700 });
 let ownsLock = false, closing = false;
-let browserProcess, worker;
+let browserProcess, worker, store;
 
 /** 原子获取账号锁，避免同一资料目录同时启动多个实例。 */
 async function acquireLock() {
@@ -115,6 +117,7 @@ function shutdown() {
   closing = true; pool?.stop(); stopWorker();
   if (browserProcess?.exitCode === null) browserProcess.kill('SIGTERM');
   if (ipc.listening) ipc.close();
+  store?.close();
 }
 process.once('SIGTERM', shutdown);
 process.once('SIGINT', shutdown);
@@ -127,12 +130,18 @@ try {
   // 不使用 Playwright 启动：直接执行 Chrome 命令，用户自行完成登录。
   const executable = process.env.X_BROWSER_EXECUTABLE || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
   await access(executable, constants.X_OK);
+  const fp = fingerprintFor(accountId);
   browserProcess = spawn(executable, [`--user-data-dir=${profile}`, `--remote-debugging-port=${port}`,
-    '--no-first-run', 'https://x.com/home'], { stdio: 'ignore' });
+    '--no-first-run', 'https://x.com/home', `--lang=${fp.locale}`, `--window-size=${fp.viewport.width},${fp.viewport.height}`], { stdio: 'ignore' });
   await new Promise<void>((resolve, reject) => { browserProcess.once('spawn', resolve); browserProcess.once('error', reject); });
   browserProcess.once('exit', () => shutdown());
+  store = new AccountStore(resolve('.data'));
   pool = new AccountPoolSlot({
-    check: () => checkBrowser(port),
+    check: async () => {
+      if (store.getByUuid(accountId)?.chromeReady) return;
+      await checkBrowser(port);
+      store.upsert({ uuid: accountId, username, chromeReady: true });
+    },
     run: () => new Promise<void>((resolve, reject) => {
       worker = spawn(process.execPath, ['scripts/loop/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(port)], { stdio: 'inherit', detached: true });
       worker.once('error', reject);
@@ -143,7 +152,12 @@ try {
   if (closing) throw new Error('浏览器已提前退出');
   await new Promise<void>((resolve, reject) => { ipc.once('error', reject); ipc.listen(socketPath, resolve); });
   await chmod(socketPath, 0o600);
-  console.log(`已用 Chrome 命令启动 @${username} 的独立浏览器。请手动登录并授权插件，然后运行：npm run account:ready -- ${accountId}`);
+  if (store.getByUuid(accountId)?.chromeReady) {
+    console.log(`账号 @${username} 已登录并安装插件，跳过登录与安装，直接执行任务。`);
+    pool.ready();
+  } else {
+    console.log(`已用 Chrome 命令启动 @${username} 的独立浏览器。请手动登录并授权插件，然后运行：npm run account:ready -- ${accountId}`);
+  }
   await new Promise<void>(resolve => ipc.once('close', resolve));
 } catch (error) {
   console.error(`账号浏览器实例停止：${error.message}`); process.exitCode = 1;

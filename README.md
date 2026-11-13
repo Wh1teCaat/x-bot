@@ -7,7 +7,7 @@
 1. 参考 `.env.example` 配置 X 应用和模型，并将 `X_AUTO_START_LOOP` 设为 `false`。X 开发者控制台的 OAuth 回调须与 `X_REDIRECT_URI` 一致，默认为 `http://127.0.0.1:3000/oauth/callback`。
 2. 在一个终端运行 `npm start`，打开 [本机授权页面](http://127.0.0.1:3000/)，完成账号授权并记下数字 ID。运行任务期间保持该服务运行。
 3. 在另一个终端运行 `npm run loop -- <账号数字ID>`。程序使用该账号独立资料打开正式版 Google Chrome；手动登录相同的 X 账号，安装 CommentCrate 并授予 X 访问权限。
-4. 关闭登录窗口；若关闭后终端未继续，按 Enter。程序会用 Playwright 重新打开同一份资料，检查账号和插件，然后自动执行一轮，进度直接显示在当前终端。下一次运行同一账号会复用这些资料。
+4. 关闭登录窗口；若关闭后终端未继续，按 Enter。程序会用 Playwright 重新打开同一份资料，检查账号和插件，然后自动执行一轮，进度直接显示在当前终端。下一次运行同一账号会复用这些资料；已登录并安装插件的账号会自动跳过登录与安装步骤，直接进入后续自动化流程。
 
 每个账号使用独立的 `.data/browser-profiles/<账号数字ID>`；不同账号需要分别授权和登录。正式版 Chrome 不会通过旧的 `X_COMMENTCRATE_EXTENSION_PATH` 参数自动加载扩展，需在账号浏览器中手动安装。**单轮任务会实际发送关注请求。**
 
@@ -15,7 +15,7 @@
 
 同一账号优先复用已打开且空闲的实例：再次授权或执行 `npm run account -- run <账号数字ID>` 可以启动下一轮。`npm run account -- status <账号数字ID>` 查看状态及错误；`npm run account -- stop <账号数字ID>` 关闭该账号的实例，保留其资料目录。实例只复用给绑定的账号，不在账号间共享登录状态。
 
-授权申请 `tweet.read`、`users.read`、`follows.read`、`follows.write` 和 `offline.access`。已有账号如缺少权限需重新授权。令牌加密保存在 `.data/accounts.enc`，密钥在 `.data/key`；二者位于同一机器，保护范围限于避免意外查看。服务只监听本机，不要将其公开到网络。用户查询和关注会消耗 API 额度，具体权限、费用及限额以 X 开发者控制台为准。
+授权申请 `tweet.read`、`users.read`、`follows.read`、`follows.write`、`tweet.write`、`media.write` 和 `offline.access`。已有账号如缺少权限需重新授权。账号相关状态统一保存在 `.data/accounts.sqlite` 的账号表：自增主键、X 账号数字 ID（uuid）、用户名（索引）、是否已 clone、clone 来源账号信息（用户名/显示名/数字 ID/完成时间）、博主关键词（keywords，用于检索相关博主）、是否已在账号资料 Chrome 登录并安装插件、是否已认证，以及 access / refresh 令牌（AES-GCM 加密，密钥在 `.data/key`）。二者位于同一机器，保护范围限于避免意外查看。服务只监听本机，不要将其公开到网络。用户查询和关注会消耗 API 额度，具体权限、费用及限额以 X 开发者控制台为准。
 
 ## 其他单轮启动方式
 
@@ -40,6 +40,19 @@ npm run loop:health
 
 旧的浏览器关注任务不会自动迁移为 API 任务，需要先核对其已关注和结果不明的用户。
 
+## 镜像发帖（准实时 hook）
+
+把某个目标用户的**新发帖**复制文本与图片、用另一个授权账号发新帖（视频/GIF 跳过）。X 不提供面向任意第三方的“发帖即回调”webhook，这里启动时先回填目标最新 3 条，随后优先用 **filtered stream**（一条长连接、X 实时推送，需 API 套餐支持 filtered stream）；连不上或套餐不支持时自动回退到 REST 轮询（间隔默认 60 秒，可用 `MIRROR_INTERVAL_MS` 调整，`--poll` 强制轮询，`--once` 只跑一次）。状态持久化在 `.data/mirror.sqlite`，重启后从水位线继续，不会重复发同一帖。
+
+```sh
+# 目标用户发新帖后，复制文本用发帖账号发新帖（发帖账号须具备 tweet.write）
+npm run mirror -- <目标用户名> <发帖账号数字ID>
+npm run mirror -- list
+npm run mirror -- remove <目标用户名>
+```
+
+发帖账号需先完成 X 授权并授予 `tweet.write` 与 `media.write`。程序按目标用户名解析数字 ID，**启动时先回填目标最新 3 条帖子**，随后优先用 filtered stream 实时监听新帖、失败回退 REST 轮询（`since_id` 只取新帖、排除转发）。每条帖子复制文本（截断到 280 字符）与图片（最多 4 张，jpg/png/webp，≤5 MB），**视频和 GIF 跳过**；失败的帖子最多重试 3 次后跳过，收到 429 冷却 15 分钟。**复制原文内容有被 X 判为垃圾/冒充的风险**，请自行评估并控制频率。
+
 ## 失败与冷却
 
 收到 X 429 后，搜索或 API 关注阶段冷却 15 分钟，再进入半开：搜索使用只读搜索；关注最多发起一次新的关注请求，确认成功才继续。明确受限则再次冷却；请求结果不明会记录 `uncertain` 并停止，避免重复提交。插件导出中断也需先核实。进程退出后需用相同任务 ID 恢复；本地队列不是外部消息队列。
@@ -61,7 +74,8 @@ npm run loop:health -- resolve-api-follow <授权账号数字ID> <目标账号�
 
 - `scripts/account/`：账号实例、状态与登录检查。
 - `scripts/browser/`：浏览器连接和启动。
-- `scripts/clone_user/`：独立的账号资料复制，使用 `npm run clone_user -- <目标用户名> <子账号资料名>`。
+- `scripts/clone_user/`：独立的账号资料复制，使用 `npm run clone_user -- <目标用户名> <子账号资料名>`；已 clone 的账号会跳过复制。
+- `scripts/mirror/`：目标发帖镜像（准实时 hook）。使用 `npm run mirror -- <目标用户名> <发帖账号数字ID>` 注册并持续轮询目标新帖，复制文本用发帖账号发新帖；`npm run mirror -- list` 查看，`npm run mirror -- remove <目标用户名>` 移除。
 - `scripts/follow/`：关注操作。
 - `scripts/loop/`：单轮任务、队列和恢复。
 - `scripts/replies/`：回复导出和筛选。

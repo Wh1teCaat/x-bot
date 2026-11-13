@@ -11,6 +11,7 @@ export function originalAvatarUrl(value: string): string {
   if (url.protocol !== 'https:' || url.hostname !== 'pbs.twimg.com' || !url.pathname.startsWith('/profile_images/')) {
     throw new Error('头像地址不是预期的 X 图片地址');
   }
-  url.pathname = url.pathname.replace(/_(normal|bigger|mini|400x400)(?=\.[^./]+$)/, '');
+  // 资料页现在常给 _200x200 这类尺寸后缀；不剥掉就会把缩略图当成原图上传。
+  url.pathname = url.pathname.replace(/_(normal|bigger|mini|reasonably_small|\d+x\d+)(?=\.[^./]+$)/, '');
   return url.toString();
 }

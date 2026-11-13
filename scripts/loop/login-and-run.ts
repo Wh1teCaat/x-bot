@@ -8,6 +8,8 @@ import { createServer } from 'node:net';
 import { resolve, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { accountReadiness } from '../account/account-readiness.ts';
+import { fingerprintFor } from '../browser/fingerprint.ts';
+import { AccountStore } from '../../src/account-store.ts';
 
 const accountId = process.argv[2];
 if (process.argv.length !== 3 || !/^\d{1,19}$/.test(accountId || '')) {
@@ -21,7 +23,7 @@ const root = resolve('.data', 'browser-profiles');
 const profile = join(root, accountId);
 const lockPath = join(root, `${accountId}.lock`);
 const executable = process.env.X_BROWSER_EXECUTABLE || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-let lockOwned = false, loginBrowser, context, worker;
+let lockOwned = false, loginBrowser, context, worker, store;
 let stopping = false;
 
 async function acquireLock() {
@@ -79,44 +81,58 @@ try {
   await mkdir(root, { recursive: true, mode: 0o700 });
   await acquireLock();
   await mkdir(profile, { recursive: true, mode: 0o700 });
-  console.log(`正在打开 @${username} 的登录窗口，请登录 X 并安装、授权 CommentCrate。`);
-  loginBrowser = spawn(executable, [`--user-data-dir=${profile}`, '--no-first-run', 'https://x.com/home'], { stdio: 'ignore' });
-  await new Promise<void>((resolve, reject) => { loginBrowser.once('spawn', resolve); loginBrowser.once('error', reject); });
-  const loginExit = new Promise<void>(resolve => loginBrowser.once('exit', () => resolve()));
-  console.log('完成后请关闭该 Chrome 窗口；如关闭窗口后没有继续，请回到终端按 Enter。');
-  const input = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    await Promise.race([loginExit, new Promise<void>(resolve => input.once('line', () => resolve()))]);
-  } finally { input.close(); }
-  if (stopping) throw new Error('已取消');
-  if (loginBrowser.exitCode === null && loginBrowser.signalCode === null) {
-    loginBrowser.kill('SIGTERM');
-    await loginExit;
+  store = new AccountStore(resolve('.data'));
+  const fp = fingerprintFor(accountId);
+  const chromeReady = store.getByUuid(accountId)?.chromeReady ?? false;
+  if (!chromeReady) {
+    console.log(`正在打开 @${username} 的登录窗口，请登录 X 并安装、授权 CommentCrate。`);
+    loginBrowser = spawn(executable, [`--user-data-dir=${profile}`, '--no-first-run', 'https://x.com/home', `--lang=${fp.locale}`, `--window-size=${fp.viewport.width},${fp.viewport.height}`], { stdio: 'ignore' });
+    await new Promise<void>((resolve, reject) => { loginBrowser.once('spawn', resolve); loginBrowser.once('error', reject); });
+    const loginExit = new Promise<void>(resolve => loginBrowser.once('exit', () => resolve()));
+    console.log('完成后请关闭该 Chrome 窗口；如关闭窗口后没有继续，请回到终端按 Enter。');
+    const input = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      await Promise.race([loginExit, new Promise<void>(resolve => input.once('line', () => resolve()))]);
+    } finally { input.close(); }
+    if (stopping) throw new Error('已取消');
+    if (loginBrowser.exitCode === null && loginBrowser.signalCode === null) {
+      loginBrowser.kill('SIGTERM');
+      await loginExit;
+    }
+  } else {
+    console.log(`账号 @${username} 已登录并安装插件，跳过登录与安装步骤。`);
   }
   const cdpPort = await allocatePort();
-  console.log('正在用 Playwright 打开该账号的浏览器资料并检查登录和插件……');
+  console.log(chromeReady
+    ? '正在用 Playwright 打开该账号的浏览器资料并执行任务……'
+    : '正在用 Playwright 打开该账号的浏览器资料并检查登录和插件……');
   context = await chromium.launchPersistentContext(profile, {
     headless: false, executablePath: executable,
     ignoreDefaultArgs: ['--disable-extensions', '--use-mock-keychain', '--password-store=basic'],
     args: [`--remote-debugging-port=${cdpPort}`, '--no-first-run'],
+    locale: fp.locale, timezoneId: fp.timezoneId, viewport: fp.viewport, screen: fp.screen, colorScheme: fp.colorScheme,
+    extraHTTPHeaders: { 'Accept-Language': fp.acceptLanguage },
   });
-  const page = context.pages()[0] || await context.newPage();
-  await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  const href = await page.getByTestId('AppTabBar_Profile_Link').getAttribute('href', { timeout: 10000 }).catch(() => null);
-  const readiness = accountReadiness(href, username, false);
-  if (readiness === 'login') throw new Error(`请先在登录窗口登录 @${username} 后重试`);
-  if (readiness === 'wrong_account') throw new Error(`浏览器登录账号与 @${username} 不一致`);
-  const helper = await context.newPage();
-  try {
-    await helper.goto('chrome-extension://haaahmifcccbgagmopbhbkgabgblmcbl/popup/popup.html', { timeout: 5000 });
-    const granted = await helper.evaluate(async () => {
-      const api = (globalThis as any).chrome, crate = (globalThis as any).CommentCrate;
-      const platform = crate?.platformsMeta?.PLATFORMS?.find(p => p.id === 'x');
-      return !!platform && await crate.permissions.create(api).has(platform);
-    });
-    if (!granted) throw new Error('请授予 CommentCrate 对 X 的访问权限');
-  } catch (error) { throw new Error(`CommentCrate 未就绪：${error.message}`); }
-  finally { await helper.close().catch(() => {}); }
+  if (!chromeReady) {
+    const page = context.pages()[0] || await context.newPage();
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const href = await page.getByTestId('AppTabBar_Profile_Link').getAttribute('href', { timeout: 10000 }).catch(() => null);
+    const readiness = accountReadiness(href, username, false);
+    if (readiness === 'login') throw new Error(`请先在登录窗口登录 @${username} 后重试`);
+    if (readiness === 'wrong_account') throw new Error(`浏览器登录账号与 @${username} 不一致`);
+    const helper = await context.newPage();
+    try {
+      await helper.goto('chrome-extension://haaahmifcccbgagmopbhbkgabgblmcbl/popup/popup.html', { timeout: 5000 });
+      const granted = await helper.evaluate(async () => {
+        const api = (globalThis as any).chrome, crate = (globalThis as any).CommentCrate;
+        const platform = crate?.platformsMeta?.PLATFORMS?.find(p => p.id === 'x');
+        return !!platform && await crate.permissions.create(api).has(platform);
+      });
+      if (!granted) throw new Error('请授予 CommentCrate 对 X 的访问权限');
+    } catch (error) { throw new Error(`CommentCrate 未就绪：${error.message}`); }
+    finally { await helper.close().catch(() => {}); }
+    store.upsert({ uuid: accountId, username, chromeReady: true });
+  }
   if (stopping) throw new Error('已取消');
   console.log('账号及插件检查通过，开始执行单轮任务；任务可能发送关注请求。');
   worker = spawn(process.execPath, ['scripts/loop/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(cdpPort)], { stdio: 'inherit', detached: true });
@@ -127,6 +143,7 @@ try {
   console.error(`启动或执行失败：${error.message}`); process.exitCode = 1;
 } finally {
   stop();
+  store?.close();
   await context?.close().catch(() => {});
   if (lockOwned) await unlink(lockPath).catch(() => {});
 }

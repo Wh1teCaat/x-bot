@@ -5,33 +5,22 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  randomBytes,
-} from "node:crypto";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  writeFileSync,
-} from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { discoverSaudiAccount } from "./saudi-discovery.ts";
 import { rankUsers } from "./user-ranking.ts";
 import { followFirstArabFollower } from "./arab-follow.ts";
 import { FollowStore, syncFollowing } from "./follow-store.ts";
 import { shouldAutoStartAccountSession, startAccountSession } from "./account-session-manager.ts";
+import { AccountStore } from "./account-store.ts";
 
 const port = Number(process.env.PORT || 3000);
 if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error("Invalid PORT");
 
 const origin = `http://127.0.0.1:${port}`;
-const authorizationScope = "tweet.read users.read follows.read follows.write offline.access";
+const authorizationScope = "users.read follows.read follows.write tweet.read tweet.write media.write offline.access";
 const redirectUri = process.env.X_REDIRECT_URI || `${origin}/oauth/callback`;
 if (redirectUri !== `${origin}/oauth/callback`)
   throw new Error(`X_REDIRECT_URI must be ${origin}/oauth/callback`);
@@ -51,19 +40,6 @@ const dataDir =
   (process.env.NODE_ENV === "test" && process.env.X_TEST_DATA_DIR) || ".data";
 
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-const keyPath = join(dataDir, "key");
-
-if (!existsSync(keyPath)) {
-  try {
-    writeFileSync(keyPath, randomBytes(32), { mode: 0o600, flag: "wx" });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  }
-}
-
-const key = readFileSync(keyPath);
-if (key.length !== 32) throw new Error("Invalid encryption key");
-const storePath = join(dataDir, "accounts.enc");
 
 type User = { id: string; name: string; username: string };
 
@@ -82,41 +58,40 @@ type Account = {
   scope?: string;
 };
 
-/** 解密并读取本地保存的授权账号。 */
-function readAccounts(): Record<string, Account> {
-  if (!existsSync(storePath)) return {};
+const accountStore = new AccountStore(dataDir);
 
-  const blob = readFileSync(storePath);
-  const decipher = createDecipheriv("aes-256-gcm", key, blob.subarray(0, 12));
-  decipher.setAuthTag(blob.subarray(12, 28));
-
-  return JSON.parse(
-    Buffer.concat([
-      decipher.update(blob.subarray(28)),
-      decipher.final(),
-    ]).toString(),
-  );
+/** 将账号表记录转换为可用的授权账号；无令牌的记录不对外。 */
+function accountFromRecord(record: {
+  uuid: string | null;
+  name: string | null;
+  username: string;
+  accessToken: string | null;
+  refreshToken: string | null;
+  expiresAt: number | null;
+  scope: string | null;
+}): Account | undefined {
+  if (!record.uuid || !record.accessToken) return undefined;
+  return {
+    user: { id: record.uuid, name: record.name ?? record.username, username: record.username },
+    accessToken: record.accessToken,
+    refreshToken: record.refreshToken ?? undefined,
+    expiresAt: record.expiresAt ?? 0,
+    scope: record.scope ?? undefined,
+  };
 }
 
-/** 加密保存账号令牌，并通过原子替换避免部分写入。 */
+/** 保存授权账号的身份与令牌，并标记为已认证。 */
 function saveAccount(account: Account) {
-  const accounts = readAccounts();
-  accounts[account.user.id] = account;
-
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  const encrypted = Buffer.concat([
-    cipher.update(JSON.stringify(accounts)),
-    cipher.final(),
-  ]);
-  const temp = `${storePath}.${randomBytes(8).toString("hex")}.tmp`;
-
-  writeFileSync(temp, Buffer.concat([iv, cipher.getAuthTag(), encrypted]), {
-    mode: 0o600,
-    flag: "wx",
+  accountStore.upsert({
+    uuid: account.user.id,
+    name: account.user.name,
+    username: account.user.username,
+    authenticated: true,
+    accessToken: account.accessToken,
+    refreshToken: account.refreshToken ?? null,
+    expiresAt: account.expiresAt,
+    scope: account.scope ?? null,
   });
-  renameSync(temp, storePath);
-  chmodSync(storePath, 0o600);
 }
 
 class HttpError extends Error {
@@ -153,6 +128,97 @@ function headers(res: ServerResponse) {
 function json(res: ServerResponse, status: number, value: unknown) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(value));
+}
+
+/** 读取并解析小体积 JSON 请求体。 */
+async function readJsonBody(req: IncomingMessage): Promise<any> {
+  let body = "";
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > 4096) throw new HttpError(413, "请求体过大");
+  }
+  try { return JSON.parse(body || "{}"); }
+  catch { throw new HttpError(400, "请求体不是有效的 JSON"); }
+}
+
+/** 确保过滤规则存在；规则按应用共享，重复添加由 X 返回错误，故先查询。 */
+async function ensureFilterRule(account: Account, value: string) {
+  const list = await xRequest(`/2/tweets/search/stream/rules`, { headers: { Authorization: `Bearer ${account.accessToken}` } });
+  const exists = Array.isArray(list.data) && list.data.some((rule: { value?: string }) => rule.value === value);
+  if (!exists) {
+    await xRequest(`/2/tweets/search/stream/rules`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${account.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ add: [{ value }] }),
+    });
+  }
+}
+
+/** 打开 X filtered stream 并把推文流透传给客户端；断线或出错时结束响应。 */
+async function proxyFilteredStream(res: ServerResponse, account: Account, username: string) {
+  await ensureFilterRule(account, `from:${username} -is:retweet`);
+  const controller = new AbortController();
+  const onClose = () => controller.abort();
+  res.once("close", onClose);
+  try {
+    const streamParams = new URLSearchParams({
+      "tweet.fields": "attachments,text",
+      expansions: "attachments.media_keys",
+      "media.fields": "type,url,preview_image_url",
+    });
+    const upstream = await fetch(`${apiBase}/2/tweets/search/stream?${streamParams}`, {
+      headers: { Authorization: `Bearer ${account.accessToken}` },
+      signal: controller.signal,
+    });
+    if (!upstream.ok || !upstream.body) {
+      throw new HttpError(upstream.status, `无法连接 X 推文流（HTTP ${upstream.status}），请确认 API 套餐支持 filtered stream。`);
+    }
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    const reader = upstream.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+    res.end();
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    if (!res.headersSent) {
+      const e = error instanceof HttpError ? error : new HttpError(502, "无法连接 X 推文流。");
+      json(res, e.status, { error: e.message });
+    } else {
+      res.end();
+    }
+  } finally {
+    res.off("close", onClose);
+  }
+}
+
+/** 下载 pbs.twimg.com 图片并上传到 X，返回 media_id。 */
+async function uploadMedia(account: Account, url: string): Promise<string> {
+  let image: Response;
+  try { image = await fetch(url, { signal: AbortSignal.timeout(30000) }); }
+  catch { throw new HttpError(502, "无法下载图片。"); }
+  if (!image.ok) throw new HttpError(502, `图片下载失败（HTTP ${image.status}）。`);
+  const type = (image.headers.get("content-type") || "").split(";")[0].toLowerCase();
+  if (!["image/jpeg", "image/png", "image/webp"].includes(type)) throw new HttpError(400, "仅支持 jpg/png/webp 图片。");
+  const bytes = Buffer.from(await image.arrayBuffer());
+  if (!bytes.length || bytes.length > 5 * 1024 * 1024) throw new HttpError(400, "图片为空或超过 5 MB。");
+
+  let result: Response;
+  try {
+    result = await fetch(`${apiBase}/2/media/upload`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${account.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ media: bytes.toString("base64"), media_category: "tweet_image", media_type: type }),
+      signal: AbortSignal.timeout(60000),
+    });
+  } catch { throw new HttpError(502, "无法上传图片到 X。"); }
+  const payload: any = await result.json().catch(() => ({}));
+  if (!result.ok) throw new HttpError(result.status === 429 ? 429 : 502, `X 图片上传失败（HTTP ${result.status}）。`);
+  const mediaId = payload.data?.media_id_string ?? payload.data?.id;
+  if (!mediaId) throw new HttpError(502, "X 未返回 media_id。");
+  return String(mediaId);
 }
 
 /** 从请求头中提取指定的 OAuth 状态 Cookie。 */
@@ -265,7 +331,8 @@ function fromToken(user: User, token: Token, previous?: Account): Account {
 
 /** 获取有效令牌，必要时合并并发刷新请求。 */
 async function usableAccount(id: string): Promise<Account> {
-  const current = readAccounts()[id];
+  const record = accountStore.getByUuid(id);
+  const current = record ? accountFromRecord(record) : undefined;
 
   if (!current) throw new HttpError(404, "未找到授权账号。");
   if (current.expiresAt > Date.now() + 60_000) return current;
@@ -536,6 +603,51 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const postTweetMatch = url.pathname.match(/^\/api\/accounts\/(\d{1,19})\/tweets$/);
+    if (req.method === "POST" && postTweetMatch) {
+      if (req.headers.origin !== origin || req.headers["x-local-request"] !== "1")
+        throw new HttpError(403, "Invalid local request");
+      const account = await usableAccount(postTweetMatch[1]);
+      if (!account.scope?.split(/\s+/).includes("tweet.write"))
+        throw new HttpError(403, "账号缺少发帖权限，请重新授权并授予 tweet.write 权限。");
+      const { text, media_ids } = await readJsonBody(req);
+      if (typeof text !== "string")
+        throw new HttpError(400, "text 必须是字符串。");
+      let mediaIds: string[] = [];
+      if (media_ids !== undefined) {
+        if (!Array.isArray(media_ids) || media_ids.length > 4 || media_ids.some((id: unknown) => typeof id !== "string" || !/^\d{1,19}$/.test(id)))
+          throw new HttpError(400, "media_ids 必须是不超过 4 个的数字 ID。");
+        mediaIds = media_ids;
+      }
+      const trimmed = text.trim();
+      if ((!trimmed && !mediaIds.length) || trimmed.length > 280)
+        throw new HttpError(400, "text 必须为 1–280 字符，或提供图片。");
+      const body: Record<string, unknown> = { text: trimmed };
+      if (mediaIds.length) body.media = { media_ids: mediaIds };
+      const result = await xRequest("/2/tweets", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${account.accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      json(res, 200, result);
+      return;
+    }
+
+    const uploadMediaMatch = url.pathname.match(/^\/api\/accounts\/(\d{1,19})\/media$/);
+    if (req.method === "POST" && uploadMediaMatch) {
+      if (req.headers.origin !== origin || req.headers["x-local-request"] !== "1")
+        throw new HttpError(403, "Invalid local request");
+      const account = await usableAccount(uploadMediaMatch[1]);
+      if (!account.scope?.split(/\s+/).includes("media.write"))
+        throw new HttpError(403, "账号缺少媒体上传权限，请重新授权并授予 media.write 权限。");
+      const { url: imageUrl } = await readJsonBody(req);
+      if (typeof imageUrl !== "string" || !/^https:\/\/pbs\.twimg\.com\//.test(imageUrl))
+        throw new HttpError(400, "url 必须是 pbs.twimg.com 的图片地址。");
+      const mediaId = await uploadMedia(account, imageUrl);
+      json(res, 200, { data: { media_id: mediaId } });
+      return;
+    }
+
     if (req.method !== "GET" || !url.pathname.startsWith("/api/"))
       throw new HttpError(404, "Not found");
     if (req.headers["x-local-request"] !== "1")
@@ -543,14 +655,15 @@ const server = createServer(async (req, res) => {
 
     if (url.pathname === "/api/accounts") {
       json(res, 200, {
-        accounts: Object.values(readAccounts()).map(
-          ({ user, expiresAt, scope, refreshToken }) => ({
-            user,
-            expiresAt,
-            scope,
-            refreshable: Boolean(refreshToken),
-          }),
-        ),
+        accounts: accountStore.list().flatMap((record) => {
+          const account = accountFromRecord(record);
+          return account ? [{
+            user: account.user,
+            expiresAt: account.expiresAt,
+            scope: account.scope,
+            refreshable: Boolean(account.refreshToken),
+          }] : [];
+        }),
       });
       return;
     }
@@ -568,6 +681,53 @@ const server = createServer(async (req, res) => {
       const params = new URLSearchParams({ usernames: names.join(",") });
       const result = await xRequest(`/2/users/by?${params}`, { headers: { Authorization: `Bearer ${account.accessToken}` } });
       json(res, 200, result); return;
+    }
+
+    const timeline = url.pathname.match(/^\/api\/accounts\/(\d{1,19})\/users\/(\d{1,19})\/tweets$/);
+    if (timeline) {
+      const account = await usableAccount(timeline[1]);
+      if (!account.scope?.split(/\s+/).includes("users.read")) throw new HttpError(403, "账号缺少用户读取权限，请重新授权。");
+      const maxResults = url.searchParams.get("max_results") ?? "100";
+      if (!/^\d+$/.test(maxResults) || Number(maxResults) < 1 || Number(maxResults) > 100) throw new HttpError(400, "max_results 必须是 1 到 100 的整数。");
+      const params = new URLSearchParams({ max_results: maxResults });
+      const sinceId = url.searchParams.get("since_id");
+      if (sinceId) {
+        if (!/^\d{1,19}$/.test(sinceId)) throw new HttpError(400, "since_id 无效");
+        params.set("since_id", sinceId);
+      }
+      const exclude = url.searchParams.get("exclude");
+      if (exclude) params.set("exclude", exclude);
+      const fields = url.searchParams.get("tweet.fields");
+      if (fields) params.set("tweet.fields", fields);
+      const expansions = url.searchParams.get("expansions");
+      if (expansions) params.set("expansions", expansions);
+      const mediaFields = url.searchParams.get("media.fields");
+      if (mediaFields) params.set("media.fields", mediaFields);
+      const result = await xRequest(`/2/users/${timeline[2]}/tweets?${params}`, { headers: { Authorization: `Bearer ${account.accessToken}` } });
+      json(res, 200, result); return;
+    }
+
+    const tweetMedia = url.pathname.match(/^\/api\/accounts\/(\d{1,19})\/tweets\/(\d{1,19})\/media$/);
+    if (tweetMedia) {
+      const account = await usableAccount(tweetMedia[1]);
+      if (!account.scope?.split(/\s+/).includes("tweet.read")) throw new HttpError(403, "账号缺少读取推文权限，请重新授权。");
+      const params = new URLSearchParams({ "tweet.fields": "attachments", expansions: "attachments.media_keys", "media.fields": "type,url,preview_image_url" });
+      const result = await xRequest(`/2/tweets/${tweetMedia[2]}?${params}`, { headers: { Authorization: `Bearer ${account.accessToken}` } });
+      const images = (result.includes?.media || [])
+        .filter((m: { type?: string; url?: string }) => m.type === "photo" && typeof m.url === "string")
+        .map((m: { url: string }) => m.url);
+      json(res, 200, { data: { images } });
+      return;
+    }
+
+    const stream = url.pathname.match(/^\/api\/accounts\/(\d{1,19})\/stream\/tweets$/);
+    if (stream) {
+      const account = await usableAccount(stream[1]);
+      if (!account.scope?.split(/\s+/).includes("tweet.read")) throw new HttpError(403, "账号缺少读取推文权限，请重新授权。");
+      const username = url.searchParams.get("username");
+      if (!username || !/^[A-Za-z0-9_]{1,15}$/.test(username)) throw new HttpError(400, "username 无效");
+      await proxyFilteredStream(res, account, username);
+      return;
     }
 
     const match = url.pathname.match(

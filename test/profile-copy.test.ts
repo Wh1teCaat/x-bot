@@ -8,6 +8,8 @@ test('accepts valid handles and rejects unsafe input', () => {
 });
 test('accepts only the X avatar CDN and preserves the original image', () => {
   assert.equal(originalAvatarUrl('https://pbs.twimg.com/profile_images/123/foo_normal.jpg'), 'https://pbs.twimg.com/profile_images/123/foo.jpg');
+  assert.equal(originalAvatarUrl('https://pbs.twimg.com/profile_images/123/foo_400x400.jpg'), 'https://pbs.twimg.com/profile_images/123/foo.jpg');
+  assert.equal(originalAvatarUrl('https://pbs.twimg.com/profile_images/123/foo_200x200.jpg'), 'https://pbs.twimg.com/profile_images/123/foo.jpg');
   assert.throws(() => originalAvatarUrl('https://evil.example/profile_images/123/x.jpg'));
   assert.throws(() => originalAvatarUrl('http://pbs.twimg.com/profile_images/123/x.jpg'));
 });
