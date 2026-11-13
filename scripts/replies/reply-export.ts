@@ -1,4 +1,4 @@
-/** 搜索帖子并控制 CommentCrate 扫描和导出回复。 */
+/** 读取博主帖子并控制 CommentCrate 扫描和导出回复。 */
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { actionDelay } from '../browser/action-delay.ts';
@@ -34,26 +34,22 @@ export function bestPost(posts) {
   return posts.filter(p => Number.isFinite(p.replies)).reduce((best, post) => !best || post.replies > best.replies ? post : best, null);
 }
 
-/** 搜索关键词并滚动收集最多十条可识别帖子。 */
-export async function findPosts(page, keyword, guard = () => {}) {
-  await guard();
-  await actionDelay(page);
-  await page.goto(`https://x.com/search?q=${encodeURIComponent(keyword)}&src=typed_query`, { waitUntil: 'domcontentloaded' });
-  await page.evaluate(key => sessionStorage.setItem(key, '1'), TAB_MARKER);
-  await page.getByTestId('tweet').first().waitFor({ timeout: 30000 });
+/** 滚动收集当前时间线中最多十条可识别帖子；给定作者时只保留该作者的帖子。 */
+async function collectPosts(page, guard, limit = 10, author?: string) {
   const posts = new Map();
   let unchanged = 0;
-  for (let i = 0; i < 20 && posts.size < 10 && unchanged < 4; i++) {
+  for (let i = 0; i < 20 && posts.size < limit && unchanged < 4; i++) {
     await guard();
     const articles = page.getByTestId('tweet');
     const n = await articles.count();
     const before = posts.size;
-    for (let j = 0; j < n && posts.size < 10; j++) {
+    for (let j = 0; j < n && posts.size < limit; j++) {
       const article = articles.nth(j);
       // The timestamp link identifies the outer post, unlike embedded quoted posts.
       const link = article.locator('a:has(time)').first();
       const href = await link.getAttribute('href').catch(() => null);
       if (!href || !/^\/[^/]+\/status\/\d+$/.test(href) || posts.has(href)) continue;
+      if (author && !href.toLowerCase().startsWith(`/${author.toLowerCase()}/status/`)) continue;
       const reply = article.getByTestId('reply').first();
       if (!await reply.count()) continue;
       const visible = (await reply.innerText()).trim();
@@ -62,13 +58,24 @@ export async function findPosts(page, keyword, guard = () => {}) {
       posts.set(href, { url: `https://x.com${href}`, replies: count });
     }
     unchanged = posts.size === before ? unchanged + 1 : 0;
-    if (posts.size < 10) {
+    if (posts.size < limit) {
       await actionDelay(page);
       await page.mouse.wheel(0, 1300);
       await page.waitForTimeout(1800);
     }
   }
   return [...posts.values()];
+}
+
+/** 打开指定博主的公开主页，收集其本人帖子和回复数。 */
+export async function findBloggerPosts(page, blogger, guard = () => {}) {
+  if (!/^[A-Za-z0-9_]{1,15}$/.test(blogger)) throw new Error('博主用户名无效');
+  await guard();
+  await actionDelay(page);
+  await page.goto(`https://x.com/${blogger}`, { waitUntil: 'domcontentloaded' });
+  await page.evaluate(key => sessionStorage.setItem(key, '1'), TAB_MARKER);
+  await page.getByTestId('tweet').first().waitFor({ timeout: 30000 });
+  return collectPosts(page, guard, 10, blogger);
 }
 
 const EXTENSION_ID = 'haaahmifcccbgagmopbhbkgabgblmcbl';
@@ -111,6 +118,7 @@ export async function scanAndExport(page, post, outputDir = '.data/reply-exports
   await actionDelay(page);
   await page.goto(post.url, { waitUntil: 'domcontentloaded' });
   await page.bringToFront();
+  const postText = await page.locator('[data-testid="tweetText"]').first().innerText({ timeout: 5000 }).catch(() => '');
   try {
     helper = await context.newPage();
     await helper.goto(`chrome-extension://${EXTENSION_ID}/popup/popup.html`);
@@ -189,6 +197,6 @@ export async function scanAndExport(page, post, outputDir = '.data/reply-exports
     const id = new URL(post.url).pathname.split('/').pop();
     const destination = path.join(outputDir, `${id}-${Date.now()}.csv`);
     await file.saveAs(destination);
-    return { destination, count: current.count, stoppedWhy: current.stoppedWhy };
+    return { destination, count: current.count, stoppedWhy: current.stoppedWhy, text: postText.trim().slice(0, 2000) };
   } finally { if (helper) await helper.close().catch(() => {}); }
 }

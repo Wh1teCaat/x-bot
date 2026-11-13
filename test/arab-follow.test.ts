@@ -9,7 +9,7 @@ test("selects the highest ranked blogger and follows exactly one returned follow
     knownStatus: () => undefined,
     search: async () => { calls.push("search"); return { data: [
       { id: "10", public_metrics: { followers_count: 10000 } },
-      { id: "20", location: "Riyadh", public_metrics: { followers_count: 1 } },
+      { id: "20", description: "مرحبا", public_metrics: { followers_count: 1 } },
     ] }; },
     followers: async (id) => { calls.push(`followers:${id}`); return { data: [{ id: "30", connection_status: [] }] }; },
     follow: async (id) => { calls.push(`follow:${id}`); return { data: { following: true } }; },

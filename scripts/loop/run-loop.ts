@@ -5,7 +5,7 @@ import { mkdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { connectTestingBrowser } from '../browser/browser-connection.ts';
-import { findPosts, getCollectorPage } from '../replies/reply-export.ts';
+import { findBloggerPosts, getCollectorPage } from '../replies/reply-export.ts';
 import { ResilienceStore } from './resilience.ts';
 import { createLoopOrchestrator } from './loop-orchestrator.ts';
 import { parseLoopArguments } from './loop-arguments.ts';
@@ -24,17 +24,19 @@ console.log(`队列任务 ID：${runId}`);
 const execute = ({ resume, probe = false }) => new Promise<number>((resolve, reject) => {
   const childArgs = ['scripts/loop/loop-run.ts', ...(resume ? ['--resume', runId] : ['--run-id', runId]),
     ...(args.accountId ? ['--account-id', args.accountId] : []), ...(args.username ? ['--username', args.username] : []),
+    ...(args.blogger ? ['--blogger', args.blogger] : []), ...(args.language ? ['--language', args.language] : []),
+    ...(args.evaluate ? ['--evaluate'] : []),
     ...(args.cdpPort ? ['--cdp-port', String(args.cdpPort)] : []), ...(probe ? ['--follow-probe'] : [])];
   const child = spawn(process.execPath, childArgs, { stdio: 'inherit' });
   child.once('error', reject);
   child.once('exit', code => resolve(code ?? 1));
 });
-/** 对搜索阶段执行只读探测，并拒绝带限流提示的结果。 */
+/** 对博主帖子读取阶段执行只读探测，并拒绝带限流提示的结果。 */
 async function probe(row) {
   let browser, context, listener;
   try {
-    const keyword = JSON.parse(row.state).keyword;
-    if (!keyword) return false;
+    const blogger = JSON.parse(row.state).blogger;
+    if (!blogger) return false;
     browser = await connectTestingBrowser({ timeout: 60000, port: args.cdpPort });
     context = browser.contexts()[0];
     if (!context) return false;
@@ -47,7 +49,7 @@ async function probe(row) {
     const guard = async () => {
       if (limited || await page.getByText(/sorry, you are rate limited|速率受限|请求过于频繁/i).first().isVisible().catch(() => false)) throw new Error('X 限流');
     };
-    const posts = await findPosts(page, keyword, guard);
+    const posts = await findBloggerPosts(page, blogger, guard);
     await guard();
     return posts.length > 0;
   } catch { return false; }

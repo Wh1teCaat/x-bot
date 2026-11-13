@@ -8,7 +8,6 @@ import {
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { discoverSaudiAccount } from "./saudi-discovery.ts";
 import { rankUsers } from "./user-ranking.ts";
 import { followFirstArabFollower } from "./arab-follow.ts";
 import { FollowStore, syncFollowing } from "./follow-store.ts";
@@ -554,52 +553,6 @@ const server = createServer(async (req, res) => {
       } finally {
         runningFollow.delete(accountId);
       }
-      return;
-    }
-
-    const discoveryMatch = url.pathname.match(
-      /^\/api\/accounts\/(\d+)\/discover-saudi$/,
-    );
-    if (req.method === "POST" && discoveryMatch) {
-      if (
-        req.headers.origin !== origin ||
-        req.headers["x-local-request"] !== "1"
-      ) {
-        throw new HttpError(403, "Invalid local request");
-      }
-
-      const account = await usableAccount(discoveryMatch[1]);
-      const authHeaders = { Authorization: `Bearer ${account.accessToken}` };
-      const result = await discoverSaudiAccount({
-        search: (keyword, nextToken) => {
-          const params = new URLSearchParams({
-            query: keyword,
-            max_results: "10",
-            "user.fields": "description,location,public_metrics,verified",
-          });
-          if (nextToken) params.set("next_token", nextToken);
-          return xRequest(`/2/users/search?${params}`, {
-            headers: authHeaders,
-          });
-        },
-        timeline: (id) => {
-          const params = new URLSearchParams({
-            max_results: "10",
-            exclude: "retweets",
-            "tweet.fields": "lang,referenced_tweets",
-          });
-          return xRequest(`/2/users/${id}/tweets?${params}`, {
-            headers: authHeaders,
-          });
-        },
-      });
-      json(res, 200, {
-        ...result,
-        data: rankUsers(result.data, (item) => item.user),
-        ...(Array.isArray(result.undetermined)
-          ? { undetermined: rankUsers(result.undetermined, (item) => item.user) }
-          : {}),
-      });
       return;
     }
 

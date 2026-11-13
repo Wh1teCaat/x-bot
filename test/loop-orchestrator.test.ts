@@ -26,7 +26,7 @@ test('search limit persists cooldown, retries probe after failure, then resumes 
     calls++;
     if (calls === 1) {
       assert.equal(resume, false);
-      db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?)').run('run', 'failed', 'search', '{"keyword":"test"}');
+      db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?)').run('run', 'failed', 'search', '{"blogger":"test"}');
       resilience.open('x', '429'); resilience.failure('run', 'search', { kind: 'rate_limit', reason: '429', retryable: false }); return 1;
     }
     assert.equal(resume, true); assert.equal(resilience.circuit('x').state, 'closed');
@@ -50,19 +50,19 @@ test('never automatically repeats an interrupted export or follow', async () => 
   }
 });
 
-test('a temporary search failure retries from the saved stage', async () => {
+test('a temporary model failure stops for manual review instead of auto-retrying', async () => {
   const { db, resilience, clock } = setup(); let calls = 0;
   const loop = createLoopOrchestrator({ db, runId: 'retry', ...clock, probe: async () => false, execute: async () => {
-    if (++calls === 1) { db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?)').run('retry', 'failed', 'search', '{}'); resilience.failure('retry', 'search', { kind: 'transient', reason: 'timeout', retryable: true }); return 1; }
-    db.prepare("UPDATE runs SET status='completed',stage='done'").run(); return 0;
+    calls++; db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?)').run('retry', 'failed', 'evaluate', '{}');
+    resilience.failure('retry', 'evaluate', { kind: 'transient', reason: 'timeout', retryable: true }); return 1;
   } });
-  const done = loop.start(); await tick(); assert.equal(calls, 1); await clock.advance(2000);
-  assert.equal(await done, 'completed'); assert.equal(calls, 2); db.close();
+  assert.equal(await loop.start(), 'manual'); await clock.advance(3600000);
+  assert.equal(calls, 1); db.close();
 });
 
 test('restarts a persisted cooldown without launching the failed run early', async () => {
   const { db, resilience, clock } = setup(); let executions = 0;
-  db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?)').run('resume', 'failed', 'search', '{"keyword":"test"}');
+  db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?)').run('resume', 'failed', 'search', '{"blogger":"test"}');
   resilience.open('x', '429');
   const options = { db, runId: 'resume', ...clock, execute: async () => { executions++; db.prepare("UPDATE runs SET status='completed',stage='done'").run(); return 0; } };
   const first = createLoopOrchestrator({ ...options, probe: async () => false });

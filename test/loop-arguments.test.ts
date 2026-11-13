@@ -5,14 +5,22 @@ import { parseLoopArguments } from '../scripts/loop/loop-arguments.ts';
 
 test('accepts account-bound browser arguments without environment variables', () => {
   assert.deepEqual(parseLoopArguments(['--account-id', '123', '--username', 'Alice', '--cdp-port', '9334']), {
-    followProbe: false, accountId: '123', username: 'Alice', cdpPort: 9334,
+    followProbe: false, evaluate: false, accountId: '123', username: 'Alice', cdpPort: 9334,
   });
+});
+
+test('accepts optional blogger, language and model-evaluation paths', () => {
+  assert.deepEqual(
+    parseLoopArguments(['--account-id', '123', '--blogger', '@Blogger', '--language', 'ar', '--evaluate']),
+    { followProbe: false, evaluate: true, accountId: '123', blogger: 'Blogger', language: 'ar' },
+  );
 });
 
 test('rejects malformed, repeated, unbound and internal-only arguments', () => {
   for (const args of [
     ['--username', 'Alice'], ['--account-id', '../1'], ['--cdp-port', '70000'],
     ['--account-id', '1', '--account-id', '2'], ['--follow-probe'], ['--run-id', 'x'],
+    ['--blogger', 'bad-name'], ['--language', 'en'],
   ]) assert.throws(() => parseLoopArguments(args));
 });
 

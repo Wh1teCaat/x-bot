@@ -41,23 +41,19 @@ export function createLoopOrchestrator({ db, runId, execute, probe, hasUncertain
       const row = getRun();
       const failure = db.prepare("SELECT * FROM failure_jobs WHERE run_id=? AND stage=? AND status!='resolved' ORDER BY updated_at DESC LIMIT 1").get(runId, row?.stage);
       const circuit = db.prepare("SELECT state FROM circuits WHERE scope='x'").get();
-      if (['search', 'follow'].includes(row?.stage) && (failure?.kind === 'rate_limit' || circuit?.state === 'open')) {
+      if (['search', 'qualify', 'follow'].includes(row?.stage) && (failure?.kind === 'rate_limit' || circuit?.state === 'open')) {
         if (row.stage === 'follow' && await hasUncertain(row)) {
           db.prepare("UPDATE loop_jobs SET status='manual',last_error=? WHERE id=?").run('关注结果不明，需核实', runId);
           finishOnce('manual'); return;
         }
         db.prepare("UPDATE loop_jobs SET status='cooldown',last_error=? WHERE id=?").run('X 限流', runId);
         await cooldown.limited();
-        onLog(`X ${row.stage === 'follow' ? '关注' : '搜索'}受限：15 分钟后进入半开探测。`);
+        onLog(`X ${row.stage === 'follow' ? '关注' : row.stage === 'qualify' ? '主页读取' : '帖子读取'}受限：15 分钟后进入半开探测。`);
         return;
       }
-      if (['keyword', 'search', 'evaluate'].includes(row?.stage) && failure?.kind === 'transient' && failure.status === 'pending') {
-        const attempt = getJob().attempts + 1;
+      if (row?.stage === 'evaluate' && failure?.kind === 'transient' && failure.status === 'pending') {
         // The LLM circuit remains open after exhaustion; do not silently clear it.
-        if (row.stage !== 'search') { db.prepare("UPDATE loop_jobs SET status='manual',last_error=? WHERE id=?").run('模型熔断需检查', runId); finishOnce('manual'); return; }
-        db.prepare("UPDATE loop_jobs SET status='ready',due=?,attempts=?,last_error=? WHERE id=?").run(now() + Math.min(60000, 1000 * 2 ** attempt), attempt, '暂时性错误', runId);
-        onLog('搜索暂时失败，已安排重试。');
-        return;
+        db.prepare("UPDATE loop_jobs SET status='manual',last_error=? WHERE id=?").run('模型熔断需检查', runId); finishOnce('manual'); return;
       }
       db.prepare("UPDATE loop_jobs SET status='manual',last_error=? WHERE id=?").run(String(error.message || '执行失败').slice(0, 200), runId);
       finishOnce('manual');
@@ -127,7 +123,7 @@ export function createLoopOrchestrator({ db, runId, execute, probe, hasUncertain
       }
       if (job?.status === 'running') {
         const row = getRun();
-        if (alive(job.owner_pid) || alive(row?.pid) || !row || !['keyword', 'search', 'evaluate'].includes(row.stage)) { finishOnce('manual'); return done; }
+        if (alive(job.owner_pid) || alive(row?.pid) || !row || !['search', 'filter', 'qualify', 'evaluate'].includes(row.stage)) { finishOnce('manual'); return done; }
         const claimed = db.prepare("UPDATE loop_jobs SET status='manual',owner_pid=NULL WHERE id=? AND status='running' AND owner_pid IS ?").run(runId, job.owner_pid);
         if (!claimed.changes) { finishOnce('manual'); return done; }
         onLog('发现中断的只读阶段，将从持久化断点恢复。');

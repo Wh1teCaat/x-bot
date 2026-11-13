@@ -11,9 +11,9 @@ import { accountReadiness } from '../account/account-readiness.ts';
 import { fingerprintFor } from '../browser/fingerprint.ts';
 import { AccountStore } from '../../src/account-store.ts';
 
-const accountId = process.argv[2];
-if (process.argv.length !== 3 || !/^\d{1,19}$/.test(accountId || '')) {
-  console.error('用法：npm run loop -- <已授权账号数字ID>'); process.exit(1);
+const [accountId, ...forwarded] = process.argv.slice(2);
+if (!/^\d{1,19}$/.test(accountId || '')) {
+  console.error('用法：npm run loop -- <已授权账号数字ID> [--blogger <博主用户名>] [--language ar] [--evaluate]'); process.exit(1);
 }
 if (process.platform !== 'darwin') { console.error('目前只支持 macOS'); process.exit(1); }
 const portText = process.env.PORT || '3000';
@@ -135,7 +135,7 @@ try {
   }
   if (stopping) throw new Error('已取消');
   console.log('账号及插件检查通过，开始执行单轮任务；任务可能发送关注请求。');
-  worker = spawn(process.execPath, ['scripts/loop/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(cdpPort)], { stdio: 'inherit', detached: true });
+  worker = spawn(process.execPath, ['scripts/loop/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(cdpPort), ...forwarded], { stdio: 'inherit', detached: true });
   const code = await new Promise<number>((resolve, reject) => { worker.once('error', reject); worker.once('exit', value => resolve(value ?? 1)); });
   if (code !== 0) throw new Error(`单轮任务停止，退出码 ${code}`);
   console.log('单轮任务已完成。');

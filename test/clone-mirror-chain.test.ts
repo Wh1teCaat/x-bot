@@ -23,7 +23,7 @@ test("clone result feeds the mirror watch, backfills and then mirrors streamed p
       copiedFromUsername: "jjaibot",
       copiedFromName: "JJ AI Bot",
       copiedAt: new Date().toISOString(),
-      keywords: ["AI", "Saudi Arabia"],
+      keywords: ["AI", "typescript"],
     });
     const clone = accounts.getByUsername("subaccount")!;
     assert.equal(clone.cloned, true);

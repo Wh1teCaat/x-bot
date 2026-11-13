@@ -29,7 +29,7 @@ export type AccountRecord = {
   copiedFromName: string | null;
   /** clone 完成时间（ISO 字符串）。 */
   copiedAt: string | null;
-  /** 该博主的关键词，用于后续检索相关博主。 */
+  /** 历史关键词字段；保留兼容，不再参与当前筛选流程。 */
   keywords: string[];
 };
 

@@ -66,17 +66,8 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
         assert.match(url.searchParams.get("user.fields")!, /public_metrics/);
         res.end(JSON.stringify({ data: [
           { id: "88", public_metrics: { followers_count: 10000 } },
-          { id: "99", location: "Saudi Arabia", public_metrics: { followers_count: 1 } },
+          { id: "99", description: "مرحبا", location: "Saudi Arabia", public_metrics: { followers_count: 1 } },
         ] }));
-        return;
-      }
-      if (
-        ["Saudi", "Saudi Arabia", "Riyadh", "Jeddah", "Dammam"].includes(
-          url.searchParams.get("query") || "",
-        )
-      ) {
-        assert.equal(req.headers.authorization, "Bearer new1");
-        res.end(JSON.stringify({ data: [], meta: { result_count: 0 } }));
         return;
       }
       assert.equal(url.searchParams.get("query"), "python developer");
@@ -387,24 +378,6 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
       { headers: header },
     );
     assert.equal(invalidSearch.status, 400);
-
-    const deniedDiscovery = await fetch(
-      `${base}/api/accounts/1/discover-saudi`,
-      {
-        method: "POST",
-        headers: { ...header, Origin: "https://evil.example" },
-      },
-    );
-    assert.equal(deniedDiscovery.status, 403);
-    const discovery = await fetch(`${base}/api/accounts/1/discover-saudi`, {
-      method: "POST",
-      headers: { ...header, Origin: base },
-    });
-    const discoveryResult = (await discovery.json()) as any;
-    assert.equal(discovery.status, 200);
-    assert.equal(discoveryResult.status, "empty");
-    assert.equal(discoveryResult.search_requests, 5);
-    assert.equal(discoveryResult.timeline_requests, 0);
 
     const followers = await fetch(
       `${base}/api/accounts/1/users/123/followers?max_results=500&pagination_token=next%20page`,

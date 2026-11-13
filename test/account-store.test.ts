@@ -187,8 +187,8 @@ test("persists blogger keywords for later retrieval", () => {
   const dir = mkdtempSync(join(tmpdir(), "x-account-store-"));
   try {
     const store = new AccountStore(dir);
-    store.upsert({ username: "blogger1", keywords: ["python developer", "Saudi Arabia", "AI"] });
-    assert.deepEqual(store.getByUsername("blogger1")!.keywords, ["python developer", "Saudi Arabia", "AI"]);
+    store.upsert({ username: "blogger1", keywords: ["python developer", "typescript", "AI"] });
+    assert.deepEqual(store.getByUsername("blogger1")!.keywords, ["python developer", "typescript", "AI"]);
     store.upsert({ username: "blogger1", cloned: true, keywords: ["updated"] });
     const rec = store.getByUsername("blogger1")!;
     assert.equal(rec.cloned, true);

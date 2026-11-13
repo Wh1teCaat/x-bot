@@ -42,7 +42,7 @@ export class LocalFollowClient {
     if (!found) throw new Error(accounts.length > 1 && !preferred ? '存在多个授权账号，请配置 X_FOLLOW_ACCOUNT_ID' : '没有可用的关注授权，请打开授权页面并重新授权');
     return found.user;
   }
-  /** 分批解析候选用户名，拒绝不符合预期的身份响应。 */
+  /** 分批解析候选用户名并返回数字 ID 映射，拒绝不符合预期的身份响应。 */
   async lookup(accountId: string, candidates: FollowCandidate[]): Promise<Record<string, string>> {
     const result: Record<string, string> = {};
     for (let i = 0; i < candidates.length; i += 100) {

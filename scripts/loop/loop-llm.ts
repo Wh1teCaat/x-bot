@@ -1,4 +1,4 @@
-/** 生成检索词并校验模型对回复用户的批量评估。 */
+/** 校验模型对回复用户的批量评估。 */
 import OpenAI from 'openai';
 
 /** 根据环境变量构建模型客户端并限制请求时长。 */
@@ -22,13 +22,6 @@ async function jsonCompletion(client, system, input) {
   try { return JSON.parse(choice.message.content); } catch { throw new Error('模型返回的 JSON 无效'); }
 }
 
-/** 生成单个可用于搜索的有效关键词。 */
-export async function generateKeyword(client, target) {
-  const result = await jsonCompletion(client, '为搜索公开话题生成一个简短、非敏感、非定向的检索词。只输出 JSON，例如 {"keyword":"Saudi Arabia"}。不要使用站点搜索操作符、URL 或用户名。', { target });
-  if (typeof result.keyword !== 'string' || !result.keyword.trim() || result.keyword.length > 80 || /[:@\n\r]/.test(result.keyword)) throw new Error('模型返回了无效关键词');
-  return result.keyword.trim();
-}
-
 /** 批量评估回复主题相关性，并验证每位候选均有唯一结果。 */
 export async function evaluateCandidates(client, candidates, target) {
   const records = candidates.map((c, i) => ({ id: i, replies: c.replies.slice(0, 3).map(s => s.slice(0, 500)) }));
@@ -39,6 +32,6 @@ export async function evaluateCandidates(client, candidates, target) {
   return result.items.map(item => {
     if (!Number.isInteger(item.id) || item.id < 0 || item.id >= records.length || seen.has(item.id) || !['relevant', 'uncertain', 'irrelevant'].includes(item.decision) || typeof item.reason !== 'string' || !item.reason.trim() || item.reason.length > 1000) throw new Error('模型候选结果格式无效');
     seen.add(item.id);
-    return { username: candidates[item.id].username, profileUrl: candidates[item.id].profileUrl, replies: candidates[item.id].replies, replyIds: candidates[item.id].replyIds || [], decision: item.decision, reason: item.reason.trim(), review: 'pending' };
+    return { ...candidates[item.id], decision: item.decision, reason: item.reason.trim(), review: 'pending' };
   });
 }
