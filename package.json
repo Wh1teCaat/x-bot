@@ -10,14 +10,14 @@
     "browser": "node scripts/browser/open-testing-browser.ts",
     "start": "node src/server.ts",
     "test": "node --test test/*.test.ts",
-    "test-loop": "node scripts/loop/test-loop.ts",
     "account": "node scripts/account/account-control.ts",
     "account:ready": "node scripts/account/account-control.ts ready",
     "loop:health": "node scripts/loop/loop-health.ts",
     "typecheck": "tsc --noEmit",
-    "loop": "node scripts/loop/login-and-run.ts",
+    "loop": "node scripts/loop/flow.ts",
     "clone_user": "node scripts/clone_user/clone_user.ts",
-    "mirror": "node scripts/mirror/mirror-loop.ts"
+    "mirror": "node scripts/mirror/mirror-loop.ts",
+    "profile:template": "node scripts/browser/make-profile-template.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

@@ -95,3 +95,19 @@ export function qualifyByFollowerBalance(
   }
   return { qualified, rejected };
 }
+
+/** 选出最终关注集合：语言直通用户始终保留；未启用模型时保留全部规则入选者。 */
+export function selectFollowCandidates({
+  qualifiedDirect = [],
+  qualifiedCandidates = [],
+  evaluations = [],
+  evaluate = false,
+}: {
+  qualifiedDirect?: CandidateWithCounts[];
+  qualifiedCandidates?: CandidateWithCounts[];
+  evaluations?: Array<CandidateWithCounts & { decision?: string }>;
+  evaluate?: boolean;
+}): CandidateWithCounts[] {
+  if (!evaluate) return [...qualifiedDirect, ...qualifiedCandidates];
+  return [...qualifiedDirect, ...evaluations.filter((item) => item.decision === "relevant")];
+}

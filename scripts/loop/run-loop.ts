@@ -25,7 +25,7 @@ const execute = ({ resume, probe = false }) => new Promise<number>((resolve, rej
   const childArgs = ['scripts/loop/loop-run.ts', ...(resume ? ['--resume', runId] : ['--run-id', runId]),
     ...(args.accountId ? ['--account-id', args.accountId] : []), ...(args.username ? ['--username', args.username] : []),
     ...(args.blogger ? ['--blogger', args.blogger] : []), ...(args.language ? ['--language', args.language] : []),
-    ...(args.evaluate ? ['--evaluate'] : []),
+    ...(args.evaluate ? ['--evaluate'] : []), ...(args.yes ? ['--yes'] : []), ...(args.postUrl ? ['--post', args.postUrl] : []),
     ...(args.cdpPort ? ['--cdp-port', String(args.cdpPort)] : []), ...(probe ? ['--follow-probe'] : [])];
   const child = spawn(process.execPath, childArgs, { stdio: 'inherit' });
   child.once('error', reject);

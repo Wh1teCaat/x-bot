@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { mkdir, access } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { resolve } from 'node:path';
+import { ensureProfileFromTemplate, PROFILE_TEMPLATE_DIR } from './profile-template.ts';
 
 const portText = process.env.X_BOT_CDP_PORT || '9333';
 if (!/^\d{1,5}$/.test(portText) || Number(portText) < 1 || Number(portText) > 65535) {
@@ -18,6 +19,8 @@ const profile = resolve('.data', 'manual-chrome-profile');
 const executable = process.env.X_BROWSER_EXECUTABLE || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 try {
   await access(executable, constants.X_OK);
+  const copied = await ensureProfileFromTemplate(profile, process.env.X_PROFILE_TEMPLATE || PROFILE_TEMPLATE_DIR);
+  if (copied) console.log('已从插件模板复制手动浏览器资料。');
   await mkdir(profile, { recursive: true, mode: 0o700 });
   const browser = spawn(executable, [`--user-data-dir=${profile}`, `--remote-debugging-port=${Number(portText)}`, '--no-first-run', 'https://x.com/'], { stdio: 'ignore' });
   await new Promise<void>((resolve, reject) => { browser.once('spawn', resolve); browser.once('error', reject); });

@@ -42,3 +42,25 @@ test("records post results and counts failed attempts", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("enqueues, claims and finishes delayed reply jobs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "x-mirror-store-"));
+  try {
+    const store = new MirrorStore(join(dir, "mirror.sqlite"));
+    store.enqueueReplyJob({ targetId: "111", tweetId: "10", posterId: "p1", targetUsername: "target", postUrl: "https://x.com/target/status/10", dueAt: 1000 });
+    assert.equal(store.dueReplyJobs(999).length, 0);
+    assert.equal(store.dueReplyJobs(1000).length, 1);
+    const job = store.dueReplyJobs(1000)[0];
+    assert.equal(store.claimReplyJob(job), true);
+    assert.equal(store.dueReplyJobs(1000).length, 0);
+    store.finishReplyJob(job, "failed", "boom", 2000);
+    assert.equal(store.dueReplyJobs(1999).length, 0);
+    assert.equal(store.dueReplyJobs(2000).length, 1);
+    assert.equal(store.listReplyJobs()[0].attempts, 1);
+    store.finishReplyJob(job, "done", null);
+    assert.equal(store.dueReplyJobs(99999).length, 0);
+    store.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

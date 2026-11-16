@@ -8,12 +8,17 @@ import { createServer } from 'node:net';
 import { resolve, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { accountReadiness } from '../account/account-readiness.ts';
+import { cookieFileCandidates, loadCookieJar, type CookieJar } from '../browser/cookies.ts';
 import { fingerprintFor } from '../browser/fingerprint.ts';
+import { ensureProfileFromTemplate, PROFILE_TEMPLATE_DIR } from '../browser/profile-template.ts';
 import { AccountStore } from '../../src/account-store.ts';
 
-const [accountId, ...forwarded] = process.argv.slice(2);
+const args = process.argv.slice(2);
+const accountId = args[0];
+const checkOnly = args.includes('--check-only');
+const forwarded = args.slice(1).filter(argument => argument !== '--check-only');
 if (!/^\d{1,19}$/.test(accountId || '')) {
-  console.error('用法：npm run loop -- <已授权账号数字ID> [--blogger <博主用户名>] [--language ar] [--evaluate]'); process.exit(1);
+  console.error('用法：npm run loop -- <已授权账号数字ID> [--check-only] [--blogger <博主用户名>] [--language ar] [--evaluate]'); process.exit(1);
 }
 if (process.platform !== 'darwin') { console.error('目前只支持 macOS'); process.exit(1); }
 const portText = process.env.PORT || '3000';
@@ -80,11 +85,27 @@ try {
   await access(executable, constants.X_OK);
   await mkdir(root, { recursive: true, mode: 0o700 });
   await acquireLock();
+  const profileCopied = await ensureProfileFromTemplate(profile, process.env.X_PROFILE_TEMPLATE || PROFILE_TEMPLATE_DIR);
+  if (profileCopied) console.log('已从插件模板复制账号浏览器资料（含已安装的 CommentCrate / exporter24）。');
   await mkdir(profile, { recursive: true, mode: 0o700 });
   store = new AccountStore(resolve('.data'));
   const fp = fingerprintFor(accountId);
-  const chromeReady = store.getByUuid(accountId)?.chromeReady ?? false;
+  const chromeReady = !profileCopied && (store.getByUuid(accountId)?.chromeReady ?? false);
+  const needsCheck = !chromeReady || checkOnly;
+  // cookie 文件只用于首次登录：已标记就绪的账号直接复用资料中的登录态，避免旧 cookie 覆盖有效会话。
+  let cookiePath: string | null = null;
+  let cookieJar: CookieJar | null = null;
   if (!chromeReady) {
+    for (const candidate of cookieFileCandidates(accountId)) {
+      try { await access(candidate, constants.R_OK); cookiePath = candidate; break; } catch {}
+    }
+  }
+  if (cookiePath) {
+    cookieJar = await loadCookieJar(cookiePath);
+    for (const warning of cookieJar.warnings) console.warn(warning);
+    console.log(`正在用 ${cookiePath} 中的 cookie 登录 @${username}，跳过手动登录窗口。`);
+  }
+  if (!chromeReady && !cookieJar) {
     console.log(`正在打开 @${username} 的登录窗口，请登录 X 并安装、授权 CommentCrate。`);
     loginBrowser = spawn(executable, [`--user-data-dir=${profile}`, '--no-first-run', 'https://x.com/home', `--lang=${fp.locale}`, `--window-size=${fp.viewport.width},${fp.viewport.height}`], { stdio: 'ignore' });
     await new Promise<void>((resolve, reject) => { loginBrowser.once('spawn', resolve); loginBrowser.once('error', reject); });
@@ -99,13 +120,17 @@ try {
       loginBrowser.kill('SIGTERM');
       await loginExit;
     }
+  } else if (chromeReady) {
+    console.log(checkOnly
+      ? `账号 @${username} 已标记为就绪，正在重新检查登录与插件……`
+      : `账号 @${username} 已登录并安装插件，跳过登录与安装步骤。`);
   } else {
-    console.log(`账号 @${username} 已登录并安装插件，跳过登录与安装步骤。`);
+    console.log(`已读取 @${username} 的 cookie，接下来检查登录态与 CommentCrate。`);
   }
   const cdpPort = await allocatePort();
-  console.log(chromeReady
-    ? '正在用 Playwright 打开该账号的浏览器资料并执行任务……'
-    : '正在用 Playwright 打开该账号的浏览器资料并检查登录和插件……');
+  console.log(needsCheck
+    ? '正在用 Playwright 打开该账号的浏览器资料并检查登录和插件……'
+    : '正在用 Playwright 打开该账号的浏览器资料并执行任务……');
   context = await chromium.launchPersistentContext(profile, {
     headless: false, executablePath: executable,
     ignoreDefaultArgs: ['--disable-extensions', '--use-mock-keychain', '--password-store=basic'],
@@ -113,12 +138,17 @@ try {
     locale: fp.locale, timezoneId: fp.timezoneId, viewport: fp.viewport, screen: fp.screen, colorScheme: fp.colorScheme,
     extraHTTPHeaders: { 'Accept-Language': fp.acceptLanguage },
   });
-  if (!chromeReady) {
+  if (needsCheck) {
+    if (!chromeReady && cookieJar) await context.addCookies(cookieJar.cookies);
     const page = context.pages()[0] || await context.newPage();
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
     const href = await page.getByTestId('AppTabBar_Profile_Link').getAttribute('href', { timeout: 10000 }).catch(() => null);
     const readiness = accountReadiness(href, username, false);
-    if (readiness === 'login') throw new Error(`请先在登录窗口登录 @${username} 后重试`);
+    if (readiness === 'login') {
+      if (cookieJar) throw new Error(`cookie 无效或已过期（${cookiePath}），请从已登录 @${username} 的浏览器重新导出 auth_token 与 ct0；删除该文件则回到手动登录`);
+      if (chromeReady) throw new Error(`账号 @${username} 的资料登录已失效；删除 .data/browser-profiles/${accountId} 后重跑，或放入 .data/cookies/${accountId}.json`);
+      throw new Error(`请先在登录窗口登录 @${username} 后重试`);
+    }
     if (readiness === 'wrong_account') throw new Error(`浏览器登录账号与 @${username} 不一致`);
     const helper = await context.newPage();
     try {
@@ -129,16 +159,22 @@ try {
         return !!platform && await crate.permissions.create(api).has(platform);
       });
       if (!granted) throw new Error('请授予 CommentCrate 对 X 的访问权限');
-    } catch (error) { throw new Error(`CommentCrate 未就绪：${error.message}`); }
-    finally { await helper.close().catch(() => {}); }
+    } catch (error) {
+      const hint = cookieJar ? '（cookie 只代替登录，CommentCrate 仍需安装在该账号的浏览器资料中）' : '';
+      throw new Error(`CommentCrate 未就绪：${error.message}${hint}`);
+    } finally { await helper.close().catch(() => {}); }
     store.upsert({ uuid: accountId, username, chromeReady: true });
   }
   if (stopping) throw new Error('已取消');
-  console.log('账号及插件检查通过，开始执行单轮任务；任务可能发送关注请求。');
-  worker = spawn(process.execPath, ['scripts/loop/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(cdpPort), ...forwarded], { stdio: 'inherit', detached: true });
-  const code = await new Promise<number>((resolve, reject) => { worker.once('error', reject); worker.once('exit', value => resolve(value ?? 1)); });
-  if (code !== 0) throw new Error(`单轮任务停止，退出码 ${code}`);
-  console.log('单轮任务已完成。');
+  if (checkOnly) {
+    console.log('登录与插件检查通过；--check-only 未执行任务，也未发送关注请求。');
+  } else {
+    console.log('账号及插件检查通过，开始执行单轮任务；任务可能发送关注请求。');
+    worker = spawn(process.execPath, ['scripts/loop/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(cdpPort), ...forwarded], { stdio: 'inherit', detached: true });
+    const code = await new Promise<number>((resolve, reject) => { worker.once('error', reject); worker.once('exit', value => resolve(value ?? 1)); });
+    if (code !== 0) throw new Error(`单轮任务停止，退出码 ${code}`);
+    console.log('单轮任务已完成。');
+  }
 } catch (error) {
   console.error(`启动或执行失败：${error.message}`); process.exitCode = 1;
 } finally {

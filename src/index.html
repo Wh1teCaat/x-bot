@@ -3,33 +3,154 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>X 账号授权</title>
+  <title>X 账号授权与 Cookie 导入</title>
   <style>
-    body{font:16px/1.6 system-ui,sans-serif;background:#f4f6f8;color:#17212b;margin:0}
-    main{max-width:560px;margin:10vh auto;padding:32px;background:white;border-radius:16px;box-shadow:0 10px 35px #17212b10}
-    h1{font-size:25px;margin:0 0 12px} p{color:#536170} button{background:#111;color:white;border:0;border-radius:24px;padding:11px 22px;font-weight:600;cursor:pointer}
-    ul{padding-left:22px} li{margin:8px 0} small{color:#66727e} @media(max-width:620px){main{margin:20px;padding:24px}}
+    body{font:15px/1.6 system-ui,sans-serif;background:#f4f6f8;color:#17212b;margin:0}
+    main{max-width:960px;margin:36px auto;padding:28px;background:white;border-radius:16px;box-shadow:0 10px 35px #17212b10}
+    h1{font-size:24px;margin:0 0 6px} h2{font-size:17px;margin:24px 0 10px} p{color:#536170;margin:6px 0}
+    textarea{width:100%;min-height:220px;box-sizing:border-box;border:1px solid #cfd6dd;border-radius:10px;padding:12px;font:13px/1.5 ui-monospace,monospace}
+    input[type=text]{border:1px solid #cfd6dd;border-radius:10px;padding:9px 12px;font:inherit}
+    button{background:#111;color:white;border:0;border-radius:22px;padding:9px 18px;font-weight:600;cursor:pointer}
+    button.secondary{background:#e8edf2;color:#17212b} button:disabled{opacity:.5;cursor:wait}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
+    ul{padding-left:20px} li{margin:6px 0} pre{background:#f6f8fa;border-radius:10px;padding:12px;white-space:pre-wrap;word-break:break-word;font-size:12px}
+    small{color:#66727e} .tag{display:inline-block;padding:1px 7px;border-radius:10px;background:#eef1f4;margin-left:6px;font-size:12px}
+    .auth{background:#f6f8fa;border-radius:12px;padding:14px 16px;margin:12px 0}
+    @media(max-width:700px){main{margin:16px;padding:18px}}
   </style>
 </head>
 <body><main>
-  <h1>授权 X 账号</h1>
-  <p>在 X 登录并确认授权，允许本地程序读取用户信息和管理关注关系。每个账号需要分别授权。</p>
-  <form method="post" action="/oauth/start"><button type="submit">前往 X 授权</button></form>
-  <h2>已授权账号</h2>
+  <h1>X 账号授权与 Cookie 导入</h1>
+  <p>先通过 X OAuth 授权账号，再批量导入该账号的浏览器 cookie。cookie 只用于浏览器登录，不代替 OAuth；账号浏览器仍需安装 CommentCrate（exporter24 可选）。</p>
+
+  <section class="auth">
+    <h2 style="margin-top:0">1. 授权账号</h2>
+    <p>在 X 登录并确认授权。每个账号需要分别授权。</p>
+    <form method="post" action="/oauth/start"><button type="submit">前往 X 授权</button></form>
+  </section>
+
+  <h2>2. 已授权账号</h2>
   <ul id="accounts"><li>正在读取…</li></ul>
-  <small>授权完成后会返回此页面。授权后，在终端执行 npm run loop -- 账号数字ID，然后在打开的浏览器中登录并安装、授权 CommentCrate。账号密码只在 X 输入。</small>
+  <div class="row"><button class="secondary" id="refresh">刷新</button><small>显示 cookie 与浏览器就绪状态</small></div>
+
+  <h2>3. 批量导入 Cookie</h2>
+  <p>单账号：直接粘贴 Chrome 扩展导出的完整 cookie 数组，会自动从 <code>twid</code> 读取账号 ID。多账号：用 <code>[{ "accountId": "...", "cookie": [...] }]</code> 包装。</p>
+  <textarea id="payload" spellcheck="false">[
+  { "domain": ".x.com", "name": "auth_token", "value": "...", "httpOnly": true },
+  { "domain": ".x.com", "name": "twid", "value": "u%3D1234567890" },
+  { "domain": ".x.com", "name": "ct0", "value": "..." }
+]</textarea>
+  <div class="row">
+    <input type="file" id="file" accept=".json,.txt,application/json,text/plain">
+    <button id="import">导入 Cookie</button>
+    <small>写入 .data/cookies/&lt;账号ID&gt;.json，权限 0600</small>
+  </div>
+  <pre id="result" hidden></pre>
+
+  <h2>4. 自动选择存活账号执行</h2>
+  <p>依次检查有 cookie 的已授权账号，使用第一个仍能登录的账号执行一轮 loop。</p>
+  <div class="row">
+    <input type="text" id="blogger" placeholder="博主用户名，可留空（默认用 clone 来源）">
+    <label><input type="checkbox" id="language"> 阿拉伯文字筛选</label>
+    <label><input type="checkbox" id="evaluate"> 模型评估</label>
+    <label><input type="checkbox" id="yes"> 自动确认关注（跳过 y/n）</label>
+    <button id="auto">自动选择并执行</button>
+  </div>
+  <pre id="autoResult" hidden></pre>
+  <small>自动任务在后台运行，日志：.data/auto-run.log；浏览器窗口会依次弹出。完整 loop 会实际发送关注请求。</small>
 </main>
 <script>
-  fetch('/api/accounts', {headers:{'X-Local-Request':'1'}}).then(async response => {
-    if (!response.ok) throw new Error('读取失败');
-    const {accounts} = await response.json();
-    const list = document.querySelector('#accounts'); list.replaceChildren();
-    for (const account of accounts) {
-      const item = document.createElement('li');
-      const scopes = (account.scope || '').split(/\s+/);
-      item.textContent = `${account.user.name} (@${account.user.username}) · ID ${account.user.id} · ${scopes.includes('follows.write') ? '已授权关注' : '需要重新授权关注权限'}`;
-      list.append(item);
+  const headers = { 'X-Local-Request': '1' };
+
+  async function loadAccounts() {
+    const list = document.querySelector('#accounts');
+    try {
+      const response = await fetch('/api/cookies', { headers });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '读取失败');
+      list.replaceChildren();
+      for (const account of data.accounts) {
+        const item = document.createElement('li');
+        item.textContent = `${account.user.name} (@${account.user.username}) · ID ${account.user.id}`;
+        const scopes = (account.scope || '').split(/\s+/);
+        const scopeTag = document.createElement('span');
+        scopeTag.className = 'tag';
+        scopeTag.textContent = scopes.includes('follows.write') ? '已授权关注' : '需要重新授权关注权限';
+        const cookieTag = document.createElement('span');
+        cookieTag.className = 'tag';
+        cookieTag.textContent = account.hasCookie ? '已导入 cookie' : '无 cookie';
+        const readyTag = document.createElement('span');
+        readyTag.className = 'tag';
+        readyTag.textContent = account.chromeReady ? '浏览器已就绪' : '待检查';
+        item.append(scopeTag, cookieTag, readyTag);
+        list.append(item);
+      }
+      if (!data.accounts.length) list.textContent = '尚未授权账号';
+    } catch (error) {
+      list.textContent = `读取失败：${error.message}`;
     }
-    if (!accounts.length) list.textContent = '尚未授权账号';
-  }).catch(() => {document.querySelector('#accounts').textContent = '无法读取账号，请检查本地服务。';});
+  }
+
+  async function importCookies() {
+    const button = document.querySelector('#import');
+    const result = document.querySelector('#result');
+    let payload;
+    try { payload = JSON.parse(document.querySelector('#payload').value); }
+    catch { alert('内容不是有效 JSON'); return; }
+    button.disabled = true;
+    result.hidden = false;
+    result.textContent = '正在导入……';
+    try {
+      const response = await fetch('/api/cookies/import', {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '导入失败');
+      const lines = data.results.map((item) => `${item.ok ? 'OK' : 'FAIL'} ${item.username || item.accountId || ''}${item.ok ? ` · ${item.cookies} 个 cookie` : ` · ${item.error}`}`);
+      result.textContent = `成功 ${data.imported} 个，失败 ${data.failed} 个\n\n${lines.join('\n')}`;
+      await loadAccounts();
+    } catch (error) {
+      result.textContent = `导入失败：${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function startAuto() {
+    const button = document.querySelector('#auto');
+    const result = document.querySelector('#autoResult');
+    button.disabled = true;
+    result.hidden = false;
+    result.textContent = '正在启动……';
+    try {
+      const response = await fetch('/api/loop/auto', {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          blogger: document.querySelector('#blogger').value.trim(),
+          language: document.querySelector('#language').checked,
+          evaluate: document.querySelector('#evaluate').checked,
+          yes: document.querySelector('#yes').checked,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '启动失败');
+      result.textContent = `已启动，PID ${data.pid}\n日志：${data.log}`;
+    } catch (error) {
+      result.textContent = `启动失败：${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  document.querySelector('#refresh').addEventListener('click', loadAccounts);
+  document.querySelector('#import').addEventListener('click', importCookies);
+  document.querySelector('#auto').addEventListener('click', startAuto);
+  document.querySelector('#file').addEventListener('change', async (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (file) document.querySelector('#payload').value = await file.text();
+  });
+  loadAccounts();
 </script></body></html>

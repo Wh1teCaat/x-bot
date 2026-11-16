@@ -2,15 +2,18 @@
 import 'dotenv/config';
 import { connectTestingBrowser } from '../browser/browser-connection.ts';
 import { actionDelay, createProfileVisitDelay } from '../browser/action-delay.ts';
-import { openExporter24, readExporter24Counts } from '../browser/exporter24.ts';
+import { exportExporter24Followers, openExporter24, readExporter24Counts } from '../browser/exporter24.ts';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdir, readFile, readdir, writeFile, rename } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { createInterface } from 'node:readline/promises';
+import { stdin, stdout } from 'node:process';
 import { join, resolve } from 'node:path';
-import { bestPost, findBloggerPosts, getCollectorPage, scanAndExport } from '../replies/reply-export.ts';
-import { enrichCsv, partitionReplyCandidates } from '../replies/reply-candidates.ts';
+import { findBloggerPosts, getCollectorPage, scanAndExport } from '../replies/reply-export.ts';
+import { enrichCsv, partitionFollowerCandidates, partitionReplyCandidates } from '../replies/reply-candidates.ts';
 import { readProfileCounts } from '../replies/profile-counts.ts';
-import { qualifyByFollowerBalance } from '../replies/follower-filter.ts';
+import { sortPostsNewestFirst } from '../replies/post-order.ts';
+import { qualifyByFollowerBalance, selectFollowCandidates } from '../replies/follower-filter.ts';
 import { makeLlm, evaluateCandidates } from './loop-llm.ts';
 import { LocalFollowClient, followCandidatesApi } from '../follow/api-follow.ts';
 import { ResilienceStore, classifyFailure, retryTransient } from './resilience.ts';
@@ -30,7 +33,7 @@ const clonedBlogger = () => {
   if (!args.accountId) return null;
   return accountStore.getByUuid(args.accountId)?.copiedFromUsername ?? null;
 };
-let blogger = args.blogger || clonedBlogger();
+let blogger = clonedBlogger() || args.blogger;
 await mkdir('.data/loop-runs', { recursive: true });
 db = new DatabaseSync('.data/loop.sqlite');
 db.exec(`CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, status TEXT NOT NULL, stage TEXT NOT NULL, state TEXT NOT NULL, error TEXT, pid INTEGER, updated_at TEXT NOT NULL);
@@ -64,15 +67,62 @@ const markProcessed = items => {
     db.exec('COMMIT');
   } catch (error) { db.exec('ROLLBACK'); throw error; }
 };
+/** 关注前保存本批待关注用户，便于人工核对和重启后恢复。 */
+const writePendingFollows = async selected => {
+  const label = state.phase === 'followers' ? 'followers' : `post-${state.postIndex + 1}`;
+  const path = join('.data/loop-runs', `${runId}-pending-${label}.json`);
+  await writeFile(path, JSON.stringify({
+    runId,
+    phase: state.phase,
+    createdAt: new Date().toISOString(),
+    post: state.phase === 'replies' ? state.post : null,
+    candidates: selected.map(candidate => ({
+      username: candidate.username,
+      followers: candidate.followers,
+      following: candidate.following,
+      userId: candidate.userId,
+    })),
+  }, null, 2), { mode: 0o600 });
+  state.pendingFollowPath = path;
+  persist('running');
+  return path;
+};
+
+/** 展示待关注人数并等待 y/n；非交互终端默认跳过。 */
+const askFollowConfirmation = async selected => {
+  const label = state.phase === 'followers' ? '博主粉丝' : `帖子 ${state.postIndex + 1}/${state.posts.length}`;
+  console.log(`\n[${label}] 固定规则筛选出 ${selected.length} 人待关注：`);
+  for (const [index, candidate] of selected.slice(0, 50).entries()) {
+    console.log(`  ${index + 1}. @${candidate.username}  粉丝 ${candidate.followers ?? '未知'}  关注 ${candidate.following ?? '未知'}`);
+  }
+  if (selected.length > 50) console.log(`  ... 其余 ${selected.length - 50} 人`);
+  if (followProbe) { console.log('半开探测：自动确认单个关注。'); return 'confirmed'; }
+  if (args.yes) { console.log('--yes：自动确认关注。'); return 'confirmed'; }
+  if (!stdin.isTTY) {
+    console.log('当前不是交互终端，默认跳过关注；待关注列表已保存。');
+    return 'skipped';
+  }
+  const input = createInterface({ input: stdin, output: stdout });
+  try {
+    for (;;) {
+      const answer = (await input.question('输入 y 执行关注，n 跳过：')).trim().toLowerCase();
+      if (answer === 'y' || answer === 'yes') return 'confirmed';
+      if (answer === 'n' || answer === 'no') return 'skipped';
+    }
+  } finally {
+    input.close();
+  }
+};
+
 try {
   if (resumeId) {
     const row = db.prepare('SELECT * FROM runs WHERE id=?').get(resumeId);
     if (!row) throw new Error('未找到任务');
     assertNotRunning(row);
     if (row.status === 'completed') throw new Error('该轮已完成');
-    if (row.stage === 'export') throw new Error('导出阶段曾中断，无法确认插件是否停止；请先检查 Chrome 中的插件状态');
+    if (row.stage === 'export' || row.stage === 'followers-export') throw new Error('导出阶段曾中断，无法确认插件是否停止；请先检查 Chrome 中的插件状态');
     runId = row.id; stage = row.stage; state = JSON.parse(row.state); runPersisted = true;
-    if (state.version !== 4) throw new Error('旧版任务不能自动迁移，请新建一轮');
+    if (state.version !== 5) throw new Error('旧版任务不能自动迁移，请新建一轮');
     if (args.accountId && state.followAccountId && args.accountId !== state.followAccountId) throw new Error('恢复任务的授权账号与原任务不一致');
     if (args.username && state.browserUsername && args.username.toLowerCase() !== state.browserUsername.toLowerCase()) throw new Error('恢复任务的浏览器账号与原任务不一致');
     if (args.blogger && state.blogger && args.blogger.toLowerCase() !== state.blogger.toLowerCase()) throw new Error('恢复任务的博主与原任务不一致');
@@ -95,7 +145,9 @@ try {
     options = { language: args.language ?? null, evaluate: args.evaluate };
     runId = args.runId || randomUUID();
     state = {
-      target: targetFor(blogger), version: 4, blogger, options, evaluations: [],
+      target: targetFor(blogger), version: 5, blogger, options, evaluations: [],
+      posts: [], postIndex: 0, phase: 'replies', results: [],
+      singlePost: Boolean(args.postUrl), ...(args.postUrl ? { singlePostUrl: args.postUrl } : {}),
       ...(args.accountId ? { followAccountId: args.accountId } : {}),
       ...(args.username ? { browserUsername: args.username } : {}),
     };
@@ -146,28 +198,35 @@ try {
     const limited = await page.getByText(/sorry, you are rate limited|速率受限|请求过于频繁/i).first().isVisible().catch(() => false);
     if (limited) { resilience.open('x', '页面显示速率限制'); throw new Error('X 页面显示速率受限'); }
   };
-  // 只选择该博主主页中回复数最高且尚未被其他任务处理的帖子。
+  // 采集博主最近 10 条有回复的帖子，按新到旧处理。
   if (stage === 'search') {
-    const posts = await findBloggerPosts(await getPage(), state.blogger, guardX);
-    resilience.ensureClosed('x');
-    if (posts.some(p => p.replies === null)) throw new Error('有帖子的回复数无法识别，停止选择');
-    const oldFiles = await readdir('.data/reply-exports').catch(e => e.code === 'ENOENT' ? [] : Promise.reject(e));
-    const oldIds = new Set(oldFiles.map(f => f.match(/^(\d+)-.*\.csv$/)?.[1]).filter(Boolean));
-    const available = posts.filter(p => {
-      const id = new URL(p.url).pathname.split('/').pop();
-      return !oldIds.has(id) && !db.prepare('SELECT id FROM posts WHERE id=?').get(id);
-    });
-    state.post = bestPost(available);
-    if (!state.post || !state.post.replies) throw new Error(`博主 @${state.blogger} 的帖子中没有可用的新帖子`);
-    const id = new URL(state.post.url).pathname.split('/').pop();
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      db.prepare('INSERT INTO posts VALUES (?, ?)').run(id, runId);
+    if (state.singlePost) {
+      const postUrl = state.singlePostUrl || args.postUrl;
+      if (!postUrl) throw new Error('单帖任务缺少帖子链接');
+      state.posts = [{ url: postUrl, replies: null }];
+      state.postIndex = 0;
+      state.phase = 'replies';
+      state.post = state.posts[0];
+      state.results = [];
       resilience.resolve(runId, 'search');
       stage = 'export'; persist('running');
-      db.exec('COMMIT');
-    } catch (e) { db.exec('ROLLBACK'); throw e; }
-    console.log(`选择博主 @${state.blogger} 的帖子：${state.post.url}，回复数约 ${state.post.replies}`);
+      console.log(`单帖回复爬取：${postUrl}（不处理粉丝列表）`);
+    } else {
+      const posts = await findBloggerPosts(await getPage(), state.blogger, guardX);
+      resilience.ensureClosed('x');
+      const withReplies = sortPostsNewestFirst(
+        posts.filter(post => typeof post.replies === 'number' && post.replies > 0),
+      ).slice(0, 10);
+      if (!withReplies.length) throw new Error(`博主 @${state.blogger} 最近的帖子都没有回复`);
+      state.posts = withReplies;
+      state.postIndex = 0;
+      state.phase = 'replies';
+      state.post = withReplies[0];
+      state.results = [];
+      resilience.resolve(runId, 'search');
+      stage = 'export'; persist('running');
+      console.log(`博主 @${state.blogger}：选择 ${withReplies.length} 条有回复的最近帖子，按新到旧处理。`);
+    }
   }
   if (stage === 'export') {
     state.export = await scanAndExport(await getPage(), state.post, '.data/reply-exports', guardX);
@@ -178,29 +237,65 @@ try {
     resilience.ensureClosed('x');
     resilience.resolve(runId, 'export');
     stage = 'filter'; persist('running');
-    console.log(`回复导出 ${state.export.count} 条；停止原因 ${state.export.stoppedWhy || '未知'}`);
+    console.log(`帖 ${state.postIndex + 1}/${state.posts.length} 回复导出 ${state.export.count} 条；停止原因 ${state.export.stoppedWhy || '未知'}`);
   }
-  // 解析回复中的用户；语言筛选是可选路径，默认全部交给固定规则。
+  // 帖子全部处理完后，用 exporter24 导出博主粉丝 CSV。
+  if (stage === 'followers-export') {
+    const page = await getPage();
+    const exporterPage = await openExporter24(page.context());
+    if (!exporterPage) throw new Error('未检测到 exporter24 扩展，无法导出博主粉丝');
+    try {
+      console.log(`正在用 exporter24 导出 @${state.blogger} 的粉丝 CSV……`);
+      const result = await exportExporter24Followers(exporterPage, state.blogger, '.data/reply-exports', guardX);
+      state.export = { destination: result.destination, count: 0, stoppedWhy: 'followers' };
+      state.phase = 'followers';
+      state.post = null;
+      state.direct = [];
+      state.candidates = [];
+      state.evaluations = [];
+      state.qualify = null;
+      state.follow = undefined;
+      state.followTargetIds = undefined;
+      resilience.resolve(runId, 'followers-export');
+      stage = 'filter'; persist('running');
+      console.log(`粉丝 CSV 已导出：${result.destination}`);
+    } finally {
+      await exporterPage.close().catch(() => {});
+    }
+  }
+  // 按阶段解析回复 CSV 或博主粉丝 CSV；语言筛选/模型评估只用于帖子回复。
   if (stage === 'filter') {
-    const postId = new URL(state.post.url).pathname.split('/').pop();
-    const all = partitionReplyCandidates(await readFile(state.export.destination, 'utf8'), postId);
     const already = db.prepare('SELECT run_id FROM evaluated_users WHERE username=?');
     const keep = candidate => candidate.username.toLowerCase() !== state.blogger.toLowerCase() && !already.get(candidate.username.toLowerCase());
-    const direct = all.direct.filter(keep);
-    const remaining = all.remaining.filter(keep);
-    if (options.language === 'ar') {
-      state.direct = direct;
-      state.candidates = options.evaluate ? remaining : [];
-      console.log(`语言筛选：阿拉伯文字 ${direct.length} 人；其余 ${options.evaluate ? `${remaining.length} 人交由模型评估` : '不参与本轮'}。`);
-    } else {
-      state.direct = [];
-      state.candidates = [...direct, ...remaining];
-      console.log(`未启用语言筛选：${state.candidates.length} 人进入固定规则筛选。`);
-    }
     state.evaluations = [];
     state.qualify = null;
+    state.follow = undefined;
+    state.followTargetIds = undefined;
+    let hasCounts = false;
+    if (state.phase === 'followers') {
+      const all = partitionFollowerCandidates(await readFile(state.export.destination, 'utf8'));
+      hasCounts = all.hasFollowerCounts;
+      state.direct = [];
+      state.candidates = all.candidates.filter(keep);
+      console.log(`粉丝 CSV：${all.candidates.length} 人；进入固定规则筛选 ${state.candidates.length} 人。`);
+    } else {
+      const postId = new URL(state.post.url).pathname.split('/').pop();
+      const all = partitionReplyCandidates(await readFile(state.export.destination, 'utf8'), postId);
+      hasCounts = all.hasFollowerCounts;
+      const direct = all.direct.filter(keep);
+      const remaining = all.remaining.filter(keep);
+      if (options.language === 'ar') {
+        state.direct = direct;
+        state.candidates = options.evaluate ? remaining : [];
+        console.log(`语言筛选：阿拉伯文字 ${direct.length} 人；其余 ${options.evaluate ? `${remaining.length} 人交由模型评估` : '不参与本轮'}。`);
+      } else {
+        state.direct = [];
+        state.candidates = [...direct, ...remaining];
+        console.log(`未启用语言筛选：${state.candidates.length} 人进入固定规则筛选。`);
+      }
+    }
     const missingCounts = [...state.direct, ...state.candidates].filter(c => c.followers === undefined || c.following === undefined).length;
-    console.log(`CSV 关注/粉丝数：${all.hasFollowerCounts ? '已包含' : '未包含'}；${missingCounts} 人需要通过 exporter24 或主页读取。`);
+    console.log(`CSV 关注/粉丝数：${hasCounts ? '已包含' : '未包含'}；${missingCounts} 人需要通过 exporter24 或主页读取。`);
     resilience.resolve(runId, 'filter');
     stage = 'qualify'; persist('running');
   }
@@ -318,11 +413,10 @@ try {
     const rejected = [...directResult.rejected, ...remainingResult.rejected];
     state.qualify = { qualifiedDirect, qualifiedCandidates, rejected };
     resilience.resolve(runId, 'qualify');
-    const hasModelPool = options.evaluate && qualifiedCandidates.length > 0;
+    const hasModelPool = state.phase === 'replies' && options.evaluate && qualifiedCandidates.length > 0;
     stage = hasModelPool ? 'evaluate' : 'follow';
-    if (!hasModelPool) markProcessed([...qualifiedDirect, ...qualifiedCandidates]);
     persist('running');
-    console.log(`固定规则（关注和粉丝均大于 50、相差不超过 2 倍）入选 ${qualifiedDirect.length + qualifiedCandidates.length} 人，排除 ${rejected.length} 人。`);
+    console.log(`固定规则（关注和粉丝均大于 50、相差不超过 2 倍）[${state.phase === 'followers' ? '粉丝' : '回复'}] 入选 ${qualifiedDirect.length + qualifiedCandidates.length} 人，排除 ${rejected.length} 人。`);
   }
   if (stage === 'evaluate') {
     const pool = state.qualify.qualifiedCandidates;
@@ -336,13 +430,29 @@ try {
     const output = join('.data/loop-runs', `${runId}.json`);
     await writeFile(`${output}.tmp`, JSON.stringify({ runId, target: state.target, blogger: state.blogger, options, post: state.post, export: state.export, qualify: state.qualify, direct: state.qualify.qualifiedDirect, candidates: state.evaluations }, null, 2), { mode: 0o600 });
     await rename(`${output}.tmp`, output);
-    markProcessed([...state.qualify.qualifiedDirect, ...state.evaluations]);
     resilience.resolve(runId, 'evaluate');
     state.resultPath = output; stage = 'follow'; persist('running');
   }
   // 使用固定规则入选的用户调用本地授权服务进行 API 关注。
   if (stage === 'follow') {
-    const selected = [...(state.qualify?.qualifiedDirect || []), ...state.evaluations.filter(c => c.decision === 'relevant')];
+    const selected = selectFollowCandidates({
+      qualifiedDirect: state.qualify?.qualifiedDirect || [],
+      qualifiedCandidates: state.qualify?.qualifiedCandidates || [],
+      evaluations: state.evaluations,
+      evaluate: state.phase === 'replies' && options.evaluate,
+    });
+    if (selected.length && !state.followConfirmation) {
+      const pendingPath = await writePendingFollows(selected);
+      state.followConfirmation = await askFollowConfirmation(selected);
+      persist('running');
+      if (state.followConfirmation === 'skipped') console.log(`已跳过本批关注；待关注列表：${pendingPath}`);
+    }
+    const skipped = state.followConfirmation === 'skipped';
+    if (skipped) {
+      state.follow = { matched: [], unresolved: [] };
+      state.followSkipped = true;
+      persist('running');
+    } else {
     if (state.follow && !state.followAccountId) throw new Error('旧浏览器关注任务需要核对已处理和未确认用户，不能直接切换到 API 续跑');
     console.log(`待关注集合共 ${selected.length} 人，通过 X API 处理。`);
     const client = new LocalFollowClient();
@@ -366,25 +476,65 @@ try {
       save: async progress => { state.follow = progress; persist('running'); },
       ...(followProbe ? { maxNewFollows: 1 } : {}),
     });
-    if (followProbe) {
+    }
+    if (followProbe && !skipped) {
       ensureX();
       if (!state.follow.probeSucceeded) throw new Error('未能找到可探测的新关注用户');
       persist('probe_succeeded');
       console.log('单次关注探测已确认成功。');
       process.exitCode = 0;
     } else {
-    const output = join('.data/loop-runs', `${runId}.json`);
-    await writeFile(`${output}.tmp`, JSON.stringify({ runId, target: state.target, blogger: state.blogger, options, post: state.post, export: state.export, qualify: state.qualify, direct: state.qualify?.qualifiedDirect || [], candidates: state.evaluations, follow: state.follow }, null, 2), { mode: 0o600 });
-    await rename(`${output}.tmp`, output);
-    if (state.follow.unresolved.length) {
-      resilience.failure(runId, 'follow', { kind: 'manual', reason: '部分候选的用户名未能解析为数字 ID', retryable: false });
-      persist('incomplete', '部分候选的用户名未能解析为数字 ID');
-      console.log(`仍有 ${state.follow.unresolved.length} 人未能解析为数字 ID，保留待处理状态。`);
-    } else {
-      resilience.resolve(runId, 'follow');
-      stage = 'done'; persist('completed');
-      console.log(`本轮完成，处理 ${state.follow.matched.length} 位用户；结果 ${output}`);
-    }
+      const output = join('.data/loop-runs', `${runId}.json`);
+      state.results ??= [];
+      state.results.push({
+        phase: state.phase,
+        post: state.phase === 'replies' ? state.post : null,
+        export: state.export,
+        qualify: state.qualify,
+        evaluations: state.evaluations,
+        follow: state.follow,
+        followSkipped: Boolean(state.followSkipped),
+      });
+      await writeFile(`${output}.tmp`, JSON.stringify({ runId, target: state.target, blogger: state.blogger, options, posts: state.posts, postIndex: state.postIndex, phase: state.phase, results: state.results }, null, 2), { mode: 0o600 });
+      await rename(`${output}.tmp`, output);
+      if (!state.followSkipped) markProcessed(state.follow.matched.map(record => ({ username: record.username })));
+      if (state.follow.unresolved.length) {
+        resilience.failure(runId, 'follow', { kind: 'manual', reason: '部分候选的用户名未能解析为数字 ID', retryable: false });
+        persist('incomplete', '部分候选的用户名未能解析为数字 ID');
+        console.log(`仍有 ${state.follow.unresolved.length} 人未能解析为数字 ID，保留待处理状态。`);
+      } else {
+        resilience.resolve(runId, 'follow');
+        if (state.followSkipped) console.log('本批关注已跳过，继续下一批。');
+        state.followConfirmation = undefined;
+        state.followSkipped = false;
+        state.pendingFollowPath = undefined;
+        state.export = undefined;
+        state.direct = [];
+        state.candidates = [];
+        state.evaluations = [];
+        state.qualify = null;
+        state.follow = undefined;
+        state.followTargetIds = undefined;
+        if (state.singlePost) {
+          stage = 'done'; persist('completed');
+          console.log(`单帖回复处理完成：${state.singlePostUrl || state.post?.url}；结果 ${output}`);
+        } else if (state.phase === 'replies') {
+          state.postIndex++;
+          if (state.postIndex < state.posts.length) {
+            state.post = state.posts[state.postIndex];
+            stage = 'export'; persist('running');
+            console.log(`转入下一条帖子 ${state.postIndex + 1}/${state.posts.length}：${state.post.url}`);
+          } else {
+            state.phase = 'followers';
+            state.post = null;
+            stage = 'followers-export'; persist('running');
+            console.log('所有帖子处理完毕，转入博主粉丝导出。');
+          }
+        } else {
+          stage = 'done'; persist('completed');
+          console.log(`本轮完成：${state.posts.length} 条帖子 + 博主粉丝；结果 ${output}`);
+        }
+      }
     }
   }
 } catch (error) {
@@ -406,7 +556,7 @@ try {
     db.exec('BEGIN IMMEDIATE');
     try {
       if (stage === 'evaluate' && (classification.kind === 'rate_limit' || classification.kind === 'transient')) resilience.open('llm', classification.reason);
-      if (['search', 'export', 'qualify', 'follow'].includes(stage) && classification.kind === 'rate_limit') resilience.open('x', classification.reason);
+      if (['search', 'export', 'followers-export', 'qualify', 'follow'].includes(stage) && classification.kind === 'rate_limit') resilience.open('x', classification.reason);
       resilience.failure(runId, stage, classification);
       persist('failed', `${classification.reason}（${classification.kind}）`);
       db.exec('COMMIT');

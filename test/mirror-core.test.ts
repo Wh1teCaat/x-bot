@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MirrorStore } from "../src/mirror-store.ts";
-import { mirrorNewPosts, mirrorTweet, normalizeText } from "../scripts/mirror/mirror-core.ts";
+import { createPostPacer, mirrorNewPosts, mirrorTweet, normalizeText } from "../scripts/mirror/mirror-core.ts";
 
 test("normalizes and truncates copied text", () => {
   assert.equal(normalizeText("  hello world  "), "hello world");
@@ -69,7 +69,7 @@ test("limit mirrors only the newest N posts", async () => {
       postTweet: async (text) => { posted.push(text); return { id: text }; },
     };
     const result = await mirrorNewPosts({ store, watch, client, limit: 3 });
-    assert.deepEqual(posted, ["a", "b", "c"]);
+    assert.deepEqual(posted, ["c", "b", "a"]);
     assert.equal(result.posted, 3);
     store.close();
   } finally {
@@ -118,6 +118,54 @@ test("mirrorTweet posts text even without images", async () => {
     });
     assert.equal(outcome, "posted");
     assert.deepEqual(mediaIds, []);
+    store.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("paces real posts with a random gap and skips the first wait", async () => {
+  let now = 1000;
+  const sleeps: number[] = [];
+  const pacer = createPostPacer({
+    minMs: 5000,
+    maxMs: 10000,
+    random: () => 0,
+    now: () => now,
+    sleep: async (ms) => { sleeps.push(ms); now += ms; },
+  });
+  await pacer();
+  assert.deepEqual(sleeps, []);
+  now = 2000;
+  await pacer();
+  assert.deepEqual(sleeps, [4000]);
+  now = 7000;
+  await pacer();
+  assert.deepEqual(sleeps, [4000, 4000]);
+});
+
+test("calls beforePost only for copied posts", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "x-mirror-core-"));
+  const store = new MirrorStore(join(dir, "mirror.sqlite"));
+  try {
+    const watch = { targetUsername: "Target", targetId: "111", posterId: "p1", sinceId: null, enabled: true };
+    const client = {
+      fetchTimeline: async () => ({
+        tweets: [
+          { id: "10", text: "a", images: [] },
+          { id: "9", text: "  ", images: [] },
+          { id: "8", text: "c", images: [] },
+        ],
+        newestId: "10",
+      }),
+      uploadImage: async () => { throw new Error("unused"); },
+      postTweet: async (text) => ({ id: "p" + text }),
+    };
+    let calls = 0;
+    const result = await mirrorNewPosts({ store, watch, client, beforePost: () => { calls++; } });
+    assert.equal(result.posted, 2);
+    assert.equal(result.skipped, 1);
+    assert.equal(calls, 2);
     store.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });

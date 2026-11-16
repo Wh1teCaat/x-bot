@@ -1,7 +1,7 @@
 /** 验证回复 CSV 解析和候选筛选的行为与边界。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCsv, collectCandidates, partitionReplyCandidates, parseCountValue, enrichCsv } from '../scripts/replies/reply-candidates.ts';
+import { parseCsv, collectCandidates, partitionReplyCandidates, partitionFollowerCandidates, parseCountValue, enrichCsv } from '../scripts/replies/reply-candidates.ts';
 
 test('parses multiline CSV and merges authors across case and host', () => {
   const csv = '\uFEFFtext,profileUrl\r\n"hello,\n""world""",https://x.com/Hello\r\nSecond,https://twitter.com/HELLO\r\nno,https://evil.example/Hello\r\n';
@@ -70,4 +70,19 @@ test('writes followers and following back into the CSV', () => {
   assert.deepEqual(rows[0], ['id', 'text', 'profileUrl', 'postUrl', 'followersCount', 'followingCount']);
   assert.deepEqual(rows[1], ['11', 'hello', 'https://x.com/A', 'https://x.com/blogger/status/99', '80', '90']);
   assert.deepEqual(rows[2].slice(4), ['', '']);
+});
+
+test('parses exporter24 follower CSV with uid and counts', () => {
+  const csv = [
+    'uid,username,name,followingCount,subsCount',
+    '111,alice,Alice,120,240',
+    '222,bob,Bob,60,70',
+  ].join('\n');
+  const result = partitionFollowerCandidates(csv);
+  assert.equal(result.hasFollowerCounts, true);
+  assert.equal(result.hasUserIds, true);
+  assert.deepEqual(result.candidates.map((c) => [c.username, c.followers, c.following, c.userId]), [
+    ['alice', 240, 120, '111'],
+    ['bob', 70, 60, '222'],
+  ]);
 });

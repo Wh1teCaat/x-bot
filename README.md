@@ -1,15 +1,109 @@
 # X 回复筛选与 API 关注
 
-流程在 clone 完成后，以 clone 来源博主为采集对象：打开该博主主页，选择回复最多的新帖子，用 CommentCrate 导出回复用户 CSV。候选用户的关注数和粉丝数优先取自 CommentCrate 导出的 CSV；CSV 没有这两列时，优先用已安装的 exporter24 扩展读取，扩展不可用或失败时再用 Playwright 逐个打开候选主页读取。两种方式都不调用 X API 查询。固定规则为两者都大于 50，且较大值不超过较小值的 2 倍。阿拉伯文字筛选和模型评估是可选路径。最后通过 X 官方 API 关注入选用户。回复内容和公开关注数据不能证明用户所在地或国籍。
+流程在 clone 完成后，以 clone 目标博主为采集对象：读取该博主最近 10 条有回复的帖子，按新到旧逐条用 CommentCrate 导出回复用户 CSV，补充关注/粉丝数并筛选关注；帖子全部处理完后，再用 exporter24 导出博主粉丝 CSV，按同一固定规则筛选关注。关注/粉丝数优先取自 CSV；缺失时用 exporter24 读取，扩展不可用或失败时再用 Playwright 打开候选主页读取。固定规则为两者都大于 50，且较大值不超过较小值的 2 倍。阿拉伯文字筛选和模型评估是可选路径，且只用于帖子回复；粉丝列表没有回复文本。最后通过 X 官方 API 关注每批入选用户。回复内容和公开关注数据不能证明用户所在地或国籍。
 
 ## 授权与启动
 
 1. 参考 `.env.example` 配置 X 应用和模型，并将 `X_AUTO_START_LOOP` 设为 `false`。X 开发者控制台的 OAuth 回调须与 `X_REDIRECT_URI` 一致，默认为 `http://127.0.0.1:3000/oauth/callback`。
-2. 在一个终端运行 `npm start`，打开 [本机授权页面](http://127.0.0.1:3000/)，完成账号授权并记下数字 ID。运行任务期间保持该服务运行。
-3. 在另一个终端运行 `npm run loop -- <账号数字ID>`（可选追加 `--blogger <博主用户名>`、`--language ar`、`--evaluate`）。程序使用该账号独立资料打开正式版 Google Chrome；手动登录相同的 X 账号，安装 CommentCrate 并授予 X 访问权限。若希望用 exporter24 补充关注/粉丝数，必须在这个账号自己的浏览器资料中安装（只在默认 Chrome 安装不会生效）；未安装时会自动回退到主页读取。
+2. 在一个终端运行 `npm start`，打开 [本机授权与 Cookie 页面](http://127.0.0.1:3000/)，完成账号授权并记下数字 ID；授权和 cookie 导入在同一个页面。运行任务期间保持该服务运行。
+3. 在另一个终端运行 `npm run loop -- <账号数字ID>`（可选追加 `--target <博主用户名>`、`--language ar`、`--evaluate`、`--loop-only`）。这是长时流程：必要时 clone → 启动 mirror 子进程监听 → 初始帖子/粉丝 loop → 父进程长时处理延迟回复任务。只想测试单轮 loop 时加 `--loop-only`。程序使用该账号独立资料打开正式版 Google Chrome；手动登录相同的 X 账号，安装 CommentCrate 并授予 X 访问权限。若希望用 exporter24 补充关注/粉丝数，必须在这个账号自己的浏览器资料中安装（只在默认 Chrome 安装不会生效）；未安装时会自动回退到主页读取。
 4. 关闭登录窗口；若关闭后终端未继续，按 Enter。程序会用 Playwright 重新打开同一份资料，检查账号和插件，然后自动执行一轮，进度直接显示在当前终端。下一次运行同一账号会复用这些资料；已登录并安装插件的账号会自动跳过登录与安装步骤，直接进入后续自动化流程。
 
-每个账号使用独立的 `.data/browser-profiles/<账号数字ID>`；不同账号需要分别授权和登录。正式版 Chrome 不会通过旧的 `X_COMMENTCRATE_EXTENSION_PATH` 参数自动加载扩展，需在账号浏览器中手动安装。**单轮任务会实际发送关注请求。**
+每个账号使用独立的 `.data/browser-profiles/<账号数字ID>`；不同账号需要分别授权和登录。正式版 Chrome 不支持 `--load-extension`，可通过下面的“插件模板”为每个账号资料复制一份已安装的 CommentCrate / exporter24，或手动安装。**单轮任务会实际发送关注请求。**
+
+### 插件模板：每个浏览器实例复制一份
+
+先从一个已经安装好 CommentCrate / exporter24 的 Chrome 资料生成模板：
+
+```sh
+npm run profile:template
+```
+
+默认从本机 `~/Library/Application Support/Google/Chrome` 复制，只保留：
+
+- `Local State`
+- `Default/Preferences`、`Default/Secure Preferences`
+- `Default/Extensions`
+- `Default/Local Extension Settings`
+
+不会复制 cookie、登录数据、历史记录。模板默认在：
+
+```text
+.data/profile-template
+```
+
+新账号首次运行 `npm run loop` 时，如果 `.data/browser-profiles/<账号ID>` 不存在，会自动复制模板，然后注入账号 cookie。这样每个账号实例都有自己的一份插件目录和 `Local Extension Settings`，互不影响。
+
+可用环境变量覆盖：
+
+```env
+X_PROFILE_TEMPLATE=.data/profile-template
+X_PROFILE_TEMPLATE_SOURCE=/path/to/Chrome/user-data
+```
+
+模板不存在时仍走原来的手动安装流程。
+
+### 用 cookie 跳过手动登录
+
+已有登录态时，把 cookie 文件放到 `.data/cookies/<账号数字ID>.json`（Netscape 格式的 `cookies.txt` 或复制来的 `Cookie:` 请求头可命名为 `<账号数字ID>.txt`；也可用 `X_COOKIE_FILE` 指定路径）：
+
+```sh
+mkdir -p .data/cookies && chmod 700 .data/cookies
+chmod 600 .data/cookies/<账号数字ID>.json
+```
+
+当该账号尚未标记 `chromeReady` 时，`npm run loop` 会读取并注入 cookie，跳过 Chrome 登录窗口，随后照常校验账号与 CommentCrate。支持 Playwright storage state（`{ "cookies": [...] }`）、浏览器扩展导出的数组、Netscape `cookies.txt` 或 `auth_token=...; ct0=...` 请求头，也可以只写最简单的：
+
+```json
+{ "auth_token": "...", "ct0": "..." }
+```
+
+只想确认 cookie 能登录、不执行任务时加 `--check-only`（不会发送关注请求）：
+
+```sh
+npm run loop -- <账号数字ID> --check-only
+```
+
+`auth_token` 与 `ct0` 必须来自同一次登录；其他 x.com / twitter.com cookie 会一并保留。注入的 cookie 会写入该账号的资料目录，供后续运行复用。cookie 只代替登录，**不会安装 CommentCrate**，该资料仍需已安装并授权插件。cookie 等同于账号密码，`.data/` 已被 git 忽略；校验失败时脚本会提示更新文件或删除文件以回到手动登录。
+
+### 批量导入 cookie 与自动执行
+
+启动 `npm start` 后打开：
+
+```text
+http://127.0.0.1:3000/
+```
+
+授权、账号列表、cookie 导入和自动执行都在同一个页面；`/cookies` 也会返回该页面。
+
+页面会列出已授权账号，并支持一次导入多个账号的 cookie。单个账号可以直接粘贴 Chrome 扩展导出的 cookie 数组，账号 ID 会从 `twid`（`u%3D<id>`）自动识别：
+
+```json
+[
+  { "domain": ".x.com", "name": "auth_token", "value": "...", "httpOnly": true },
+  { "domain": ".x.com", "name": "twid", "value": "u%3D1234567890" },
+  { "domain": ".x.com", "name": "ct0", "value": "..." }
+]
+```
+
+多账号导入时，每项提供 `accountId` 或 `username`，以及 `cookie`：
+
+```json
+[
+  {
+    "accountId": "1234567890",
+    "cookie": { "auth_token": "...", "ct0": "..." }
+  },
+  {
+    "username": "alice",
+    "cookie": "auth_token=...; ct0=...;"
+  }
+]
+```
+
+导入后会写入 `.data/cookies/<账号ID>.json`（权限 0600），并把该账号的 `chromeReady` 清掉，下次运行会重新校验 cookie 和 CommentCrate。cookie 导入只负责登录，**不会安装 CommentCrate**。
+
+页面上的“自动选择并执行”会依次检查有 cookie 的已授权账号，使用第一个仍能登录的账号执行一轮 loop。自动检查使用 `--check-only`，不会发送关注请求；选定账号后的 loop 会按页面选项决定是否自动确认关注。后台自动任务的日志在 `.data/auto-run.log`。所有账号都检查失败时会退出，不会继续尝试。
 
 `X_AUTO_START_LOOP=true` 可以启用旧版后台账号实例。切换到前台命令前，先用 `npm run account -- stop <账号数字ID>` 停止该账号的旧实例，避免资料目录被占用。
 
@@ -17,34 +111,163 @@
 
 授权申请 `tweet.read`、`users.read`、`follows.read`、`follows.write`、`tweet.write`、`media.write` 和 `offline.access`。已有账号如缺少权限需重新授权。账号相关状态统一保存在 `.data/accounts.sqlite` 的账号表：自增主键、X 账号数字 ID（uuid）、用户名（索引）、是否已 clone、clone 来源账号信息（用户名/显示名/数字 ID/完成时间）、历史关键词字段（keywords）、是否已在账号资料 Chrome 登录并安装插件、是否已认证，以及 access / refresh 令牌（AES-GCM 加密，密钥在 `.data/key`）。二者位于同一机器，保护范围限于避免意外查看。服务只监听本机，不要将其公开到网络。用户查询和关注会消耗 API 额度，具体权限、费用及限额以 X 开发者控制台为准。
 
-## 其他单轮启动方式
+## 单轮调试
 
-手动模式可启动 `npm run browser`，在正式版 Google Chrome 的独立资料目录（`.data/manual-chrome-profile`）中登录 X 并安装、启用 CommentCrate；另开终端启动 `npm start`，再运行：
+正常执行统一使用长时 `npm run loop`。只测试单轮阶段时加 `--loop-only`：
 
 ```sh
-npm run test-loop -- --blogger <博主用户名>
+npm run loop -- <账号ID> --loop-only [--target <博主用户名>] [--language ar] [--evaluate] [--yes]
 ```
 
-也可使用 `npm run test-loop -- --account-id <数字ID> --username <用户名> --cdp-port <端口>` 指定账号及浏览器，账号一旦绑定到任务，恢复时不能换账号。新增的可选路径参数为 `--blogger <博主用户名>`、`--language ar` 和 `--evaluate`。单个已授权账号无需指定 ID；有多个时可在 `.env` 中设置 `X_FOLLOW_ACCOUNT_ID`。配置通过 `dotenv` 加载，任务 ID、账号和端口等运行状态通过参数传递。
+`--loop-only` 不 clone、不启动 mirror、不进入长时模式。恢复任务：
+
+```sh
+npm run loop -- <账号ID> --loop-only --resume <任务ID>
+```
 
 独立窗口为多账号隔离提供基础，但当前帖子与用户去重和 X 熔断仍为全局状态，因此同一时间只执行一轮；尚不支持多账号并行。不同账号可同时准备各自的浏览器资料。
 
-单轮任务从 clone 来源博主（或用 `--blogger` 指定）的主页选择回复最多且未处理的帖子，导出回复并解析用户。默认只按固定规则筛选：关注数和粉丝数优先从 CSV 读取；缺失时优先用 exporter24 扩展批量读取，扩展不可用或连续失败时回退到逐个打开候选主页读取。要求两者都大于 50、且较大值不超过较小值的 2 倍。读取会限制为串行并带随机延迟。`--language ar` 额外只保留含阿拉伯文字的回复用户，`--evaluate` 再结合帖子内容对剩余用户调用模型评估，只有判为相关者加入候选。关注时优先使用 CSV 中的用户数字 ID（`authorId`/`userId` 等），缺失的才批量解析用户名，然后串行调用 X API 关注；未能解析的用户保留在未处理列表。**该命令会实际发送关注请求。** 帖子读取和回复导出仍通过浏览器，关注不再操作原帖菜单。如果 CSV 没有用户数字 ID，解析得到的是查询时用户名对应的账号。
+单轮 loop 使用账号的 clone 目标作为博主（`--blogger` 仅作为未 clone 账号的手动兜底）。流程：
+
+1. 读取博主最近 10 条帖子，按新到旧排序，跳过没有回复的帖子。
+2. 对每条帖子：CommentCrate 导出回复 CSV → exporter24/主页补充关注/粉丝数 → 固定规则筛选 → 可选语言/模型评估 → 关注入选用户。
+3. 所有帖子处理完后：exporter24 导出博主粉丝 CSV → 同一固定规则筛选 → 关注入选用户。
+
+固定规则：关注数和粉丝数都大于 50，且较大值不超过较小值的 2 倍。阅读会串行并带随机延迟。`--language ar` 只影响帖子回复用户；`--evaluate` 只评估回复用户，粉丝列表不做模型评估。关注时优先使用 CSV 的用户数字 ID，缺失时才批量解析用户名。**该命令会实际发送关注请求。** 粉丝导出依赖 exporter24 的登录/额度；大粉丝量账号可能超时。
+
+### 关注前人工确认
+
+每批固定规则筛选完成后，会先展示待关注用户和他们的粉丝/关注数：
+
+```text
+[帖子 1/10] 固定规则筛选出 12 人待关注：
+  1. @user1  粉丝 1200  关注 980
+  ...
+输入 y 执行关注，n 跳过：
+```
+
+- 输入 `y`：执行本批关注
+- 输入 `n`：跳过本批关注，继续下一条帖子/粉丝阶段
+- `--yes`：跳过人工确认，自动关注
+- 非交互终端且没有 `--yes`：默认跳过关注，不会误发请求
+- 页面“自动选择并执行”可勾选“自动确认关注（跳过 y/n）”
+
+待关注列表会持久化到：
+
+```text
+.data/loop-runs/<任务ID>-pending-<post-N|followers>.json
+```
+
+同时保存在任务的 `runs.state` 里。关注进度保存在：
+- 任务状态 `runs.state.follow`
+- `.data/following.sqlite` 的 `following` / `pending` / `uncertain` 记录
+- `.data/loop.sqlite` 的 `evaluated_users` 成功关注记录（跳过或失败的用户不写入，可后续重试）
+
+进程中断后从 `follow` 阶段恢复时：
+- 已确认：继续未完成的关注，不重复提示
+- 已跳过：直接推进下一批
+- 未确认：重新展示 y/n 提示
+
 
 补充到的关注/粉丝数会写回原 CSV 同目录的 `*-enriched.csv`，新增 `followersCount`、`followingCount` 两列；筛选和关注使用同一份内存数据。
 
 模型配置为 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`，仅在使用 `--evaluate` 时需要。结果和任务状态保存在 `.data/loop-runs`、`.data/loop.sqlite`，API 关注记录在 `.data/following.sqlite`。任务可从断点恢复：
 
 ```sh
-npm run test-loop -- --resume <任务ID>
+npm run loop -- <账号ID> --loop-only --resume <任务ID>
 npm run loop:health
 ```
 
 旧的浏览器关注任务不会自动迁移为 API 任务，需要先核对其已关注和结果不明的用户。
 
+## 自动选择 clone 目标
+
+`--target` 优先：
+
+```sh
+npm run loop -- <账号ID> --target <博主用户名>
+```
+
+未指定 `--target` 且账号尚未 clone 时，使用 X API 的 `users/search` 搜索时尚相关博主，再逐一检查：
+
+- 粉丝数 > `CLONE_TARGET_MIN_FOLLOWERS`（默认 1000）
+- 最近 3 条非转推/非回复帖子中，至少 `CLONE_TARGET_REQUIRED_POSTS` 条（默认 2）回复数 >= `CLONE_TARGET_MIN_REPLIES`（默认 50）
+
+第一个满足条件的博主会被选为 clone 目标，并持久化。可用参数：
+
+```sh
+CLONE_TARGET_MIN_REPLIES=50
+CLONE_TARGET_MIN_FOLLOWERS=1000
+CLONE_TARGET_REQUIRED_POSTS=2
+CLONE_TARGET_MAX_CANDIDATES=40
+FASHION_SEARCH_QUERIES=fashion,fashion blogger,fashion influencer,ootd,street style
+```
+
+账号已经 clone 时不会重新搜索，直接使用 `copied_from_username`；传入不同 `--target` 会报错。
+
+## 长时 loop（clone → mirror 子进程 + 延迟回调）
+
+```sh
+npm run loop -- <账号ID> [--target <博主用户名>] [--cookie <文件>] [--language ar] [--evaluate] [--loop-only] [--yes] [--mirror-once|--no-mirror] [--check-only]
+```
+
+行为：
+
+1. 账号未 clone：用 `--target` 执行 clone，完成后写入账号表并持久化目标。
+2. 账号已 clone：跳过 clone，直接使用账号表里的 `copied_from_username`；
+   若传入不同的 `--target` 会报错，不会重新 clone 或更换目标。
+3. **先启动 mirror 子进程**，持续监听目标新帖并立即镜像发布；子进程异常退出 5 秒后自动重启。
+4. 父进程执行初始 loop：最多 10 条有回复的最近帖子 + 博主粉丝列表，每批筛选后关注。
+5. 初始 loop 结束后，父进程保持长时运行，每隔 `MIRROR_REPLY_SCHEDULER_MS` 检查延迟回复任务：
+   - 到期任务执行 `loop --loop-only --post <原帖>`，只处理该帖回复，不处理粉丝
+   - 任务串行执行，避免和当前 loop 争用账号
+   - 失败最多重试 3 次
+6. mirror 子进程只负责监听/镜像/登记任务；延迟任务由父 loop 执行。
+7. `--mirror-once`：mirror 只回填 3 条，初始 loop 后退出，不进入长时模式。
+8. `--no-mirror`：不启动 mirror，只跑一次初始 loop 后退出。
+9. `--loop-only`：只跑一次 loop，不 clone、不启动 mirror、不进入长时模式，用于测试。
+10. `--check-only`：只检查登录和插件，并打印 clone 状态/持久化目标，不执行 clone、loop 或 mirror。
+
+持久化位置：
+
+- clone 状态与目标：`.data/accounts.sqlite` 的 `cloned`、`copied_from_username`、`copied_at` 等字段
+- mirror 目标、水位线和延迟回复任务：`.data/mirror.sqlite`
+- loop 任务/批次状态：`.data/loop.sqlite` 和 `.data/loop-runs/*.json`
+
 ## 镜像发帖（准实时 hook）
 
-把某个目标用户的**新发帖**复制文本与图片、用另一个授权账号发新帖（视频/GIF 跳过）。X 不提供面向任意第三方的“发帖即回调”webhook，这里启动时先回填目标最新 3 条，随后优先用 **filtered stream**（一条长连接、X 实时推送，需 API 套餐支持 filtered stream）；连不上或套餐不支持时自动回退到 REST 轮询（间隔默认 60 秒，可用 `MIRROR_INTERVAL_MS` 调整，`--poll` 强制轮询，`--once` 只跑一次）。状态持久化在 `.data/mirror.sqlite`，重启后从水位线继续，不会重复发同一帖。
+把某个目标用户的**新发帖**复制文本与图片、用另一个授权账号发新帖（视频/GIF 跳过）。目标新帖通过 X API 获取（REST 时间线或 filtered stream），发帖和图片上传也全部走 X API；脚本只复制 API 返回的文本与图片，不使用浏览器页面抓取。X 不提供面向任意第三方的“发帖即回调”webhook，这里启动时先回填目标最新 3 条，随后优先用 **filtered stream**（一条长连接、X 实时推送，需 API 套餐支持 filtered stream）；连不上或套餐不支持时自动回退到 REST 轮询（间隔默认 60 秒，可用 `MIRROR_INTERVAL_MS` 调整，`--poll` 强制轮询，`--once` 只跑一次；`--backfill-only` 只复制最新 3 条然后退出，适合测试）。每条实际镜像帖之间随机等待 5–10 秒，可用 `MIRROR_POST_GAP_MIN_MS`、`MIRROR_POST_GAP_MAX_MS` 调整；轮询间隔和每次 API 请求也有随机抖动，可用 `MIRROR_POLL_JITTER_MS`、`MIRROR_REQUEST_JITTER_MS` 调整。状态持久化在 `.data/mirror.sqlite`，重启后从水位线继续，不会重复发同一帖。
+
+### 新帖延迟回复爬取
+
+镜像发帖成功后，会立即把目标原帖登记为一条延迟回复爬取任务。默认 **5 小时后**执行：
+
+```sh
+MIRROR_REPLY_DELAY_MS=18000000   # 5 小时，单位毫秒
+```
+
+完整 `npm run loop` 中由父 loop 执行；单独运行 `npm run mirror` 时由 mirror 自己的调度器执行。执行时启动：
+
+```sh
+npm run loop -- <发帖账号ID> --loop-only --post <目标原帖链接> --target <博主>
+```
+
+只处理这一条帖子的回复，不处理粉丝列表。执行前仍会展示待关注用户并提示 y/n；`MIRROR_REPLY_AUTO_YES=true` 可自动确认。
+
+相关参数：
+
+```sh
+MIRROR_REPLY_DELAY_MS=18000000     # 延迟多久执行，默认 5 小时
+MIRROR_REPLY_SCHEDULER_MS=60000    # 调度器检查间隔，默认 60 秒
+MIRROR_REPLY_RETRY_MS=600000       # 失败重试间隔，默认 10 分钟
+MIRROR_REPLY_AUTO_YES=false        # 是否自动确认关注
+```
+
+- 任务持久化在 `.data/mirror.sqlite` 的 `mirror_reply_jobs` 表
+- 失败最多重试 3 次
+- `--backfill-only` 和 `--once` 不启动调度器，任务会保留到下一次持续监听
+- 如果 mirror 运行在非交互终端且没有 `MIRROR_REPLY_AUTO_YES`，回复爬取会执行，但关注确认默认跳过
+
 
 ```sh
 # 目标用户发新帖后，复制文本用发帖账号发新帖（发帖账号须具备 tweet.write）
@@ -76,7 +299,7 @@ npm run loop:health -- resolve-api-follow <授权账号数字ID> <目标账号�
 
 - `scripts/account/`：账号实例、状态与登录检查。
 - `scripts/browser/`：浏览器连接、启动和 exporter24 计数读取。
-- `scripts/clone_user/`：独立的账号资料复制，使用 `npm run clone_user -- <目标用户名> <子账号资料名>`；已 clone 的账号会跳过复制。clone 完成后，loop 默认使用该来源博主采集帖子回复。
+- `scripts/clone_user/`：独立的账号资料复制，使用 `npm run clone_user -- <目标用户名> <子账号资料名>`，可加 `--cookie <文件>`、`--dry-run`、`--update`。复制头像、显示名称、完整简介和横幅；`--update` 只刷新资料、不改用户名，已 clone 的账号也可用。clone 完成后，loop 默认使用该来源博主采集帖子回复。
 - `scripts/mirror/`：目标发帖镜像（准实时 hook）。使用 `npm run mirror -- <目标用户名> <发帖账号数字ID>` 注册并持续轮询目标新帖，复制文本用发帖账号发新帖；`npm run mirror -- list` 查看，`npm run mirror -- remove <目标用户名>` 移除。
 - `scripts/follow/`：关注操作。
 - `scripts/loop/`：单轮任务、队列和恢复。

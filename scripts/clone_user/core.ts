@@ -15,3 +15,14 @@ export function originalAvatarUrl(value: string): string {
   url.pathname = url.pathname.replace(/_(normal|bigger|mini|reasonably_small|\d+x\d+)(?=\.[^./]+$)/, '');
   return url.toString();
 }
+
+/** Restrict banner downloads to X's image CDN and ask for the original-sized banner. */
+export function originalBannerUrl(value: string): string {
+  const url = new URL(value);
+  if (url.protocol !== 'https:' || url.hostname !== 'pbs.twimg.com' || !url.pathname.startsWith('/profile_banners/')) {
+    throw new Error('横幅地址不是预期的 X 图片地址');
+  }
+  // Banner URLs end with a display size such as /600x200; the raw path is the original.
+  url.pathname = url.pathname.replace(/\/\d+x\d+$/, '');
+  return url.toString();
+}

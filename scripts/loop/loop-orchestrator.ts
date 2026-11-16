@@ -41,14 +41,14 @@ export function createLoopOrchestrator({ db, runId, execute, probe, hasUncertain
       const row = getRun();
       const failure = db.prepare("SELECT * FROM failure_jobs WHERE run_id=? AND stage=? AND status!='resolved' ORDER BY updated_at DESC LIMIT 1").get(runId, row?.stage);
       const circuit = db.prepare("SELECT state FROM circuits WHERE scope='x'").get();
-      if (['search', 'qualify', 'follow'].includes(row?.stage) && (failure?.kind === 'rate_limit' || circuit?.state === 'open')) {
+      if (['search', 'followers-export', 'qualify', 'follow'].includes(row?.stage) && (failure?.kind === 'rate_limit' || circuit?.state === 'open')) {
         if (row.stage === 'follow' && await hasUncertain(row)) {
           db.prepare("UPDATE loop_jobs SET status='manual',last_error=? WHERE id=?").run('关注结果不明，需核实', runId);
           finishOnce('manual'); return;
         }
         db.prepare("UPDATE loop_jobs SET status='cooldown',last_error=? WHERE id=?").run('X 限流', runId);
         await cooldown.limited();
-        onLog(`X ${row.stage === 'follow' ? '关注' : row.stage === 'qualify' ? '主页读取' : '帖子读取'}受限：15 分钟后进入半开探测。`);
+        onLog(`X ${row.stage === 'follow' ? '关注' : row.stage === 'followers-export' ? '粉丝导出' : row.stage === 'qualify' ? '主页读取' : '帖子读取'}受限：15 分钟后进入半开探测。`);
         return;
       }
       if (row?.stage === 'evaluate' && failure?.kind === 'transient' && failure.status === 'pending') {
@@ -62,7 +62,7 @@ export function createLoopOrchestrator({ db, runId, execute, probe, hasUncertain
   const queue = new EventWorkQueue({ store, now, setTimer, clearTimer, handle: async () => {
     const row = getRun();
     if (row?.status === 'completed') return;
-    if (row?.stage === 'export' && row.status !== 'running') throw new Error('导出结果需人工核实');
+    if ((row?.stage === 'export' || row?.stage === 'followers-export') && row.status !== 'running') throw new Error('导出结果需人工核实');
     const result = await execute({ runId, resume: Boolean(row) });
     if (result !== 0) throw new Error(`单轮任务退出码 ${result}`);
     if (getRun()?.status !== 'completed') throw new Error('单轮任务未完成，需人工检查');

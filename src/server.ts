@@ -6,8 +6,10 @@ import {
   type ServerResponse,
 } from "node:http";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseCookieImportPayload, writeCookieFile } from "../scripts/browser/cookie-import.ts";
 import { rankUsers } from "./user-ranking.ts";
 import { followFirstArabFollower } from "./arab-follow.ts";
 import { FollowStore, syncFollowing } from "./follow-store.ts";
@@ -130,11 +132,11 @@ function json(res: ServerResponse, status: number, value: unknown) {
 }
 
 /** 读取并解析小体积 JSON 请求体。 */
-async function readJsonBody(req: IncomingMessage): Promise<any> {
+async function readJsonBody(req: IncomingMessage, maxBytes = 4096): Promise<any> {
   let body = "";
   for await (const chunk of req) {
     body += chunk;
-    if (body.length > 4096) throw new HttpError(413, "请求体过大");
+    if (body.length > maxBytes) throw new HttpError(413, "请求体过大");
   }
   try { return JSON.parse(body || "{}"); }
   catch { throw new HttpError(400, "请求体不是有效的 JSON"); }
@@ -360,6 +362,7 @@ async function usableAccount(id: string): Promise<Account> {
 }
 
 const page = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+let autoRunProcess: ReturnType<typeof spawn> | null = null;
 const followStore = new FollowStore(join(dataDir, "following.sqlite"));
 const runningFollow = new Set<string>();
 
@@ -395,7 +398,7 @@ const server = createServer(async (req, res) => {
 
     const url = new URL(req.url || "/", origin);
 
-    if (req.method === "GET" && url.pathname === "/") {
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/cookies")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(page);
       return;
@@ -556,6 +559,70 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/cookies/import") {
+      if (req.headers["x-local-request"] !== "1" || (req.headers.origin && req.headers.origin !== origin))
+        throw new HttpError(403, "Invalid local request");
+      const body = await readJsonBody(req, 1_000_000);
+      let entries;
+      try { entries = parseCookieImportPayload(body); }
+      catch (error) { throw new HttpError(400, error instanceof Error ? error.message : "cookie 导入格式无效"); }
+      const results = [];
+      for (const entry of entries) {
+        const account = entry.accountId
+          ? accountStore.getByUuid(entry.accountId)
+          : accountStore.getByUsername(entry.username!);
+        if (!account?.uuid || !account.authenticated) {
+          results.push({ accountId: entry.accountId, username: entry.username, ok: false, error: "未找到已授权账号，请先完成 X 授权" });
+          continue;
+        }
+        try {
+          const written = writeCookieFile(dataDir, account.uuid, entry.cookie);
+          accountStore.upsert({ uuid: account.uuid, username: account.username, chromeReady: false });
+          results.push({ accountId: account.uuid, username: account.username, ok: true, cookies: written.count });
+        } catch (error) {
+          results.push({ accountId: account.uuid, username: account.username, ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      json(res, 200, { imported: results.filter((item) => item.ok).length, failed: results.filter((item) => !item.ok).length, results });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/loop/auto") {
+      if (req.headers["x-local-request"] !== "1" || (req.headers.origin && req.headers.origin !== origin))
+        throw new HttpError(403, "Invalid local request");
+      if (autoRunProcess && autoRunProcess.exitCode === null)
+        throw new HttpError(409, "自动任务正在运行");
+      const body = await readJsonBody(req);
+      const blogger = typeof body.blogger === "string" ? body.blogger.trim().replace(/^@/, "") : "";
+      if (blogger && !/^[A-Za-z0-9_]{1,15}$/.test(blogger)) throw new HttpError(400, "博主用户名无效");
+      if (body.language && body.language !== "ar") throw new HttpError(400, "目前仅支持 language=ar");
+      const language = body.language === "ar" ? "ar" : null;
+      const evaluate = body.evaluate === true;
+      const yes = body.yes === true;
+      const args = [
+        "scripts/loop/auto-run.ts",
+        ...(blogger ? ["--blogger", blogger] : []),
+        ...(language ? ["--language", language] : []),
+        ...(evaluate ? ["--evaluate"] : []),
+        ...(yes ? ["--yes"] : []),
+      ];
+      const logPath = join(dataDir, "auto-run.log");
+      mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+      const fd = openSync(logPath, "a", 0o600);
+      try {
+        const child = spawn(process.execPath, args, { cwd: process.cwd(), detached: true, stdio: ["ignore", fd, fd] });
+        child.unref();
+        autoRunProcess = child;
+        child.once("exit", () => { if (autoRunProcess === child) autoRunProcess = null; });
+        json(res, 202, { pid: child.pid, log: logPath });
+      } catch (error) {
+        throw new HttpError(502, `无法启动自动任务：${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        closeSync(fd);
+      }
+      return;
+    }
+
     const postTweetMatch = url.pathname.match(/^\/api\/accounts\/(\d{1,19})\/tweets$/);
     if (req.method === "POST" && postTweetMatch) {
       if (req.headers.origin !== origin || req.headers["x-local-request"] !== "1")
@@ -618,6 +685,18 @@ const server = createServer(async (req, res) => {
           }] : [];
         }),
       });
+      return;
+    }
+
+    if (url.pathname === "/api/cookies") {
+      const accounts = accountStore.list().filter((record) => record.uuid && record.authenticated).map((record) => ({
+        user: { id: record.uuid, name: record.name ?? record.username, username: record.username },
+        scope: record.scope,
+        expiresAt: record.expiresAt,
+        chromeReady: record.chromeReady,
+        hasCookie: existsSync(join(dataDir, "cookies", `${record.uuid}.json`)) || existsSync(join(dataDir, "cookies", `${record.uuid}.txt`)),
+      }));
+      json(res, 200, { accounts });
       return;
     }
 

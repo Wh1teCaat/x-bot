@@ -8,7 +8,7 @@ export function classifyFailure(error, stage) {
   const msg = String(error?.message || '未知错误');
   const status = error?.status ?? error?.statusCode;
   if (status === 429 || /rate.?limit|rate limited|限流|速率受限/i.test(msg)) return { kind: 'rate_limit', reason: '服务速率受限', retryable: false };
-  if (stage === 'follow' || stage === 'export') return { kind: 'manual', reason: '外部操作状态需核实', retryable: false };
+  if (stage === 'follow' || stage === 'export' || stage === 'followers-export') return { kind: 'manual', reason: '外部操作状态需核实', retryable: false };
   if ([401, 403].includes(status) || /登录|captcha|验证码|验证|权限|connection rejected/i.test(msg)) return { kind: 'manual', reason: '登录、权限或验证问题', retryable: false };
   if (status >= 500 || ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN'].includes(error?.code) || /timeout|timed out|超时|connection error/i.test(msg)) return { kind: 'transient', reason: '连接或服务暂时异常', retryable: true };
   return { kind: 'manual', reason: '结果或输入需要检查', retryable: false };

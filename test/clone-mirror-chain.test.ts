@@ -54,9 +54,10 @@ test("clone result feeds the mirror watch, backfills and then mirrors streamed p
     };
     const backfill = await mirrorNewPosts({ store: mirrors, watch, client, limit: 3 });
     assert.equal(backfill.posted, 3);
-    assert.deepEqual(posted.map((p) => p.text), ["post three", "post two", ""]);
+    assert.deepEqual(posted.map((p) => p.text), ["", "post two", "post three"]);
+    assert.deepEqual(posted[0].mediaIds, ["m_b.jpg"]);
     assert.deepEqual(posted[1].mediaIds, ["m_a.jpg"]);
-    assert.deepEqual(posted[2].mediaIds, ["m_b.jpg"]);
+    assert.deepEqual(posted[2].mediaIds, []);
     mirrors.setSinceId(targetUsername, backfill.newestId!);
 
     // 重复同步不重发（水位线之后没有新帖）。

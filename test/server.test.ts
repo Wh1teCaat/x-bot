@@ -262,6 +262,26 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
     );
     assert.equal(JSON.stringify(accounts).includes("access1"), false);
     assert.equal(JSON.stringify(accounts).includes("access2"), false);
+
+    // Cookie 导入页与本地导入接口。
+    assert.equal((await fetch(`${base}/cookies`)).status, 200);
+    const cookieStatus = await fetch(`${base}/api/cookies`, { headers: header });
+    assert.equal(cookieStatus.status, 200);
+    assert.equal(((await cookieStatus.json()) as any).accounts.every((item: any) => item.hasCookie === false), true);
+    assert.equal((await fetch(`${base}/api/cookies/import`, {
+      method: "POST",
+      headers: { ...header, Origin: base, "Content-Type": "application/json" },
+      body: JSON.stringify([{ accountId: "1", cookie: { auth_token: "a", ct0: "b" } }]),
+    })).status, 200);
+    const importedCookies = JSON.parse(readFileSync(join(dir, "cookies", "1.json"), "utf8"));
+    assert.deepEqual(importedCookies.cookies.map((cookie: any) => cookie.name), ["auth_token", "ct0"]);
+    const cookieStatusAgain = await fetch(`${base}/api/cookies`, { headers: header });
+    assert.equal(((await cookieStatusAgain.json()) as any).accounts.find((item: any) => item.user.id === "1").hasCookie, true);
+    assert.equal((await fetch(`${base}/api/cookies/import`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify([{ accountId: "1", cookie: { auth_token: "a", ct0: "b" } }]),
+    })).status, 403);
     const sqlite = readFileSync(join(dir, "accounts.sqlite"));
     for (const secret of ["access1", "refresh1", "refresh2"]) {
       assert.equal(sqlite.includes(Buffer.from(secret)), false);

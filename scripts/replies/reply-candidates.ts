@@ -62,7 +62,7 @@ function normalizeHeader(value) {
 /** 在表头中定位用户数字 ID 列；评论自身的 id 列不参与匹配。 */
 function userIdColumn(header) {
   const keys = header.map(normalizeHeader);
-  const exact = ['userid', 'authorid', 'fromid', 'accountid'];
+  const exact = ['userid', 'authorid', 'fromid', 'accountid', 'uid', 'restid'];
   const found = keys.findIndex(key => exact.includes(key) || key.endsWith('userid') || key.endsWith('authorid'));
   return found;
 }
@@ -71,7 +71,7 @@ function userIdColumn(header) {
 function countColumn(header, kind) {
   const keys = header.map(normalizeHeader);
   const exact = kind === 'followers'
-    ? ['followers', 'followerscount', 'followercount', 'follower', 'fans', 'fanscount', 'followersnum', 'numfollowers', '粉丝', '粉丝数', '粉丝数量', '被关注', '被关注数']
+    ? ['followers', 'followerscount', 'followercount', 'follower', 'fans', 'fanscount', 'followersnum', 'numfollowers', 'subscount', 'subscribers', 'subscribercount', '粉丝', '粉丝数', '粉丝数量', '被关注', '被关注数']
     : ['following', 'followingcount', 'followcount', 'follow', 'follows', 'followings', 'followingnum', 'numfollowing', 'friends', 'friendscount', 'numfriends', '关注', '关注数', '关注数量'];
   const found = keys.findIndex(key => exact.includes(key));
   if (found >= 0) return found;
@@ -140,6 +140,49 @@ export function partitionReplyCandidates(csv, expectedPostId) {
     (matched ? direct : remaining).push(candidate);
   }
   return { direct, remaining, hasFollowerCounts: followersIndex >= 0 && followingIndex >= 0, hasUserIds: userIdIndex >= 0, header };
+}
+
+/** 在粉丝列表 CSV 中定位用户名列。 */
+function usernameColumn(header) {
+  const keys = header.map(normalizeHeader);
+  return keys.findIndex(key => ['username', 'screenname', 'handle', 'user', 'account'].includes(key));
+}
+
+/** 解析 exporter24 导出的粉丝/关注 CSV，返回与回复候选同形的用户列表。 */
+export function partitionFollowerCandidates(csv) {
+  const rows = parseCsv(csv);
+  const header = rows.shift();
+  if (!header) throw new Error('CSV 为空');
+  const usernameIndex = usernameColumn(header);
+  const profileIndex = header.indexOf('profileUrl');
+  if (usernameIndex < 0 && profileIndex < 0) throw new Error('粉丝 CSV 缺少用户名列或 profileUrl 列');
+  const followersIndex = countColumn(header, 'followers');
+  const followingIndex = countColumn(header, 'following');
+  const userIdIndex = userIdColumn(header);
+  const users = new Map();
+  for (const row of rows) {
+    if (row.length !== header.length) continue;
+    let username = usernameIndex >= 0 ? row[usernameIndex].trim().replace(/^@/, '') : '';
+    if (!/^[A-Za-z0-9_]{1,15}$/.test(username) && profileIndex >= 0) {
+      try { username = new URL(row[profileIndex]).pathname.match(/^\/([A-Za-z0-9_]{1,15})\/?$/)?.[1] ?? ''; } catch { username = ''; }
+    }
+    if (!/^[A-Za-z0-9_]{1,15}$/.test(username)) continue;
+    const key = username.toLowerCase();
+    if (users.has(key)) continue;
+    const followers = followersIndex >= 0 ? parseCountValue(row[followersIndex]) : undefined;
+    const following = followingIndex >= 0 ? parseCountValue(row[followingIndex]) : undefined;
+    const userId = userIdIndex >= 0 && /^\d{1,19}$/.test(row[userIdIndex]) ? row[userIdIndex] : undefined;
+    users.set(key, {
+      username,
+      profileUrl: `https://x.com/${username}`,
+      replies: [],
+      replyIds: [],
+      followers,
+      following,
+      userId,
+    });
+  }
+  return { candidates: [...users.values()], hasFollowerCounts: followersIndex >= 0 && followingIndex >= 0, hasUserIds: userIdIndex >= 0, header };
 }
 
 /** 返回具有阿拉伯文字回复及对应回复 ID 的候选用户。 */

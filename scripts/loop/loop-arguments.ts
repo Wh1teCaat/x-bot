@@ -12,19 +12,25 @@ export type LoopArguments = {
   language?: "ar";
   /** 可选模型评估；缺省只使用固定关注/粉丝规则。 */
   evaluate: boolean;
+  /** 跳过关注前人工确认（y/n）。 */
+  yes: boolean;
+  /** 只处理指定帖子（镜像延迟回复爬取使用）。 */
+  postUrl?: string;
 };
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const handle = /^[A-Za-z0-9_]{1,15}$/;
+const statusUrl = /^https?:\/\/(?:www\.)?(?:x|twitter)\.com\/([A-Za-z0-9_]{1,15})\/status\/(\d{1,19})(?:[?#].*)?$/i;
 
 /** 解析公开参数；内部运行参数仅允许由调度器传给子进程。 */
 export function parseLoopArguments(args: string[], internal = false): LoopArguments {
-  const result: LoopArguments = { followProbe: false, evaluate: false };
+  const result: LoopArguments = { followProbe: false, evaluate: false, yes: false };
   const seen = new Set<string>();
   for (let i = 0; i < args.length; i++) {
     const key = args[i];
     if (seen.has(key)) throw new Error('参数不能重复');
     seen.add(key);
     if (key === '--evaluate') { result.evaluate = true; continue; }
+    if (key === '--yes') { result.yes = true; continue; }
     if (key === '--follow-probe' && internal) { result.followProbe = true; continue; }
     const value = args[++i];
     if (!value) throw new Error('参数缺少值');
@@ -40,6 +46,11 @@ export function parseLoopArguments(args: string[], internal = false): LoopArgume
     else if (key === '--language') {
       if (value !== 'ar') throw new Error('目前仅支持阿拉伯语筛选（--language ar）');
       result.language = 'ar';
+    }
+    else if (key === '--post') {
+      const match = statusUrl.exec(value);
+      if (!match) throw new Error('--post 必须是 X 帖子链接');
+      result.postUrl = `https://x.com/${match[1]}/status/${match[2]}`;
     }
     else if (key === '--cdp-port' && /^\d{1,5}$/.test(value) && +value > 0 && +value <= 65535) result.cdpPort = +value;
     else throw new Error(`无效参数 ${key}`);

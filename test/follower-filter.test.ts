@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   followerBalance,
   qualifyByFollowerBalance,
+  selectFollowCandidates,
 } from "../scripts/replies/follower-filter.ts";
 
 test("requires both counts above 50 and a ratio no greater than two", () => {
@@ -32,4 +33,19 @@ test("separates qualified and rejected CSV candidates in order", () => {
   assert.match(result.rejected[0].reason!, /大于 50/);
   assert.match(result.rejected[1].reason!, /相差超过 2 倍/);
   assert.match(result.rejected[2].reason!, /缺少关注数或粉丝数/);
+});
+
+test("selects all rule-qualified users when evaluation is off", () => {
+  const direct = [{ username: "direct", followers: 80, following: 90 }];
+  const candidates = [{ username: "candidate", followers: 100, following: 120 }];
+  assert.deepEqual(selectFollowCandidates({ qualifiedDirect: direct, qualifiedCandidates: candidates, evaluate: false }).map((item) => item.username), ["direct", "candidate"]);
+});
+
+test("selects only relevant evaluated users when evaluation is on", () => {
+  const direct = [{ username: "direct", followers: 80, following: 90 }];
+  const evaluations = [
+    { username: "yes", followers: 100, following: 120, decision: "relevant" },
+    { username: "no", followers: 100, following: 120, decision: "irrelevant" },
+  ];
+  assert.deepEqual(selectFollowCandidates({ qualifiedDirect: direct, evaluations, evaluate: true }).map((item) => item.username), ["direct", "yes"]);
 });
