@@ -53,7 +53,7 @@
     <input type="text" id="blogger" placeholder="博主用户名，可留空（默认用 clone 来源）">
     <label><input type="checkbox" id="language"> 阿拉伯文字筛选</label>
     <label><input type="checkbox" id="evaluate"> 模型评估</label>
-    <label><input type="checkbox" id="yes"> 自动确认关注（跳过 y/n）</label>
+    <small>筛选结果写入关注 Outbox；请运行主 loop 处理队列。</small>
     <button id="auto">自动选择并执行</button>
   </div>
   <pre id="autoResult" hidden></pre>
@@ -132,7 +132,7 @@
           blogger: document.querySelector('#blogger').value.trim(),
           language: document.querySelector('#language').checked,
           evaluate: document.querySelector('#evaluate').checked,
-          yes: document.querySelector('#yes').checked,
+          yes: false,
         }),
       });
       const data = await response.json();

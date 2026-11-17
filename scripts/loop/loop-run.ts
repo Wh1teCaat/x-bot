@@ -6,8 +6,6 @@ import { exportExporter24Followers, openExporter24, readExporter24Counts } from 
 import { DatabaseSync } from 'node:sqlite';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { createInterface } from 'node:readline/promises';
-import { stdin, stdout } from 'node:process';
 import { join, resolve } from 'node:path';
 import { findBloggerPosts, getCollectorPage, scanAndExport } from '../replies/reply-export.ts';
 import { enrichCsv, partitionFollowerCandidates, partitionReplyCandidates } from '../replies/reply-candidates.ts';
@@ -15,7 +13,8 @@ import { readProfileCounts } from '../replies/profile-counts.ts';
 import { sortPostsNewestFirst } from '../replies/post-order.ts';
 import { qualifyByFollowerBalance, selectFollowCandidates } from '../replies/follower-filter.ts';
 import { makeLlm, evaluateCandidates } from './loop-llm.ts';
-import { LocalFollowClient, followCandidatesApi } from '../follow/api-follow.ts';
+import { LocalFollowClient } from '../follow/api-follow.ts';
+import { FollowOutbox } from '../../src/follow-outbox.ts';
 import { ResilienceStore, classifyFailure, retryTransient } from './resilience.ts';
 import { parseLoopArguments } from './loop-arguments.ts';
 import { AccountStore } from '../../src/account-store.ts';
@@ -67,53 +66,6 @@ const markProcessed = items => {
     db.exec('COMMIT');
   } catch (error) { db.exec('ROLLBACK'); throw error; }
 };
-/** 关注前保存本批待关注用户，便于人工核对和重启后恢复。 */
-const writePendingFollows = async selected => {
-  const label = state.phase === 'followers' ? 'followers' : `post-${state.postIndex + 1}`;
-  const path = join('.data/loop-runs', `${runId}-pending-${label}.json`);
-  await writeFile(path, JSON.stringify({
-    runId,
-    phase: state.phase,
-    createdAt: new Date().toISOString(),
-    post: state.phase === 'replies' ? state.post : null,
-    candidates: selected.map(candidate => ({
-      username: candidate.username,
-      followers: candidate.followers,
-      following: candidate.following,
-      userId: candidate.userId,
-    })),
-  }, null, 2), { mode: 0o600 });
-  state.pendingFollowPath = path;
-  persist('running');
-  return path;
-};
-
-/** 展示待关注人数并等待 y/n；非交互终端默认跳过。 */
-const askFollowConfirmation = async selected => {
-  const label = state.phase === 'followers' ? '博主粉丝' : `帖子 ${state.postIndex + 1}/${state.posts.length}`;
-  console.log(`\n[${label}] 固定规则筛选出 ${selected.length} 人待关注：`);
-  for (const [index, candidate] of selected.slice(0, 50).entries()) {
-    console.log(`  ${index + 1}. @${candidate.username}  粉丝 ${candidate.followers ?? '未知'}  关注 ${candidate.following ?? '未知'}`);
-  }
-  if (selected.length > 50) console.log(`  ... 其余 ${selected.length - 50} 人`);
-  if (followProbe) { console.log('半开探测：自动确认单个关注。'); return 'confirmed'; }
-  if (args.yes) { console.log('--yes：自动确认关注。'); return 'confirmed'; }
-  if (!stdin.isTTY) {
-    console.log('当前不是交互终端，默认跳过关注；待关注列表已保存。');
-    return 'skipped';
-  }
-  const input = createInterface({ input: stdin, output: stdout });
-  try {
-    for (;;) {
-      const answer = (await input.question('输入 y 执行关注，n 跳过：')).trim().toLowerCase();
-      if (answer === 'y' || answer === 'yes') return 'confirmed';
-      if (answer === 'n' || answer === 'no') return 'skipped';
-    }
-  } finally {
-    input.close();
-  }
-};
-
 try {
   if (resumeId) {
     const row = db.prepare('SELECT * FROM runs WHERE id=?').get(resumeId);
@@ -441,20 +393,10 @@ try {
       evaluations: state.evaluations,
       evaluate: state.phase === 'replies' && options.evaluate,
     });
-    if (selected.length && !state.followConfirmation) {
-      const pendingPath = await writePendingFollows(selected);
-      state.followConfirmation = await askFollowConfirmation(selected);
-      persist('running');
-      if (state.followConfirmation === 'skipped') console.log(`已跳过本批关注；待关注列表：${pendingPath}`);
-    }
-    const skipped = state.followConfirmation === 'skipped';
-    if (skipped) {
-      state.follow = { matched: [], unresolved: [] };
-      state.followSkipped = true;
-      persist('running');
-    } else {
     if (state.follow && !state.followAccountId) throw new Error('旧浏览器关注任务需要核对已处理和未确认用户，不能直接切换到 API 续跑');
-    console.log(`待关注集合共 ${selected.length} 人，通过 X API 处理。`);
+    if (followProbe) throw new Error('旧版关注探测不能自动迁移至 Outbox，请先核实旧任务');
+    if (state.follow?.matched?.some(item => item.status !== 'queued') || state.followConfirmation) throw new Error('旧版关注任务需要先核实并结束，不能自动迁移到 Outbox');
+    console.log(`待关注集合共 ${selected.length} 人，准备写入 Outbox。`);
     const client = new LocalFollowClient();
     const account = await client.selectAccount(state.followAccountId || process.env.X_FOLLOW_ACCOUNT_ID);
     if (!state.followAccountId) { state.followAccountId = account.id; persist('running'); }
@@ -471,19 +413,16 @@ try {
     }
     state.followTargetIds = ids;
     persist('running');
-    state.follow = await followCandidatesApi({ client, accountId: account.id, candidates: selected, ids,
-      progress: state.follow, guard: ensureX,
-      save: async progress => { state.follow = progress; persist('running'); },
-      ...(followProbe ? { maxNewFollows: 1 } : {}),
-    });
-    }
-    if (followProbe && !skipped) {
-      ensureX();
-      if (!state.follow.probeSucceeded) throw new Error('未能找到可探测的新关注用户');
-      persist('probe_succeeded');
-      console.log('单次关注探测已确认成功。');
-      process.exitCode = 0;
-    } else {
+    const ready = selected.filter(candidate => ids[candidate.username.toLowerCase()] && ids[candidate.username.toLowerCase()] !== account.id);
+    const unresolved = selected.filter(candidate => !ids[candidate.username.toLowerCase()]);
+    const outbox = new FollowOutbox('.data/following.sqlite');
+    try {
+      const added = outbox.enqueue(account.id, ready.map(candidate => ({ id: ids[candidate.username.toLowerCase()], username: candidate.username, source: `${runId}:${state.phase}:${state.post?.url || state.blogger}` })));
+      console.log(`Outbox 新增 ${added} 人，重复目标已跳过。`);
+    } finally { outbox.close(); }
+    state.follow = { matched: ready.map(candidate => ({ username: candidate.username, targetId: ids[candidate.username.toLowerCase()], status: 'queued' })), unresolved: unresolved.map(candidate => candidate.username.toLowerCase()) };
+    persist('running');
+    {
       const output = join('.data/loop-runs', `${runId}.json`);
       state.results ??= [];
       state.results.push({

@@ -370,7 +370,9 @@ const runningFollow = new Set<string>();
 async function sendFollow(accountId: string, targetId: string, accessToken: string) {
   const previous = followStore.status(accountId, targetId);
   if (previous === "following" || previous === "pending") return { data: { following: previous === "following", pending_follow: previous === "pending" }, cached: true };
-  if (!followStore.reserve(accountId, targetId)) throw new HttpError(409, "关注结果不明确或正在处理中，请先核实。");
+  const reservation = followStore.reserveWithDailyLimit(accountId, targetId);
+  if (reservation === 'limit') throw new HttpError(409, '该账号最近 24 小时已达到本程序的 400 次关注尝试上限，请稍后再试。');
+  if (reservation !== 'reserved') throw new HttpError(409, "关注结果不明确或正在处理中，请先核实。");
   let result;
   try { result = await xRequest(`/2/users/${accountId}/following`, {
     method: "POST",

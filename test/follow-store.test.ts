@@ -35,3 +35,31 @@ test("updates pending status when following sync confirms it", async () => {
     assert.equal(store.status("1", "30"), "following");
   } finally { store.close(); }
 });
+
+test('persists incoming follows idempotently and checks the correct account', () => {
+  const store = new FollowStore(':memory:');
+  try {
+    store.record('1', '3', 'following');
+    store.record('2', '3', 'pending');
+    assert.equal(store.recordInboundFollow('event-1', '1', '3'), '互关');
+    assert.equal(store.recordInboundFollow('event-1', '1', '3'), '重复事件');
+    assert.equal(store.recordInboundFollow('event-2', '2', '3'), '已关注我，是否互关待确认');
+    assert.equal(store.hasObservedMutualFollow('1', '3'), true);
+    assert.equal(store.hasObservedMutualFollow('2', '3'), false);
+    store.record('2', '3', 'following');
+    assert.equal(store.hasObservedMutualFollow('2', '3'), true);
+  } finally { store.close(); }
+});
+
+test('reserves attempts atomically within a rolling 24-hour account limit', () => {
+  const store = new FollowStore(':memory:');
+  try {
+    const now = 200000000;
+    assert.equal(store.reserveWithDailyLimit('1', '2', 2, now), 'reserved');
+    assert.equal(store.reserveWithDailyLimit('1', '2', 2, now), 'duplicate');
+    assert.equal(store.reserveWithDailyLimit('1', '3', 2, now), 'reserved');
+    assert.equal(store.reserveWithDailyLimit('1', '4', 2, now), 'limit');
+    assert.equal(store.reserveWithDailyLimit('5', '4', 2, now), 'reserved');
+    assert.equal(store.reserveWithDailyLimit('1', '4', 2, now + 86400000), 'reserved');
+  } finally { store.close(); }
+});

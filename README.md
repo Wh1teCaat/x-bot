@@ -103,7 +103,7 @@ http://127.0.0.1:3000/
 
 导入后会写入 `.data/cookies/<账号ID>.json`（权限 0600），并把该账号的 `chromeReady` 清掉，下次运行会重新校验 cookie 和 CommentCrate。cookie 导入只负责登录，**不会安装 CommentCrate**。
 
-页面上的“自动选择并执行”会依次检查有 cookie 的已授权账号，使用第一个仍能登录的账号执行一轮 loop。自动检查使用 `--check-only`，不会发送关注请求；选定账号后的 loop 会按页面选项决定是否自动确认关注。后台自动任务的日志在 `.data/auto-run.log`。所有账号都检查失败时会退出，不会继续尝试。
+页面上的“自动选择并执行”会依次检查有 cookie 的已授权账号，使用第一个仍能登录的账号执行一轮采集。自动检查使用 `--check-only`，不会发送关注请求；单轮采集写入 Outbox，由主 loop 的 worker 消费。后台自动任务的日志在 `.data/auto-run.log`。所有账号都检查失败时会退出。
 
 `X_AUTO_START_LOOP=true` 可以启用旧版后台账号实例。切换到前台命令前，先用 `npm run account -- stop <账号数字ID>` 停止该账号的旧实例，避免资料目录被占用。
 
@@ -135,38 +135,19 @@ npm run loop -- <账号ID> --loop-only --resume <任务ID>
 
 固定规则：关注数和粉丝数都大于 50，且较大值不超过较小值的 2 倍。阅读会串行并带随机延迟。`--language ar` 只影响帖子回复用户；`--evaluate` 只评估回复用户，粉丝列表不做模型评估。关注时优先使用 CSV 的用户数字 ID，缺失时才批量解析用户名。**该命令会实际发送关注请求。** 粉丝导出依赖 exporter24 的登录/额度；大粉丝量账号可能超时。
 
-### 关注前人工确认
+### 关注 Outbox
 
-每批固定规则筛选完成后，会先展示待关注用户和他们的粉丝/关注数：
+筛选结果按账号和目标 ID 去重写入 `.data/following.sqlite` 中的 Outbox。正常主 `npm run loop` 启动后台 worker，默认自动执行：每批最多 20 人，批次间隔至少 15 分钟，每账号最近 24 小时最多 400 次本程序关注尝试。请求限流或达到本程序配额会保留待处理项；结果不明确或处理中断则转为待核实，不自动重发。网页或其他应用的关注不会计入本程序配额。旧的 `--yes` 保留兼容，默认已经无需确认。
 
-```text
-[帖子 1/10] 固定规则筛选出 12 人待关注：
-  1. @user1  粉丝 1200  关注 980
-  ...
-输入 y 执行关注，n 跳过：
+需要每批手动确认时，主 loop 添加 `--confirm-follow`；非交互终端无法确认时 worker 退出，候选人保留在 Outbox。单独的 `--loop-only`、`--no-mirror`、页面单轮任务结束后不会持续运行 worker，队列会保留，启动主 loop 后继续处理。主 loop 或 worker 停止时不会清空队列。
+
+```sh
+node scripts/follow/outbox-control.ts status <账号ID>
+# 人工核实后，先用 loop:health resolve-api-follow 处理 uncertain，再重新排队
+node scripts/follow/outbox-control.ts retry <账号ID> <目标ID>
 ```
 
-- 输入 `y`：执行本批关注
-- 输入 `n`：跳过本批关注，继续下一条帖子/粉丝阶段
-- `--yes`：跳过人工确认，自动关注
-- 非交互终端且没有 `--yes`：默认跳过关注，不会误发请求
-- 页面“自动选择并执行”可勾选“自动确认关注（跳过 y/n）”
-
-待关注列表会持久化到：
-
-```text
-.data/loop-runs/<任务ID>-pending-<post-N|followers>.json
-```
-
-同时保存在任务的 `runs.state` 里。关注进度保存在：
-- 任务状态 `runs.state.follow`
-- `.data/following.sqlite` 的 `following` / `pending` / `uncertain` 记录
-- `.data/loop.sqlite` 的 `evaluated_users` 成功关注记录（跳过或失败的用户不写入，可后续重试）
-
-进程中断后从 `follow` 阶段恢复时：
-- 已确认：继续未完成的关注，不重复提示
-- 已跳过：直接推进下一批
-- 未确认：重新展示 y/n 提示
+重启 `npm start` 以加载服务端配额改动。仅本程序已记录的请求计入配额；限制无法保证符合 X 自动关注规则。
 
 
 补充到的关注/粉丝数会写回原 CSV 同目录的 `*-enriched.csv`，新增 `followersCount`、`followingCount` 两列；筛选和关注使用同一份内存数据。
@@ -208,7 +189,7 @@ FASHION_SEARCH_QUERIES=fashion,fashion blogger,fashion influencer,ootd,street st
 ## 长时 loop（clone → mirror 子进程 + 延迟回调）
 
 ```sh
-npm run loop -- <账号ID> [--target <博主用户名>] [--cookie <文件>] [--language ar] [--evaluate] [--loop-only] [--yes] [--mirror-once|--no-mirror] [--check-only]
+npm run loop -- <账号ID> [--target <博主用户名>] [--cookie <文件>] [--language ar] [--evaluate] [--loop-only] [--confirm-follow] [--mirror-once|--no-mirror] [--check-only]
 ```
 
 行为：
@@ -252,7 +233,7 @@ MIRROR_REPLY_DELAY_MS=18000000   # 5 小时，单位毫秒
 npm run loop -- <发帖账号ID> --loop-only --post <目标原帖链接> --target <博主>
 ```
 
-只处理这一条帖子的回复，不处理粉丝列表。执行前仍会展示待关注用户并提示 y/n；`MIRROR_REPLY_AUTO_YES=true` 可自动确认。
+只处理这一条帖子的回复，不处理粉丝列表。筛选结果写入关注 Outbox；由主 loop 的 worker 分批处理。单独运行 mirror 时需另行启动主 loop 来处理 Outbox。
 
 相关参数：
 
@@ -260,13 +241,12 @@ npm run loop -- <发帖账号ID> --loop-only --post <目标原帖链接> --targe
 MIRROR_REPLY_DELAY_MS=18000000     # 延迟多久执行，默认 5 小时
 MIRROR_REPLY_SCHEDULER_MS=60000    # 调度器检查间隔，默认 60 秒
 MIRROR_REPLY_RETRY_MS=600000       # 失败重试间隔，默认 10 分钟
-MIRROR_REPLY_AUTO_YES=false        # 是否自动确认关注
 ```
 
 - 任务持久化在 `.data/mirror.sqlite` 的 `mirror_reply_jobs` 表
 - 失败最多重试 3 次
 - `--backfill-only` 和 `--once` 不启动调度器，任务会保留到下一次持续监听
-- 如果 mirror 运行在非交互终端且没有 `MIRROR_REPLY_AUTO_YES`，回复爬取会执行，但关注确认默认跳过
+- 单独运行 mirror 时不会启动关注 Outbox worker；队列保留到主 loop 启动。
 
 
 ```sh
@@ -280,7 +260,7 @@ npm run mirror -- remove <目标用户名>
 
 ## 失败与冷却
 
-收到 X 429 后，帖子读取、用户数据读取或 API 关注阶段冷却 15 分钟，再进入半开：只读阶段使用只读探测；关注最多发起一次新的关注请求，确认成功才继续。明确受限则再次冷却；请求结果不明会记录 `uncertain` 并停止，避免重复提交。插件导出中断也需先核实。进程退出后需用相同任务 ID 恢复；本地队列不是外部消息队列。
+采集阶段遇到 X 429 会进入已有的冷却和探测流程。Outbox 关注遇到 429 会停止当前批次并保留条目，在下次批次间隔后再尝试；结果不明记录为 `manual`，需要先核实。插件导出中断也需先核实。
 
 人工核实 API 关注的实际状态后，可记录结果（不发送请求）：
 

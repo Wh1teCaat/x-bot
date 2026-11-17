@@ -10,7 +10,7 @@ import { discoverFashionTarget, parseFashionQueries } from '../clone_user/fashio
 const raw = process.argv.slice(2);
 const accountId = raw[0];
 if (!/^\d{1,19}$/.test(accountId || '')) {
-  console.error('用法：npm run loop -- <账号数字ID> [--target <博主用户名>] [--cookie <文件>] [--language ar] [--evaluate] [--post <帖子链接>] [--resume <任务ID>] [--loop-only] [--mirror-once|--no-mirror] [--yes] [--check-only]');
+  console.error('用法：npm run loop -- <账号数字ID> [--target <博主用户名>] [--cookie <文件>] [--language ar] [--evaluate] [--post <帖子链接>] [--resume <任务ID>] [--loop-only] [--mirror-once|--no-mirror] [--confirm-follow] [--check-only]');
   process.exit(1);
 }
 let target: string | undefined;
@@ -21,6 +21,7 @@ let evaluate = false;
 let mirror: 'continuous' | 'once' | 'none' = 'continuous';
 let checkOnly = false;
 let yes = false;
+let confirmFollow = false;
 let loopOnly = false;
 let resumeId: string | undefined;
 for (let index = 1; index < raw.length; index++) {
@@ -28,6 +29,7 @@ for (let index = 1; index < raw.length; index++) {
   if (key === '--evaluate') { evaluate = true; continue; }
   if (key === '--check-only') { checkOnly = true; continue; }
   if (key === '--yes') { yes = true; continue; }
+  if (key === '--confirm-follow') { confirmFollow = true; continue; }
   if (key === '--loop-only') { loopOnly = true; continue; }
   if (key === '--mirror-once') { mirror = 'once'; continue; }
   if (key === '--no-mirror') { mirror = 'none'; continue; }
@@ -104,6 +106,9 @@ if (account.cloned) {
 
 let stopping = false;
 let mirrorChild: ChildProcess | null = null;
+let outboxChild: ChildProcess | null = null;
+let activityChild: ChildProcess | null = null;
+let activityRestartTimer: ReturnType<typeof setTimeout> | null = null;
 let restartTimer: ReturnType<typeof setTimeout> | null = null;
 let replyChild: ChildProcess | null = null;
 let replyTimer: ReturnType<typeof setInterval> | null = null;
@@ -113,13 +118,34 @@ const stopPromise = new Promise<void>((resolveSignal) => { resolveStop = resolve
 const stop = () => {
   stopping = true;
   if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+  if (activityRestartTimer) { clearTimeout(activityRestartTimer); activityRestartTimer = null; }
   if (replyTimer) { clearInterval(replyTimer); replyTimer = null; }
   mirrorChild?.kill('SIGINT');
+  outboxChild?.kill('SIGINT');
+  activityChild?.kill('SIGINT');
   replyChild?.kill('SIGINT');
   resolveStop?.();
 };
 process.once('SIGINT', stop);
 process.once('SIGTERM', stop);
+
+outboxChild = spawn(process.execPath, ['scripts/follow/outbox-worker.ts', accountId, ...(confirmFollow ? ['--confirm-follow'] : [])], { cwd: process.cwd(), stdio: 'inherit' });
+outboxChild.once('error', error => console.error(`关注 Outbox 子进程启动失败：${error.message}`));
+outboxChild.once('exit', (code, signal) => { outboxChild = null; if (!stopping) console.error(`关注 Outbox 已停止（code=${code}, signal=${signal}），队列保留。`); });
+
+if (process.env.X_ACTIVITY_APP_BEARER_TOKEN) {
+  const startActivity = () => {
+    if (stopping) return;
+    activityChild = spawn(process.execPath, ['scripts/follow/follow-stream.ts', 'run', accountId, '--app'], { cwd: process.cwd(), stdio: 'inherit' });
+    activityChild.once('error', error => console.error(`关注事件子进程启动失败：${error.message}`));
+    activityChild.once('exit', (code, signal) => {
+      activityChild = null;
+      if (!stopping) console.error(`关注事件监听已停止（code=${code}, signal=${signal}）；请检查权限、订阅和日志。`);
+    });
+    console.log('关注事件监听子进程已启动。');
+  };
+  startActivity();
+} else console.error('未配置 X_ACTIVITY_APP_BEARER_TOKEN，关注事件监听未启动。');
 
 const mirrorArgs = ['scripts/mirror/mirror-loop.ts', resolvedTarget, accountId, '--no-reply-scheduler',
   ...(mirror === 'once' ? ['--backfill-only'] : [])];

@@ -8,14 +8,35 @@ export class FollowStore {
   /** 打开数据库并初始化关注与同步表。 */
   constructor(path: string) {
     this.db = new DatabaseSync(path);
-    this.db.exec(`CREATE TABLE IF NOT EXISTS follows (
+    this.db.exec(`PRAGMA busy_timeout=5000;
+    CREATE TABLE IF NOT EXISTS follows (
       account_id TEXT NOT NULL, target_id TEXT NOT NULL,
       status TEXT NOT NULL CHECK(status IN ('following', 'pending', 'uncertain')),
       updated_at TEXT NOT NULL, PRIMARY KEY(account_id, target_id)
     );
     CREATE TABLE IF NOT EXISTS follow_sync (
       account_id TEXT PRIMARY KEY, synced_at TEXT NOT NULL, user_count INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS inbound_follows (
+      event_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, target_id TEXT NOT NULL,
+      occurred_at TEXT, received_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS follow_attempts (
+      id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, target_id TEXT NOT NULL,
+      attempted_at INTEGER NOT NULL
     );`);
+  }
+
+  /** 保存关注事件；只有已确认关注对方时才报告互关。 */
+  recordInboundFollow(eventId: string, accountId: string, targetId: string, occurredAt?: string): string {
+    const inserted = this.db.prepare('INSERT OR IGNORE INTO inbound_follows VALUES (?, ?, ?, ?, ?)').run(eventId, accountId, targetId, occurredAt || null, new Date().toISOString());
+    if (!inserted.changes) return '重复事件';
+    return this.status(accountId, targetId) === 'following' ? '互关' : '已关注我，是否互关待确认';
+  }
+
+  /** 基于已收到的入站关注事件和当前已知的出站关注状态判断。 */
+  hasObservedMutualFollow(accountId: string, targetId: string): boolean {
+    return this.status(accountId, targetId) === 'following' && !!this.db.prepare('SELECT 1 FROM inbound_follows WHERE account_id=? AND target_id=? LIMIT 1').get(accountId, targetId);
   }
 
   /** 读取指定账号对目标的已知关注状态。 */
@@ -26,6 +47,20 @@ export class FollowStore {
   /** 原子预留尚未处理的目标，表示请求结果待确认。 */
   reserve(accountId: string, targetId: string): boolean {
     return !!this.db.prepare("INSERT OR IGNORE INTO follows VALUES (?, ?, 'uncertain', ?)").run(accountId, targetId, new Date().toISOString()).changes;
+  }
+
+  /** 原子预留关注并计入最近 24 小时尝试；含不确定和失败请求。 */
+  reserveWithDailyLimit(accountId: string, targetId: string, limit = 400, now = Date.now()): 'reserved' | 'duplicate' | 'limit' {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (this.status(accountId, targetId)) { this.db.exec('COMMIT'); return 'duplicate'; }
+      const count = (this.db.prepare('SELECT count(*) AS n FROM follow_attempts WHERE account_id=? AND attempted_at>?').get(accountId, now - 86400000) as { n: number }).n;
+      if (count >= limit) { this.db.exec('COMMIT'); return 'limit'; }
+      this.db.prepare("INSERT INTO follows VALUES (?, ?, 'uncertain', ?)").run(accountId, targetId, new Date(now).toISOString());
+      this.db.prepare('INSERT INTO follow_attempts (account_id, target_id, attempted_at) VALUES (?, ?, ?)').run(accountId, targetId, now);
+      this.db.exec('COMMIT');
+      return 'reserved';
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
   /** 仅清除指定目标仍未确认的预留记录。 */
