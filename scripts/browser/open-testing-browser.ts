@@ -1,5 +1,6 @@
+import '../../src/runtime-config.ts';
 /** 通过系统命令启动使用独立资料的正式版 Google Chrome。 */
-import 'dotenv/config';
+
 import { spawn } from 'node:child_process';
 import { mkdir, access } from 'node:fs/promises';
 import { constants } from 'node:fs';

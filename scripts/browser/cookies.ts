@@ -1,3 +1,4 @@
+import '../../src/runtime-config.ts';
 /** 读取并规范化从浏览器导出的 X 登录 cookie，供 Playwright 注入。 */
 import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';

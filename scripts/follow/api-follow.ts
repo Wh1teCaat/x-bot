@@ -1,3 +1,4 @@
+import '../../src/runtime-config.ts';
 /** 通过本地授权服务解析用户并使用 X API 处理关注。 */
 /** 判断输入是否为合法的 X 数字用户 ID。 */
 const validId = (value: unknown): value is string => typeof value === 'string' && /^\d{1,19}$/.test(value);

@@ -1,3 +1,4 @@
+import '../../src/runtime-config.ts';
 /** 从已安装插件的 Chrome 资料生成最小模板，并为每个账号复制一份隔离资料。 */
 import { cp, mkdir, readdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';

@@ -1,3 +1,5 @@
+import '../../src/runtime-config.ts';
+import { monitorProcess } from '../../src/runtime-monitor.ts';
 /** 独立运行：复制用户资料到当前手动登录的 X 账号。 */
 import { chromium, type Page, type Locator } from 'playwright';
 import { mkdir } from 'node:fs/promises';
@@ -11,6 +13,8 @@ import { loadCookieJar } from '../browser/cookies.ts';
 import { fingerprintFor } from '../browser/fingerprint.ts';
 import { AccountStore } from '../../src/account-store.ts';
 
+const telemetry = monitorProcess(process.env.X_RUNTIME_ACCOUNT_ID, 'clone');
+telemetry.stage('复制目标账号资料');
 const rawArgs = process.argv.slice(2);
 let cookiePath: string | undefined;
 let dryRun = false;
@@ -173,6 +177,7 @@ try {
     await context.close().catch(() => {});
     process.exit(0);
   }
+  telemetry.stage('复制头像、显示名称和简介');
   console.log('正在自动复制头像、显示名称和简介。');
   // 资料页上的“Edit profile”按钮会把未完成引导的账号带进 /i/flow/setup_profile，
   // 该引导流程依赖 api.x.com 的跨域请求；设置页提供同一套字段并提交到站内接口。
@@ -224,6 +229,7 @@ try {
     if (bannerResult && !bannerResult.ok()) throw new Error('横幅上传未完成，请在浏览器检查；名称、简介和头像可能已保存');
   }
   await page.waitForTimeout(2000);
+  telemetry.stage('核对资料保存结果');
   console.log('资料保存请求已提交，正在检查结果……');
   await page.goto(`https://x.com/${owner}`, { waitUntil: 'domcontentloaded' });
   const ownLines = (await page.getByTestId('UserName').first().innerText({ timeout: 15000 })).split('\n').map(x => x.trim()).filter(Boolean);
@@ -248,6 +254,7 @@ try {
   const saveUsername = await firstVisible(page, ['[data-testid="settingsDetailSave"]', '[data-testid="save"]']);
   for (let attempt = 0; attempt < 20 && !await saveUsername.isEnabled(); attempt++) await page.waitForTimeout(500);
   if (!await saveUsername.isEnabled()) throw new Error('用户名保存按钮不可用，未提交修改');
+  telemetry.stage('保存并核对用户名');
   console.log(`正在保存 X 推荐的第一个用户名：@${suggestion}`);
   await page.waitForTimeout(1000 + Math.floor(Math.random() * 2000));
   await saveUsername.click();

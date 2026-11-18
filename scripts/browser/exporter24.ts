@@ -1,3 +1,4 @@
+import '../../src/runtime-config.ts';
 /** 使用 exporter24 扩展的搜索页读取用户的关注/粉丝数。 */
 import type { BrowserContext, Download, Page } from 'playwright';
 import { mkdir } from 'node:fs/promises';

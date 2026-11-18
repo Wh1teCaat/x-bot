@@ -1,5 +1,6 @@
+import '../../src/runtime-config.ts';
 /** 为一个账号维护持久工作池位，使用系统进程打开独立浏览器。 */
-import 'dotenv/config';
+
 import { spawn } from 'node:child_process';
 import { mkdir, open, readFile, unlink, chmod, access } from 'node:fs/promises';
 import { constants } from 'node:fs';

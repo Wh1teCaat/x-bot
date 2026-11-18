@@ -1,3 +1,4 @@
+import '../../src/runtime-config.ts';
 /** 验证并连接指定的 Google Chrome 调试端口。 */
 import { chromium } from 'playwright';
 import { execFile } from 'node:child_process';

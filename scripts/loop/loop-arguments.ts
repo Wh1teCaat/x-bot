@@ -1,5 +1,6 @@
 /** 校验单轮任务参数；账号、浏览器端口和运行状态由调用者显式传递。 */
 export type LoopArguments = {
+  followersOnly?: boolean;
   resumeId?: string;
   accountId?: string;
   username?: string;
@@ -29,6 +30,7 @@ export function parseLoopArguments(args: string[], internal = false): LoopArgume
     const key = args[i];
     if (seen.has(key)) throw new Error('参数不能重复');
     seen.add(key);
+    if (key === '--followers-only') { result.followersOnly = true; continue; }
     if (key === '--evaluate') { result.evaluate = true; continue; }
     if (key === '--yes') { result.yes = true; continue; }
     if (key === '--follow-probe' && internal) { result.followProbe = true; continue; }
@@ -58,5 +60,6 @@ export function parseLoopArguments(args: string[], internal = false): LoopArgume
   if (result.resumeId && result.runId) throw new Error('不能同时指定新任务 ID 和恢复任务 ID');
   if (result.username && !result.accountId) throw new Error('浏览器用户名必须绑定授权账号 ID');
   if (result.followProbe && !result.resumeId) throw new Error('半开探测只能恢复已有任务');
+  if (result.followersOnly && result.postUrl) throw new Error('不能同时指定粉丝任务和帖子');
   return result;
 }

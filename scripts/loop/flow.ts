@@ -1,7 +1,11 @@
+import '../../src/runtime-config.ts';
 /** 长时 loop：启动 mirror 子进程监听，执行初始 loop，并持续处理延迟回复任务。 */
-import 'dotenv/config';
+
+import { monitorProcess } from '../../src/runtime-monitor.ts';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { FollowerCheckpoints } from '../browser/follower-batch.ts';
 import { AccountStore } from '../../src/account-store.ts';
 import { MirrorStore } from '../../src/mirror-store.ts';
 import { resolveFlowTarget } from './flow-target.ts';
@@ -13,6 +17,8 @@ if (!/^\d{1,19}$/.test(accountId || '')) {
   console.error('用法：npm run loop -- <账号数字ID> [--target <博主用户名>] [--cookie <文件>] [--language ar] [--evaluate] [--post <帖子链接>] [--resume <任务ID>] [--loop-only] [--mirror-once|--no-mirror] [--confirm-follow] [--check-only]');
   process.exit(1);
 }
+const telemetry = monitorProcess(accountId, 'flow');
+telemetry.stage('准备账号运行');
 let target: string | undefined;
 let cookiePath: string | undefined;
 let language: 'ar' | undefined;
@@ -23,6 +29,7 @@ let checkOnly = false;
 let yes = false;
 let confirmFollow = false;
 let loopOnly = false;
+let followersOnly = false;
 let resumeId: string | undefined;
 for (let index = 1; index < raw.length; index++) {
   const key = raw[index];
@@ -30,12 +37,14 @@ for (let index = 1; index < raw.length; index++) {
   if (key === '--check-only') { checkOnly = true; continue; }
   if (key === '--yes') { yes = true; continue; }
   if (key === '--confirm-follow') { confirmFollow = true; continue; }
+  if (key === '--followers-only') { followersOnly = true; continue; }
   if (key === '--loop-only') { loopOnly = true; continue; }
   if (key === '--mirror-once') { mirror = 'once'; continue; }
   if (key === '--no-mirror') { mirror = 'none'; continue; }
   const value = raw[++index];
   if (!value) { console.error(`${key} 缺少值`); process.exit(1); }
-  if (key === '--target') target = value.replace(/^@/, '');
+  if (key === '--resume') resumeId = value;
+  else if (key === '--target') target = value.replace(/^@/, '');
   else if (key === '--cookie') cookiePath = value;
   else if (key === '--post') {
     if (!/^https?:\/\/(?:www\.)?(?:x|twitter)\.com\/[A-Za-z0-9_]{1,15}\/status\/\d{1,19}/i.test(value)) { console.error('--post 必须是 X 帖子链接'); process.exit(1); }
@@ -117,6 +126,7 @@ let resolveStop: (() => void) | null = null;
 const stopPromise = new Promise<void>((resolveSignal) => { resolveStop = resolveSignal; });
 const stop = () => {
   stopping = true;
+  telemetry.finish('stopped');
   if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
   if (activityRestartTimer) { clearTimeout(activityRestartTimer); activityRestartTimer = null; }
   if (replyTimer) { clearInterval(replyTimer); replyTimer = null; }
@@ -164,11 +174,12 @@ const startMirror = () => {
 if (mirror !== 'none') startMirror();
 
 const loopCode = await run(loopArgs(resolvedTarget), loginEnv);
+resumeId = undefined;
 if (loopCode !== 0) {
   if (mirror === 'continuous') console.error('初始 loop 失败；mirror 仍在监听，继续等待延迟回复任务。');
   else { stop(); process.exitCode = loopCode; process.exit(loopCode); }
 }
-if (mirror === 'none') { stop(); process.exit(0); }
+// --no-mirror 仍保留粉丝半小时调度和关注 Outbox。
 if (mirror === 'once') {
   if (mirrorChild) await new Promise<void>((resolveExit) => mirrorChild!.once('exit', () => resolveExit()));
   stop();
@@ -180,13 +191,44 @@ mirrorStore.recoverStaleReplyJobs(new Date(Date.now() - 6 * 60 * 60 * 1000).toIS
 const schedulerMs = Math.max(1000, Number(process.env.MIRROR_REPLY_SCHEDULER_MS) || 60_000);
 const retryMs = Math.max(1000, Number(process.env.MIRROR_REPLY_RETRY_MS) || 10 * 60 * 1000);
 const autoYes = /^(1|true|yes)$/i.test(process.env.MIRROR_REPLY_AUTO_YES || '');
+telemetry.stage('等待定时任务', 'waiting');
 console.log(`loop 进入长时运行；每 ${Math.round(schedulerMs / 1000)} 秒检查延迟回复任务。`);
 
 /** 处理到期的单帖回复任务；串行，避免与当前 loop 争用账号。 */
+let followerScheduleBlocked = loopCode !== 0;
+const processDueFollowerBatch = async (): Promise<boolean> => {
+  if (followerScheduleBlocked || postUrl) return false;
+  const db = new DatabaseSync(resolve(dataDir, 'loop.sqlite'));
+  let checkpoint;
+  try {
+    checkpoint = new FollowerCheckpoints(db).get(accountId, resolvedTarget);
+    // 上次失败/中断的粉丝任务须先恢复，不能另起任务跳过尚未入队的批次。
+    const pending = db.prepare("SELECT state FROM runs WHERE status != 'completed'").all().some(row => {
+      const state = JSON.parse(String(row.state));
+      return state.followAccountId === accountId && state.blogger?.toLowerCase() === resolvedTarget.toLowerCase() && state.phase === 'followers';
+    });
+    if (pending) { followerScheduleBlocked = true; console.error('存在未完成粉丝任务，请先用 --resume 恢复；定时抓取暂停。'); return false; }
+  } finally { db.close(); }
+  if (checkpoint.done || checkpoint.due > Date.now()) return false;
+  telemetry.stage('执行粉丝定时续抓');
+  console.log('开始半小时粉丝续抓：本批最多 200 人。');
+  replyChild = spawn(process.execPath, [...loopArgs(resolvedTarget).filter(arg => arg !== '--followers-only'), '--followers-only'], { cwd: process.cwd(), stdio: 'inherit', env: loginEnv });
+  const code = await new Promise<number>(resolveCode => {
+    replyChild!.once('error', () => resolveCode(1));
+    replyChild!.once('exit', code => resolveCode(code ?? 1));
+  });
+  replyChild = null;
+  if (code !== 0) { followerScheduleBlocked = true; console.error('粉丝续抓失败，断点保留；请检查并恢复后重启定时调度。'); }
+  telemetry.stage('等待定时任务', 'waiting');
+  return true;
+};
 const processDueReplyJob = async () => {
   if (stopping || replyChild || !mirrorStore) return;
+  if (await processDueFollowerBatch()) return;
+  if (stopping) return;
   const [job] = mirrorStore.dueReplyJobs(Date.now(), 1);
   if (!job || !mirrorStore.claimReplyJob(job)) return;
+  telemetry.stage('执行延迟回复任务');
   console.log(`开始延迟回复爬取：${job.postUrl}（第 ${job.attempts + 1}/3 次）`);
   const args = ['scripts/loop/flow.ts', job.posterId, '--loop-only', '--post', job.postUrl, '--target', job.targetUsername,
     ...(yes || autoYes ? ['--yes'] : []), ...(cookiePath ? ['--cookie', cookiePath] : [])];
@@ -196,6 +238,7 @@ const processDueReplyJob = async () => {
     replyChild!.once('exit', (exitCode) => resolveCode(exitCode ?? 1));
   });
   replyChild = null;
+  telemetry.stage('等待定时任务', 'waiting');
   try {
     if (code === 0) {
       mirrorStore.finishReplyJob(job, 'done', null);
@@ -221,13 +264,14 @@ process.exit(0);
 
 function loopArgs(blogger: string): string[] {
   return ['scripts/loop/login-and-run.ts', accountId, '--blogger', blogger,
-    ...(language ? ['--language', language] : []), ...(evaluate ? ['--evaluate'] : []),
+    ...(followersOnly ? ['--followers-only'] : []), ...(language ? ['--language', language] : []), ...(evaluate ? ['--evaluate'] : []),
     ...(yes ? ['--yes'] : []), ...(postUrl ? ['--post', postUrl] : []), ...(resumeId ? ['--resume', resumeId] : [])];
 }
 
 function run(args: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
+  telemetry.stage(args[0].includes('clone_user') ? '复制目标账号资料' : '登录并执行采集流程');
   return new Promise((resolveCode, reject) => {
-    const child = spawn(process.execPath, args, { stdio: 'inherit', cwd: process.cwd(), env });
+    const child = spawn(process.execPath, args, { stdio: 'inherit', cwd: process.cwd(), env: { ...env, X_RUNTIME_ACCOUNT_ID: accountId } });
     child.once('error', reject);
     child.once('exit', (code) => resolveCode(code ?? 1));
   });

@@ -1,3 +1,4 @@
+import '../../src/runtime-config.ts';
 /** X Activity 关注事件的连接、订阅、读取与流锁（follow-stream 与 follow-reply 共用）。 */
 import { setTimeout as delay } from 'node:timers/promises';
 import { AccountStore } from '../../src/account-store.ts';
@@ -64,12 +65,14 @@ export async function ensureFollowSubscription(api: ActivityHttp, accountId: str
 }
 
 /** 持续读取 Activity 流；每条有效入站关注事件回调一次，不补漏、不保存。 */
-export async function receiveFollowEvents(api: ActivityHttp, controller: AbortController, onFollow: (event: FollowEvent) => void): Promise<void> {
+export async function receiveFollowEvents(api: ActivityHttp, controller: AbortController, onFollow: (event: FollowEvent) => void, onState: (state: string) => void = () => {}): Promise<void> {
   let retry = 1;
   while (!controller.signal.aborted) {
     try {
+      onState('连接关注事件流');
       const response = await api('/stream');
       if (!response.body) throw new Error('X 未返回流数据');
+      onState('监听关注与回关事件');
       console.log('Activity 流已连接；收到关注事件时会打印。');
       retry = 1;
       const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -107,6 +110,7 @@ export async function receiveFollowEvents(api: ActivityHttp, controller: AbortCo
       if (/X API HTTP (400|401|403|404):/.test(message)) throw error;
       console.error(`连接失败：${message}`);
     }
+    onState('连接断开，等待重连');
     try { await delay(retry * 1000, undefined, { signal: controller.signal }); } catch { break; }
     retry = Math.min(retry * 2, 60);
   }

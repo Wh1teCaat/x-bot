@@ -62,7 +62,7 @@ export function createLoopOrchestrator({ db, runId, execute, probe, hasUncertain
   const queue = new EventWorkQueue({ store, now, setTimer, clearTimer, handle: async () => {
     const row = getRun();
     if (row?.status === 'completed') return;
-    if ((row?.stage === 'export' || row?.stage === 'followers-export') && row.status !== 'running') throw new Error('导出结果需人工核实');
+    if ((row?.stage === 'export' || (row?.stage === 'followers-export' && !JSON.parse(row.state).followerBatchMode)) && row.status !== 'running') throw new Error('导出结果需人工核实');
     const result = await execute({ runId, resume: Boolean(row) });
     if (result !== 0) throw new Error(`单轮任务退出码 ${result}`);
     if (getRun()?.status !== 'completed') throw new Error('单轮任务未完成，需人工检查');

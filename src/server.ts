@@ -1,5 +1,6 @@
+import { configSchema, readRuntimeConfig, saveRuntimeConfig } from './runtime-config.ts';
 /** 提供本机 OAuth 授权与 X API 代理服务。 */
-import "dotenv/config";
+
 import {
   createServer,
   type IncomingMessage,
@@ -14,6 +15,7 @@ import { rankUsers } from "./user-ranking.ts";
 import { followFirstArabFollower } from "./arab-follow.ts";
 import { FollowStore, syncFollowing } from "./follow-store.ts";
 import { shouldAutoStartAccountSession, startAccountSession } from "./account-session-manager.ts";
+import { readConsole } from "./console-data.ts";
 import { AccountStore } from "./account-store.ts";
 
 const port = Number(process.env.PORT || 3000);
@@ -362,6 +364,7 @@ async function usableAccount(id: string): Promise<Account> {
 }
 
 const page = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+const consolePage = readFileSync(new URL("./console.html", import.meta.url), "utf8");
 let autoRunProcess: ReturnType<typeof spawn> | null = null;
 const followStore = new FollowStore(join(dataDir, "following.sqlite"));
 const runningFollow = new Set<string>();
@@ -403,6 +406,25 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/cookies")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(page);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/console") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(consolePage);
+      return;
+    }
+
+    if (url.pathname === "/api/settings" && ["GET", "PUT"].includes(req.method || "")) {
+      if (req.headers["x-local-request"] !== "1" || (req.headers.origin && req.headers.origin !== origin))
+        throw new HttpError(403, "Invalid local request");
+      try {
+        if (req.method === "GET") json(res, 200, { ...readRuntimeConfig(), schema: configSchema });
+        else {
+          const body = await readJsonBody(req, 32768);
+          json(res, 200, saveRuntimeConfig(body.values, body.revision));
+        }
+      } catch (error) { throw new HttpError(400, error.message); }
       return;
     }
 
@@ -695,6 +717,16 @@ const server = createServer(async (req, res) => {
       throw new HttpError(404, "Not found");
     if (req.headers["x-local-request"] !== "1")
       throw new HttpError(403, "Missing local request header");
+
+    if (url.pathname === "/api/console" || url.pathname.startsWith("/api/console/")) {
+      const id = url.pathname === '/api/console' ? undefined : url.pathname.slice('/api/console/'.length);
+      const accounts = accountStore.list();
+      if (id && (!/^\d{1,19}$/.test(id) || !accounts.some(a => a.uuid === id))) throw new HttpError(404, '未找到账号');
+      const before = url.searchParams.get('before');
+      if (before !== null && (!/^\d{1,15}$/.test(before) || Number(before) < 1)) throw new HttpError(400, '日志分页参数无效');
+      json(res, 200, readConsole(dataDir, accounts, { accountId: id, before: before ? Number(before) : undefined }));
+      return;
+    }
 
     if (url.pathname === "/api/accounts") {
       json(res, 200, {

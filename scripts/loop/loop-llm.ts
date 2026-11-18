@@ -1,3 +1,4 @@
+import '../../src/runtime-config.ts';
 /** 校验模型对回复用户的批量评估。 */
 import OpenAI from 'openai';
 

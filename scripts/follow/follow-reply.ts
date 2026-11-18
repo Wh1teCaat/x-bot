@@ -1,5 +1,7 @@
+import '../../src/runtime-config.ts';
 /** 独立的回关监听 + 私信回复命令：npm run follow-reply -- <账号数字ID> [--mock] [--app]。 */
-import 'dotenv/config';
+
+import { monitorProcess, recordRuntimeEvent } from '../../src/runtime-monitor.ts';
 import { existsSync } from 'node:fs';
 import { FollowStore } from '../../src/follow-store.ts';
 import { makeLlm } from '../loop/loop-llm.ts';
@@ -74,6 +76,8 @@ async function runMockSelfTest(accountId: string): Promise<void> {
 
 /** 真实模式：订阅入站关注 + 落库 + 生成并发送私信。 */
 async function runReal(accountId: string): Promise<void> {
+  const telemetry = monitorProcess(accountId, 'activity');
+  telemetry.stage('准备回关与私信监听');
   await withActivityStreamLock(async () => {
     const api = makeActivityApi({ accountId, useAppToken, appToken, controller });
 
@@ -91,17 +95,19 @@ async function runReal(accountId: string): Promise<void> {
     if (!llmConfigured) console.log('未配置 LLM_API_KEY/LLM_MODEL/LLM_BASE_URL，只监听落库、不发送回关私信。');
 
     await receiveFollowEvents(api, controller, (event) => {
-      console.log(JSON.stringify({ eventId: event.eventId, time: event.occurredAt, followerId: event.followerId, follower: event.followerUsername, accountId: event.accountId }));
+      const eventMessage = JSON.stringify({ eventId: event.eventId, time: event.occurredAt, followerId: event.followerId, follower: event.followerUsername, accountId: event.accountId });
+      if (event.accountId === accountId) console.log(eventMessage);
       const store = new FollowStore('.data/following.sqlite');
       try {
         const outcome = store.recordInboundFollow(event.eventId, event.accountId, event.followerId, event.occurredAt);
-        console.log(`关注事件已保存：${outcome}`);
+        if (event.accountId === accountId) console.log(`关注事件已保存：${outcome}`);
+        else recordRuntimeEvent(event.accountId, `${eventMessage}\n关注事件已保存：${outcome}`);
         if (outcome !== '重复事件') {
           if (llmConfigured) dispatcher.enqueue(event.accountId, event.followerId, event.followerUsername);
           else if (!llmWarningLogged) { llmWarningLogged = true; console.log('未配置 LLM，跳过回关私信回复。'); }
         }
       } finally { store.close(); }
-    });
+    }, state => telemetry.stage(state, 'waiting'));
   });
 }
 

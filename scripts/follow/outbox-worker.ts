@@ -1,4 +1,6 @@
-import 'dotenv/config';
+import '../../src/runtime-config.ts';
+
+import { monitorProcess } from '../../src/runtime-monitor.ts';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -9,6 +11,8 @@ import { LocalFollowClient } from './api-follow.ts';
 const account = process.argv[2];
 const confirm = process.argv.includes('--confirm-follow');
 if (!/^\d{1,19}$/.test(account || '')) throw new Error('需要账号数字 ID');
+const telemetry = monitorProcess(account, 'outbox');
+telemetry.stage('准备关注队列');
 const lock = `.data/follow-outbox-${account}.lock`;
 let owned = false;
 for (let attempt = 0; attempt < 2; attempt++) {
@@ -31,8 +35,9 @@ try {
   while (!controller.signal.aborted) {
     const batch = box.pending(account);
     const wait = Math.max(0, box.nextBatch(account) - Date.now());
-    if (!batch.length || wait) { await sleep(Math.min(wait || 5000, 5000), undefined, { signal: controller.signal }).catch(() => {}); continue; }
+    if (!batch.length || wait) { telemetry.stage(wait && batch.length ? '等待下一批关注' : '等待关注候选', 'waiting'); await sleep(Math.min(wait || 5000, 5000), undefined, { signal: controller.signal }).catch(() => {}); continue; }
     if (confirm) {
+      telemetry.stage('等待人工确认关注', 'waiting');
       if (!stdin.isTTY) { console.error('需要逐批确认，但当前终端不可交互；Outbox 暂停。'); break; }
       console.log(`待关注本批 ${batch.length} 人：${batch.map(item => '@' + item.username).join(', ')}`);
       const input = createInterface({ input: stdin, output: stdout });
@@ -44,19 +49,22 @@ try {
     for (const item of batch) {
       if (controller.signal.aborted) break;
       if (!box.begin(account, item.target_id)) continue;
+      telemetry.stage(`关注 @${item.username}`);
       try {
         const result = await client.follow(account, item.target_id);
         if (result.errors?.length || (!result.data?.following && !result.data?.pending_follow)) throw new Error('X 返回的关注结果不明确');
         box.finish(account, item.target_id, 'done');
-        console.log(`Outbox @${item.username}：${result.data.following ? 'following' : 'pending'}`);
+        console.log(`Outbox @${item.username}：${result.data.following ? '已关注' : '等待对方批准'}`);
+        telemetry.endStep('completed');
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         // 429 和本程序配额明确没有发出成功请求，其他错误必须人工核实。
         const retryable = error.status === 429 || (error.status === 409 && message.includes('关注尝试上限'));
         box.finish(account, item.target_id, retryable ? 'queued' : 'manual', message.slice(0, 300));
         console.error(`Outbox @${item.username} 暂停：${message}`);
+        telemetry.endStep('failed');
         break;
       }
     }
   }
-} finally { box.close(); if (owned) await unlink(lock).catch(() => {}); }
+} finally { telemetry.finish(controller.signal.aborted ? 'stopped' : 'completed'); box.close(); if (owned) await unlink(lock).catch(() => {}); }

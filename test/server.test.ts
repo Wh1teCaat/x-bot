@@ -225,6 +225,17 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
         throw new Error("server exited early");
       }),
     ]);
+    const settingsUrl = `${base}/api/settings`;
+    assert.equal((await fetch(settingsUrl)).status, 403);
+    const settingsHeaders = { 'X-Local-Request': '1', 'Content-Type': 'application/json' };
+    const settings = await (await fetch(settingsUrl, { headers: settingsHeaders })).json() as any;
+    assert.equal(settings.values.MIRROR_INTERVAL_MS, 60000);
+    assert.ok(!JSON.stringify(settings).includes('X_CLIENT_SECRET'));
+    const settingsBody = JSON.stringify({ values: { ...settings.values, MIRROR_INTERVAL_MS: 90000 }, revision: settings.revision });
+    assert.equal((await fetch(settingsUrl, { method: 'PUT', headers: { ...settingsHeaders, Origin: 'https://untrusted.test' }, body: settingsBody })).status, 403);
+    assert.equal((await fetch(settingsUrl, { method: 'PUT', headers: settingsHeaders, body: settingsBody })).status, 200);
+    assert.equal((await fetch(settingsUrl, { method: 'PUT', headers: settingsHeaders, body: settingsBody })).status, 400);
+    assert.match(readFileSync(join(dir, 'config.toml'), 'utf8'), /90000/);
     const home = await fetch(base);
     assert.equal(home.headers.get("referrer-policy"), "same-origin");
     const csp = home.headers.get("content-security-policy") || "";
@@ -270,6 +281,17 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
     );
     assert.equal(JSON.stringify(accounts).includes("access1"), false);
     assert.equal(JSON.stringify(accounts).includes("access2"), false);
+
+    assert.equal((await fetch(`${base}/console`)).status, 200);
+    assert.equal((await fetch(`${base}/api/console`)).status, 403);
+    const consoleData = await (await fetch(`${base}/api/console`, { headers: header })).json() as any;
+    assert.deepEqual(consoleData.accounts.map(a => a.id), ['1', '2']);
+    assert.equal(JSON.stringify(consoleData).includes('access1'), false);
+    assert.equal((await fetch(`${base}/api/console/999`, { headers: header })).status, 404);
+    assert.equal((await fetch(`${base}/api/console/1?before=bad`, { headers: header })).status, 400);
+    const consoleAccount = await (await fetch(`${base}/api/console/1`, { headers: header })).json() as any;
+    assert.equal(consoleAccount.accounts.length, 1);
+    assert.equal(consoleAccount.accounts[0].id, '1');
 
     // Cookie 导入页与本地导入接口。
     assert.equal((await fetch(`${base}/cookies`)).status, 200);

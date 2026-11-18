@@ -1,5 +1,7 @@
+import '../../src/runtime-config.ts';
+import { monitorProcess } from '../../src/runtime-monitor.ts';
 /** 镜像监控入口：启动先回填目标最新 3 条（文本+图片），再优先 filtered stream 实时监听，失败回退 REST 轮询。 */
-import 'dotenv/config';
+
 import { resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { MirrorStore } from '../../src/mirror-store.ts';
@@ -20,7 +22,7 @@ class LocalMirrorClient {
   constructor(accountId: string) { this.origin = origin; this.accountId = accountId; }
 
   async request(path: string, method = 'GET', body?: unknown) {
-    const jitterMax = Math.max(0, Number(process.env.MIRROR_REQUEST_JITTER_MS) || 800);
+    const jitterMax = Math.max(0, Number(process.env.MIRROR_REQUEST_JITTER_MS ?? 800));
     if (jitterMax) await new Promise<void>((resolve) => setTimeout(resolve, 200 + Math.floor(Math.random() * jitterMax)));
     let response;
     try {
@@ -111,6 +113,8 @@ try {
   }
   const targetUsername = command;
   const posterId = arg1;
+  const telemetry = monitorProcess(posterId, 'mirror');
+  telemetry.stage('准备镜像监听');
 
   const accounts = await new LocalMirrorClient(posterId).request('/api/accounts');
   const account = (accounts.accounts || []).find((a: { user?: { id?: string } }) => a.user?.id === posterId);
@@ -118,6 +122,7 @@ try {
   const scope = (account.scope || '').split(/\s+/);
   if (!scope.includes('tweet.write') || !scope.includes('media.write')) throw new Error('发帖账号缺少 tweet.write / media.write 权限，请重新授权');
 
+  telemetry.stage('监听目标帖子', 'waiting');
   const client = new LocalMirrorClient(posterId);
   const targetId = await client.lookup(targetUsername);
   store.registerWatch({ targetUsername, targetId, posterId });
@@ -141,7 +146,7 @@ try {
   const replyAutoYes = /^(1|true|yes)$/i.test(process.env.MIRROR_REPLY_AUTO_YES || '');
   if (replyDelayMs > 0) console.log(`新帖回复爬取延迟：${Math.round(replyDelayMs / 60_000)} 分钟。`);
   let stopping = false;
-  const stop = () => { stopping = true; };
+  const stop = () => { stopping = true; telemetry.finish('stopped'); };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   let cooldownUntil = 0;
@@ -170,19 +175,22 @@ try {
   async function mirrorOne(tweet: MirrorTweet) {
     const watch = store.getWatch(targetUsername);
     if (!watch) return;
+    telemetry.stage(`镜像帖子 ${tweet.id}`);
     try {
       const outcome = await mirrorTweet({ store, watch, tweet, postTweet: (t, m) => client.postTweet(t, m), uploadImage: (u) => client.uploadImage(u), onPost, beforePost });
       if (outcome === 'posted') { store.setSinceId(targetUsername, tweet.id); console.log(`已镜像 @${targetUsername} 的推文 ${tweet.id}`); }
     } catch (error) {
       if (rateLimited(error)) cooldownUntil = Date.now() + 15 * 60 * 1000;
       console.error(`镜像 ${tweet.id} 失败：${error instanceof Error ? error.message : String(error)}`);
-    }
+      telemetry.endStep('failed');
+    } finally { telemetry.stage('监听目标帖子', 'waiting'); }
   }
 
   /** 启动回填：复制目标最新 3 条帖子（文本+图片）。 */
   async function backfill() {
     const watch = store.getWatch(targetUsername);
     if (!watch || !watch.targetId) return;
+    telemetry.stage('回填最近帖子');
     const mirrorClient: MirrorClient = {
       fetchTimeline: (tid, sinceId) => client.fetchTimeline(tid, sinceId),
       uploadImage: (u) => client.uploadImage(u),
@@ -194,7 +202,8 @@ try {
       console.log(`启动回填完成：复制 ${result.posted} 条，跳过 ${result.skipped} 条。`);
     } catch (error) {
       console.error(`启动回填失败（继续监听）：${error instanceof Error ? error.message : String(error)}`);
-    }
+      telemetry.endStep('failed');
+    } finally { telemetry.stage('监听目标帖子', 'waiting'); }
   }
 
   /** filtered stream 循环；返回 false 表示该套餐不支持流，应回退 REST。 */

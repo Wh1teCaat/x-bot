@@ -1,5 +1,7 @@
+import '../../src/runtime-config.ts';
 /** 独立的 X Activity 关注事件测试；run 子命令接入回关落库与私信回复。 */
-import 'dotenv/config';
+
+import { monitorProcess, recordRuntimeEvent } from '../../src/runtime-monitor.ts';
 import { existsSync } from 'node:fs';
 import { FollowStore } from '../../src/follow-store.ts';
 import { makeLlm } from '../loop/loop-llm.ts';
@@ -15,6 +17,9 @@ if (command === 'run' && !useAppToken) throw new Error('run 需要 --app 以连�
 if (useAppToken && !appToken) throw new Error('请在 .env 配置 X_ACTIVITY_APP_BEARER_TOKEN');
 if (!useAppToken && (!existsSync('.data/accounts.sqlite') || !existsSync('.data/key'))) throw new Error('找不到账号数据库或加密密钥，请在项目目录运行并先完成授权');
 
+const telemetry = monitorProcess(accountId, 'activity');
+telemetry.stage('准备关注事件监听');
+const streamState = (state: string) => telemetry.stage(state, 'waiting');
 const controller = new AbortController();
 process.once('SIGINT', () => controller.abort());
 process.once('SIGTERM', () => controller.abort());
@@ -37,17 +42,19 @@ async function main() {
     await withActivityStreamLock(async () => {
       console.log(await ensureFollowSubscription(api, accountId));
       await receiveFollowEvents(api, controller, (event) => {
-        console.log(JSON.stringify({ eventId: event.eventId, time: event.occurredAt, followerId: event.followerId, follower: event.followerUsername, accountId: event.accountId }));
+        const eventMessage = JSON.stringify({ eventId: event.eventId, time: event.occurredAt, followerId: event.followerId, follower: event.followerUsername, accountId: event.accountId });
+        if (event.accountId === accountId) console.log(eventMessage);
         const store = new FollowStore('.data/following.sqlite');
         try {
           const outcome = store.recordInboundFollow(event.eventId, event.accountId, event.followerId, event.occurredAt);
-          console.log(`关注事件已保存：${outcome}`);
+          if (event.accountId === accountId) console.log(`关注事件已保存：${outcome}`);
+          else recordRuntimeEvent(event.accountId, `${eventMessage}\n关注事件已保存：${outcome}`);
           if (outcome !== '重复事件') {
             if (llmConfigured) dispatcher.enqueue(event.accountId, event.followerId, event.followerUsername);
             else if (!llmWarningLogged) { llmWarningLogged = true; console.log('未配置 LLM，跳过回关私信回复。'); }
           }
         } finally { store.close(); }
-      });
+      }, streamState);
     });
     return;
   }
@@ -67,7 +74,7 @@ async function main() {
     if (seen.has(event.eventId)) return;
     seen.add(event.eventId); if (seen.size > 10000) seen.delete(seen.values().next().value!);
     console.log(JSON.stringify({ eventId: event.eventId, time: event.occurredAt, followerId: event.followerId, follower: event.followerUsername, accountId: event.accountId }));
-  });
+  }, streamState);
 }
 
 main().catch(error => { if (!controller.signal.aborted) { console.error(error.message); process.exitCode = 1; } });

@@ -1,5 +1,6 @@
+import '../../src/runtime-config.ts';
 /** 从本机 Chrome 资料生成插件模板，供每个账号浏览器复制一份。 */
-import 'dotenv/config';
+
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createProfileTemplate, PROFILE_TEMPLATE_DIR } from './profile-template.ts';

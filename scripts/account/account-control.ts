@@ -1,5 +1,6 @@
+import '../../src/runtime-config.ts';
 /** 操作已创建的账号池位；不读取或写入浏览器登录凭证。 */
-import 'dotenv/config';
+
 import { sendAccountCommand, type AccountAction } from './account-socket.ts';
 
 const [action, accountId] = process.argv.slice(2);

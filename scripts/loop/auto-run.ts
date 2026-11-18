@@ -1,5 +1,6 @@
+import '../../src/runtime-config.ts';
 /** 自动挑选一个仍能登录的 cookie 账号并执行单轮 loop。 */
-import 'dotenv/config';
+
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';

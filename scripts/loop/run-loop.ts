@@ -1,5 +1,7 @@
+import '../../src/runtime-config.ts';
 /** 启动单轮任务队列，并将执行与半开探测交给子进程。 */
-import 'dotenv/config';
+
+import { monitorProcess } from '../../src/runtime-monitor.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -18,14 +20,17 @@ const db = new DatabaseSync('.data/loop.sqlite');
 db.exec('CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, status TEXT NOT NULL, stage TEXT NOT NULL, state TEXT NOT NULL, error TEXT, pid INTEGER, updated_at TEXT NOT NULL)');
 new ResilienceStore(db);
 const runId = args.resumeId || randomUUID();
+const telemetry = monitorProcess(args.accountId || (args.resumeId ? JSON.parse(String(db.prepare('SELECT state FROM runs WHERE id=?').get(runId)?.state || '{}')).followAccountId : undefined), 'scheduler');
+telemetry.stage('准备采集调度');
 if (args.resumeId && !db.prepare('SELECT id FROM runs WHERE id=?').get(runId)) { console.error('未找到任务'); db.close(); process.exit(1); }
 console.log(`队列任务 ID：${runId}`);
 /** 启动单轮子进程；探测模式只允许一次新的关注请求。 */
 const execute = ({ resume, probe = false }) => new Promise<number>((resolve, reject) => {
+  telemetry.stage(probe ? '执行限流恢复探测' : '等待采集步骤完成', 'waiting');
   const childArgs = ['scripts/loop/loop-run.ts', ...(resume ? ['--resume', runId] : ['--run-id', runId]),
     ...(args.accountId ? ['--account-id', args.accountId] : []), ...(args.username ? ['--username', args.username] : []),
     ...(args.blogger ? ['--blogger', args.blogger] : []), ...(args.language ? ['--language', args.language] : []),
-    ...(args.evaluate ? ['--evaluate'] : []), ...(args.yes ? ['--yes'] : []), ...(args.postUrl ? ['--post', args.postUrl] : []),
+    ...(args.followersOnly ? ['--followers-only'] : []), ...(args.evaluate ? ['--evaluate'] : []), ...(args.yes ? ['--yes'] : []), ...(args.postUrl ? ['--post', args.postUrl] : []),
     ...(args.cdpPort ? ['--cdp-port', String(args.cdpPort)] : []), ...(probe ? ['--follow-probe'] : [])];
   const child = spawn(process.execPath, childArgs, { stdio: 'inherit' });
   child.once('error', reject);
@@ -33,6 +38,7 @@ const execute = ({ resume, probe = false }) => new Promise<number>((resolve, rej
 });
 /** 对博主帖子读取阶段执行只读探测，并拒绝带限流提示的结果。 */
 async function probe(row) {
+  telemetry.stage('执行限流恢复探测');
   let browser, context, listener;
   try {
     const blogger = JSON.parse(row.state).blogger;
@@ -69,6 +75,9 @@ async function hasUncertain(row) {
   } catch { return true; }
   finally { follows?.close(); }
 }
-const loop = createLoopOrchestrator({ db, runId, execute, probe, hasUncertain, onLog: console.log });
+const loop = createLoopOrchestrator({ db, runId, execute, probe, hasUncertain, onLog: message => {
+  telemetry.stage(message, /冷却|分钟后|等待/.test(message) ? 'waiting' : 'running');
+  console.log(message);
+} });
 try { const result = await loop.start(); if (result !== 'completed') { console.error(`任务停止：${result}；任务 ID：${runId}`); process.exitCode = 1; } }
 finally { loop.close(); db.close(); }

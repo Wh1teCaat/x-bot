@@ -20,3 +20,7 @@ coverage/
 
 # 独立资料复制工具的浏览器登录资料
 .profile-copy/
+
+# 本地运行配置（可能包含个人路径）
+/config.toml
+/config.toml.*.tmp

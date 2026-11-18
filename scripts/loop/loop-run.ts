@@ -1,8 +1,12 @@
+import '../../src/runtime-config.ts';
 /** 执行博主帖子采集、导出、固定规则筛选、可选评估和关注的单轮阶段。 */
-import 'dotenv/config';
+
+import { monitorProcess } from '../../src/runtime-monitor.ts';
+import { stageLabels } from '../../src/console-data.ts';
 import { connectTestingBrowser } from '../browser/browser-connection.ts';
 import { actionDelay, createProfileVisitDelay } from '../browser/action-delay.ts';
-import { exportExporter24Followers, openExporter24, readExporter24Counts } from '../browser/exporter24.ts';
+import { openExporter24, readExporter24Counts } from '../browser/exporter24.ts';
+import { FollowerCheckpoints, readFollowerBatch, FOLLOWER_INTERVAL_MS } from '../browser/follower-batch.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -39,6 +43,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, status TEXT NOT NU
 CREATE TABLE IF NOT EXISTS posts(id TEXT PRIMARY KEY, run_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS evaluated_users(username TEXT PRIMARY KEY, run_id TEXT NOT NULL);`);
 const resilience = new ResilienceStore(db);
+const followerCheckpoints = new FollowerCheckpoints(db);
+let telemetry = monitorProcess(args.accountId, 'loop');
+telemetry.stage('准备采集任务');
 const followProbe = args.followProbe;
 /** 只允许对应任务在半开状态下执行受控关注探测。 */
 const ensureX = () => {
@@ -48,8 +55,16 @@ const ensureX = () => {
   resilience.ensureClosed('x');
 };
 /** 每个阶段完成后保存任务状态，供失败或进程重启后恢复。 */
-const persist = (status, error = null) => db.prepare('UPDATE runs SET status=?, stage=?, state=?, error=?, pid=?, updated_at=? WHERE id=?')
-  .run(status, stage, JSON.stringify(state), error, status === 'running' ? process.pid : null, new Date().toISOString(), runId);
+const persist = (status, error = null) => {
+  const result = db.prepare('UPDATE runs SET status=?, stage=?, state=?, error=?, pid=?, updated_at=? WHERE id=?')
+    .run(status, stage, JSON.stringify(state), error, status === 'running' ? process.pid : null, new Date().toISOString(), runId);
+  if (status === 'running') {
+    const context = state.phase === 'followers' ? '粉丝' : `帖子 ${(state.postIndex || 0) + 1}/${state.posts?.length || '?'}`;
+    telemetry.stage(`${stageLabels[stage] || stage} · ${context}`);
+  } else if (status === 'completed') telemetry.endStep('completed');
+  else if (['failed', 'incomplete'].includes(status)) telemetry.endStep('failed');
+  return result;
+};
 /** 避免同一任务在已有进程仍存活时被重复启动。 */
 const assertNotRunning = row => {
   if (row.status !== 'running' || !row.pid) return;
@@ -72,8 +87,9 @@ try {
     if (!row) throw new Error('未找到任务');
     assertNotRunning(row);
     if (row.status === 'completed') throw new Error('该轮已完成');
-    if (row.stage === 'export' || row.stage === 'followers-export') throw new Error('导出阶段曾中断，无法确认插件是否停止；请先检查 Chrome 中的插件状态');
+    if (row.stage === 'export' || (row.stage === 'followers-export' && !JSON.parse(row.state).followerBatchMode)) throw new Error('导出阶段曾中断，无法确认插件是否停止；请先检查 Chrome 中的插件状态');
     runId = row.id; stage = row.stage; state = JSON.parse(row.state); runPersisted = true;
+    if (!args.accountId && state.followAccountId) telemetry = monitorProcess(state.followAccountId, 'loop');
     if (state.version !== 5) throw new Error('旧版任务不能自动迁移，请新建一轮');
     if (args.accountId && state.followAccountId && args.accountId !== state.followAccountId) throw new Error('恢复任务的授权账号与原任务不一致');
     if (args.username && state.browserUsername && args.username.toLowerCase() !== state.browserUsername.toLowerCase()) throw new Error('恢复任务的浏览器账号与原任务不一致');
@@ -94,11 +110,19 @@ try {
     persist('running');
   } else {
     if (!handle.test(blogger)) throw new Error('未找到 clone 来源博主；请先 clone，或用 --blogger <用户名> 指定');
+    if (args.accountId && !args.postUrl) {
+      const pending = db.prepare("SELECT id,state FROM runs WHERE status!='completed'").all().find(row => {
+        const saved = JSON.parse(String(row.state));
+        return saved.followAccountId === args.accountId && saved.blogger?.toLowerCase() === blogger.toLowerCase() && saved.phase === 'followers';
+      });
+      if (pending) throw new Error(`存在未完成粉丝任务 ${pending.id}，请先用 --resume 恢复`);
+    }
+    if (args.followersOnly) stage = 'followers-export';
     options = { language: args.language ?? null, evaluate: args.evaluate };
     runId = args.runId || randomUUID();
     state = {
       target: targetFor(blogger), version: 5, blogger, options, evaluations: [],
-      posts: [], postIndex: 0, phase: 'replies', results: [],
+      posts: [], postIndex: 0, phase: args.followersOnly ? 'followers' : 'replies', results: [], followerBatchMode: true,
       singlePost: Boolean(args.postUrl), ...(args.postUrl ? { singlePostUrl: args.postUrl } : {}),
       ...(args.accountId ? { followAccountId: args.accountId } : {}),
       ...(args.username ? { browserUsername: args.username } : {}),
@@ -117,6 +141,7 @@ try {
       runPersisted = true;
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
+  persist('running');
   console.log(`任务 ID：${runId}；博主：@${state.blogger}；当前阶段：${stage}`);
   // 只有真正进入可选模型评估阶段才要求模型配置。
   let llm;
@@ -150,6 +175,7 @@ try {
     const limited = await page.getByText(/sorry, you are rate limited|速率受限|请求过于频繁/i).first().isVisible().catch(() => false);
     if (limited) { resilience.open('x', '页面显示速率限制'); throw new Error('X 页面显示速率受限'); }
   };
+  while (stage !== 'done') {
   // 采集博主最近 10 条有回复的帖子，按新到旧处理。
   if (stage === 'search') {
     if (state.singlePost) {
@@ -193,26 +219,32 @@ try {
   }
   // 帖子全部处理完后，用 exporter24 导出博主粉丝 CSV。
   if (stage === 'followers-export') {
+    if (!state.followAccountId) throw new Error('粉丝断点需要绑定授权账号');
+    const checkpoint = followerCheckpoints.get(state.followAccountId, state.blogger);
+    if (checkpoint.done || checkpoint.due > Date.now()) {
+      stage = 'done'; persist('completed');
+      console.log(checkpoint.done ? '博主粉丝已抓取完毕。' : '粉丝下一批尚未到期，等待半小时定时调度。');
+      continue;
+    }
     const page = await getPage();
     const exporterPage = await openExporter24(page.context());
-    if (!exporterPage) throw new Error('未检测到 exporter24 扩展，无法导出博主粉丝');
+    if (!exporterPage) throw new Error('未检测到 exporter24 扩展');
+    let batchSaved = false;
     try {
-      console.log(`正在用 exporter24 导出 @${state.blogger} 的粉丝 CSV……`);
-      const result = await exportExporter24Followers(exporterPage, state.blogger, '.data/reply-exports', guardX);
-      state.export = { destination: result.destination, count: 0, stoppedWhy: 'followers' };
+      const result = await readFollowerBatch(exporterPage, state.blogger, checkpoint, taskId => {
+        checkpoint.taskId = taskId;
+        followerCheckpoints.save(state.followAccountId, state.blogger, checkpoint);
+      }, guardX);
+      state.followerBatch = result;
       state.phase = 'followers';
       state.post = null;
-      state.direct = [];
-      state.candidates = [];
-      state.evaluations = [];
-      state.qualify = null;
-      state.follow = undefined;
-      state.followTargetIds = undefined;
+      state.export = { count: result.candidates.length, stoppedWhy: 'followers-batch' };
       resilience.resolve(runId, 'followers-export');
       stage = 'filter'; persist('running');
-      console.log(`粉丝 CSV 已导出：${result.destination}`);
+      batchSaved = true;
+      console.log(`粉丝本批 ${result.candidates.length} 人，开始筛选并入队。`);
     } finally {
-      await exporterPage.close().catch(() => {});
+      if (batchSaved) await exporterPage.close().catch(() => {});
     }
   }
   // 按阶段解析回复 CSV 或博主粉丝 CSV；语言筛选/模型评估只用于帖子回复。
@@ -225,11 +257,13 @@ try {
     state.followTargetIds = undefined;
     let hasCounts = false;
     if (state.phase === 'followers') {
-      const all = partitionFollowerCandidates(await readFile(state.export.destination, 'utf8'));
+      const all = state.followerBatch
+        ? { candidates: state.followerBatch.candidates, hasFollowerCounts: true }
+        : partitionFollowerCandidates(await readFile(state.export.destination, 'utf8'));
       hasCounts = all.hasFollowerCounts;
       state.direct = [];
       state.candidates = all.candidates.filter(keep);
-      console.log(`粉丝 CSV：${all.candidates.length} 人；进入固定规则筛选 ${state.candidates.length} 人。`);
+      console.log(`粉丝本批：${all.candidates.length} 人；进入固定规则筛选 ${state.candidates.length} 人。`);
     } else {
       const postId = new URL(state.post.url).pathname.split('/').pop();
       const all = partitionReplyCandidates(await readFile(state.export.destination, 'utf8'), postId);
@@ -344,7 +378,7 @@ try {
         persist('running');
       }
     }
-    try {
+    if (state.export.destination) try {
       const counts = Object.fromEntries(allCandidates.map(candidate => [
         candidate.username.toLowerCase(),
         { followers: candidate.followers, following: candidate.following },
@@ -441,6 +475,7 @@ try {
         resilience.failure(runId, 'follow', { kind: 'manual', reason: '部分候选的用户名未能解析为数字 ID', retryable: false });
         persist('incomplete', '部分候选的用户名未能解析为数字 ID');
         console.log(`仍有 ${state.follow.unresolved.length} 人未能解析为数字 ID，保留待处理状态。`);
+        break;
       } else {
         resilience.resolve(runId, 'follow');
         if (state.followSkipped) console.log('本批关注已跳过，继续下一批。');
@@ -470,11 +505,19 @@ try {
             console.log('所有帖子处理完毕，转入博主粉丝导出。');
           }
         } else {
+          if (state.followerBatch) {
+            const checkpoint = followerCheckpoints.get(state.followAccountId, state.blogger);
+            followerCheckpoints.save(state.followAccountId, state.blogger, {
+              ...checkpoint, offset: state.followerBatch.nextOffset, done: state.followerBatch.done,
+              due: Date.now() + FOLLOWER_INTERVAL_MS,
+            });
+          }
           stage = 'done'; persist('completed');
           console.log(`本轮完成：${state.posts.length} 条帖子 + 博主粉丝；结果 ${output}`);
         }
       }
     }
+  }
   }
 } catch (error) {
   // 不完整的模型结果仍保存为降级文件，外部操作失败则保留状态等待核实。

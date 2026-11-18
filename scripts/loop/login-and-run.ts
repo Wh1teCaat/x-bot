@@ -1,5 +1,7 @@
+import '../../src/runtime-config.ts';
+import { monitorProcess } from '../../src/runtime-monitor.ts';
 /** 前台登录账号并使用相同资料启动单轮任务。 */
-import 'dotenv/config';
+
 import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
 import { access, mkdir, open, readFile, unlink } from 'node:fs/promises';
@@ -15,6 +17,8 @@ import { AccountStore } from '../../src/account-store.ts';
 
 const args = process.argv.slice(2);
 const accountId = args[0];
+const telemetry = monitorProcess(accountId, 'login');
+telemetry.stage('检查登录与浏览器');
 const checkOnly = args.includes('--check-only');
 const forwarded = args.slice(1).filter(argument => argument !== '--check-only');
 if (!/^\d{1,19}$/.test(accountId || '')) {
@@ -170,6 +174,7 @@ try {
     console.log('登录与插件检查通过；--check-only 未执行任务，也未发送关注请求。');
   } else {
     console.log('账号及插件检查通过，开始执行单轮任务；任务可能发送关注请求。');
+    telemetry.stage('等待采集任务完成', 'waiting');
     worker = spawn(process.execPath, ['scripts/loop/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(cdpPort), ...forwarded], { stdio: 'inherit', detached: true });
     const code = await new Promise<number>((resolve, reject) => { worker.once('error', reject); worker.once('exit', value => resolve(value ?? 1)); });
     if (code !== 0) throw new Error(`单轮任务停止，退出码 ${code}`);
