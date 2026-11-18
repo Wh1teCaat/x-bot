@@ -1,3 +1,5 @@
+import { DatabaseSync } from 'node:sqlite';
+import { processSnapshot, stopProcessTree } from './process-stop.ts';
 import { configSchema, readRuntimeConfig, saveRuntimeConfig } from './runtime-config.ts';
 /** 提供本机 OAuth 授权与 X API 代理服务。 */
 
@@ -648,6 +650,30 @@ const server = createServer(async (req, res) => {
       const results = await startAllConsoleLoops(accountStore.list(), launchConsoleLoop);
       const count = (status: string) => results.filter(item => item.status === status).length;
       json(res, 202, { results, message: `已启动 ${count("started")} 个，跳过 ${count("skipped")} 个，失败 ${count("failed")} 个` });
+      return;
+    }
+
+    const stopLoopMatch = url.pathname.match(/^\/api\/console\/(\d{1,19})\/stop$/);
+    if (req.method === "POST" && stopLoopMatch) {
+      if (req.headers.origin !== origin || req.headers["x-local-request"] !== "1")
+        throw new HttpError(403, "Invalid local request");
+      const id = stopLoopMatch[1];
+      if (!accountStore.getByUuid(id)) throw new HttpError(404, "未找到账号");
+      const pids = new Set<number>();
+      const child = consoleLoops.get(id);
+      if (child?.pid) pids.add(child.pid);
+      // 服务重启后仍可停止此前启动的 flow；只信任本地记录并复核实际命令。
+      const runtimePath = join(dataDir, "runtime.sqlite");
+      if (existsSync(runtimePath)) {
+        const db = new DatabaseSync(runtimePath, { readOnly: true });
+        try {
+          for (const row of db.prepare("SELECT pid FROM runtime_sessions WHERE account=? AND worker='flow' AND ended_at IS NULL").all(id)) pids.add(Number(row.pid));
+        } finally { db.close(); }
+      }
+      const roots = processSnapshot().filter(row => pids.has(row.pid) &&
+        new RegExp("(?:^|[/\\s])scripts/loop/flow\\.ts\\s+" + id + "(?:\\s|$)").test(row.command));
+      await Promise.all(roots.map(row => stopProcessTree(row.pid)));
+      json(res, 200, { message: roots.length ? "账号任务已停止，队列和断点已保留" : "账号没有可停止的长 loop", stopped: roots.length });
       return;
     }
 

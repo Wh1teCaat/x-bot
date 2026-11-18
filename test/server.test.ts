@@ -298,6 +298,14 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
       body: JSON.stringify({ confirm: false }),
     })).status, 400);
     const startHeaders = { ...header, Origin: base, "Content-Type": "application/json" };
+    assert.equal((await fetch(base + '/api/console/1/stop', { method: 'POST' })).status, 403);
+    const stopHeaders = { Origin: base, 'X-Local-Request': '1' };
+    assert.equal((await fetch(base + '/api/console/999/stop', { method: 'POST', headers: stopHeaders })).status, 404);
+    for (let i = 0; i < 2; i++) {
+      const stopped = await fetch(base + '/api/console/1/stop', { method: 'POST', headers: stopHeaders });
+      assert.equal(stopped.status, 200);
+      assert.equal(((await stopped.json()) as any).stopped, 0);
+    }
     assert.equal((await fetch(base + '/api/console/1/start', { method: 'POST' })).status, 403);
     for (const [id, body, expected] of [
       ['999', { confirm: true }, 404],

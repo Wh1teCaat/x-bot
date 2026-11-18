@@ -1,6 +1,7 @@
 import '../../src/runtime-config.ts';
 /** 长时 loop：启动 mirror 子进程监听，执行初始 loop，并持续处理延迟回复任务。 */
 
+import { stopProcessTree } from '../../src/process-stop.ts';
 import { monitorProcess } from '../../src/runtime-monitor.ts';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve } from 'node:path';
@@ -65,6 +66,32 @@ const readAccount = () => {
 let account = readAccount();
 if (!account) { console.error(`未找到账号 ${accountId}，请先完成 X 授权`); process.exit(1); }
 const loginEnv = { ...process.env, ...(cookiePath ? { X_COOKIE_FILE: resolve(cookiePath) } : {}) };
+let stopping = false;
+let mirrorChild: ChildProcess | null = null;
+let outboxChild: ChildProcess | null = null;
+let activityChild: ChildProcess | null = null;
+let activityRestartTimer: ReturnType<typeof setTimeout> | null = null;
+let restartTimer: ReturnType<typeof setTimeout> | null = null;
+let replyChild: ChildProcess | null = null;
+let replyTimer: ReturnType<typeof setInterval> | null = null;
+let mirrorStore: MirrorStore | null = null;
+let resolveStop: (() => void) | null = null;
+const stopPromise = new Promise<void>((resolveSignal) => { resolveStop = resolveSignal; });
+let stopTask: Promise<void> | null = null;
+const stop = (status = 'stopped') => {
+  if (stopTask) return stopTask;
+  stopping = true;
+  telemetry.finish(status);
+  if (restartTimer) clearTimeout(restartTimer);
+  if (activityRestartTimer) clearTimeout(activityRestartTimer);
+  if (replyTimer) clearInterval(replyTimer);
+  stopTask = stopProcessTree(process.pid, false).finally(() => resolveStop?.());
+  return stopTask;
+};
+const stopOnSignal = () => { void stop().then(() => process.exit(0), error => { console.error(error); process.exit(1); }); };
+process.once('SIGINT', stopOnSignal);
+process.once('SIGTERM', stopOnSignal);
+
 if (checkOnly) {
   console.log(`clone 状态：${account.cloned ? `已完成，目标 @${account.copiedFromUsername}` : '未 clone'}`);
   const code = await run(['scripts/loop/login-and-run.ts', accountId, '--check-only'], loginEnv);
@@ -113,31 +140,6 @@ if (account.cloned) {
   console.log(`clone 完成并持久化：目标 @${resolvedTarget}`);
 }
 
-let stopping = false;
-let mirrorChild: ChildProcess | null = null;
-let outboxChild: ChildProcess | null = null;
-let activityChild: ChildProcess | null = null;
-let activityRestartTimer: ReturnType<typeof setTimeout> | null = null;
-let restartTimer: ReturnType<typeof setTimeout> | null = null;
-let replyChild: ChildProcess | null = null;
-let replyTimer: ReturnType<typeof setInterval> | null = null;
-let mirrorStore: MirrorStore | null = null;
-let resolveStop: (() => void) | null = null;
-const stopPromise = new Promise<void>((resolveSignal) => { resolveStop = resolveSignal; });
-const stop = () => {
-  stopping = true;
-  telemetry.finish('stopped');
-  if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
-  if (activityRestartTimer) { clearTimeout(activityRestartTimer); activityRestartTimer = null; }
-  if (replyTimer) { clearInterval(replyTimer); replyTimer = null; }
-  mirrorChild?.kill('SIGINT');
-  outboxChild?.kill('SIGINT');
-  activityChild?.kill('SIGINT');
-  replyChild?.kill('SIGINT');
-  resolveStop?.();
-};
-process.once('SIGINT', stop);
-process.once('SIGTERM', stop);
 
 outboxChild = spawn(process.execPath, ['scripts/follow/outbox-worker.ts', accountId, ...(confirmFollow ? ['--confirm-follow'] : [])], { cwd: process.cwd(), stdio: 'inherit' });
 outboxChild.once('error', error => console.error(`关注 Outbox 子进程启动失败：${error.message}`));
@@ -175,14 +177,16 @@ if (mirror !== 'none') startMirror();
 
 const loopCode = await run(loopArgs(resolvedTarget), loginEnv);
 resumeId = undefined;
+if (stopping) { await stop(); process.exit(0); }
 if (loopCode !== 0) {
-  if (mirror === 'continuous') console.error('初始 loop 失败；mirror 仍在监听，继续等待延迟回复任务。');
-  else { stop(); process.exitCode = loopCode; process.exit(loopCode); }
+  console.error('初始 loop 失败，停止该账号全部任务；队列和断点保留。');
+  await stop('failed');
+  process.exit(loopCode);
 }
 // --no-mirror 仍保留粉丝半小时调度和关注 Outbox。
 if (mirror === 'once') {
   if (mirrorChild) await new Promise<void>((resolveExit) => mirrorChild!.once('exit', () => resolveExit()));
-  stop();
+  await stop(loopCode ? 'failed' : 'completed');
   process.exit(loopCode);
 }
 
@@ -256,7 +260,7 @@ replyTimer = setInterval(() => {
 }, schedulerMs);
 
 await stopPromise;
-stop();
+await stop();
 if (replyChild) replyChild.kill('SIGINT');
 if (mirrorStore) mirrorStore.close();
 console.log('loop 已停止。');
@@ -268,11 +272,13 @@ function loopArgs(blogger: string): string[] {
     ...(yes ? ['--yes'] : []), ...(postUrl ? ['--post', postUrl] : []), ...(resumeId ? ['--resume', resumeId] : [])];
 }
 
-function run(args: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
+async function run(args: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
   telemetry.stage(args[0].includes('clone_user') ? '复制目标账号资料' : '登录并执行采集流程');
-  return new Promise((resolveCode, reject) => {
+  const code = await new Promise<number>((resolveCode) => {
     const child = spawn(process.execPath, args, { stdio: 'inherit', cwd: process.cwd(), env: { ...env, X_RUNTIME_ACCOUNT_ID: accountId } });
-    child.once('error', reject);
+    child.once('error', error => { console.error(`子进程启动失败：${error.message}`); resolveCode(1); });
     child.once('exit', (code) => resolveCode(code ?? 1));
   });
+  if (stopping) { await stop(); process.exit(0); }
+  return code;
 }

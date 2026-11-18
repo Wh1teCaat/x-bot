@@ -152,3 +152,15 @@ test('a failed worker stays red while other workers run, then clears after recov
     assert.equal(result.accounts[0].needsAttention, false);
   } finally { if (!failed.closed) failed.close(); active.close(); if (recovered && !recovered.closed) recovered.close(); f.cleanup(); }
 });
+
+test('failed or manually stopped flow takes precedence over later child session completion', () => {
+  for (const status of ['failed', 'stopped']) {
+    const f = fixture(); let now = 1000;
+    const flow = new RuntimeMonitor(join(f.dir, 'runtime.sqlite'), '1', 'flow', () => now);
+    now = 2000;
+    const child = new RuntimeMonitor(join(f.dir, 'runtime.sqlite'), '1', 'loop', () => now);
+    child.close('completed'); now = 3000; flow.close(status);
+    try { assert.equal(readConsole(f.dir, accounts, { now, alive: () => false }).accounts[0].status, status); }
+    finally { f.cleanup(); }
+  }
+});

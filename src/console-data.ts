@@ -49,7 +49,9 @@ export function readConsole(dataDir: string, accounts: Account[], options: { acc
       for (const session of [...sessions].sort((a, b) => b.startedAt - a.startedAt)) if (!latestWorkers.has(session.worker)) latestWorkers.set(session.worker, session);
       const failed = (status: string) => ['failed', 'interrupted', 'manual', 'incomplete', 'blocked', 'verification', 'suspended'].includes(status);
       const needsAttention = stats.manual > 0 || stats.uncertain > 0 || [...latestWorkers.values()].some(s => failed(s.status) || s.stageStatus === 'failed') || Boolean(fallback && failed(String(fallback.status)) && (!sessions.length || fallback.updatedAt >= Math.max(...sessions.map(s => s.startedAt))));
-      const status = active.length ? 'running' : fallback?.status === 'running' ? 'running' : sessions[0]?.status || fallback?.status || 'idle';
+      const flow = latestWorkers.get('flow');
+      const terminalFlow = flow && flow.status !== 'running' && flow.updatedAt >= Math.max(...sessions.map(s => s.startedAt)) ? flow : null;
+      const status = active.length ? 'running' : fallback?.status === 'running' ? 'running' : terminalFlow?.status || sessions[0]?.status || fallback?.status || 'idle';
       return { id, username: account.username || id, name: account.name || account.username || id, authorized: Boolean(account.authenticated), status, needsAttention, stats, sessions, fallback, checkpoints, nextFollowAt };
     });
     let logs: any[] = [], steps: any[] = [];
