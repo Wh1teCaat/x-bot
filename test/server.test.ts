@@ -292,6 +292,24 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
     const consoleAccount = await (await fetch(`${base}/api/console/1`, { headers: header })).json() as any;
     assert.equal(consoleAccount.accounts.length, 1);
     assert.equal(consoleAccount.accounts[0].id, '1');
+    assert.equal((await fetch(base + '/api/console/start-all', { method: 'POST' })).status, 403);
+    assert.equal((await fetch(base + '/api/console/start-all', {
+      method: 'POST', headers: { ...header, Origin: base, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: false }),
+    })).status, 400);
+    const startHeaders = { ...header, Origin: base, "Content-Type": "application/json" };
+    assert.equal((await fetch(base + '/api/console/1/start', { method: 'POST' })).status, 403);
+    for (const [id, body, expected] of [
+      ['999', { confirm: true }, 404],
+      ['1', { confirm: false }, 400],
+      ['1', { confirm: true, target: 'bad/name' }, 400],
+    ] as const) {
+      const response = await fetch(base + '/api/console/' + id + '/start', {
+        method: 'POST', headers: startHeaders, body: JSON.stringify(body),
+      });
+      assert.equal(response.status, expected);
+    }
+
 
     // Cookie 导入页与本地导入接口。
     assert.equal((await fetch(`${base}/cookies`)).status, 200);

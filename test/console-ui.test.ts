@@ -16,7 +16,7 @@ test('console expands account logs, preserves expansion on refresh, filters and 
   const bob = { ...alice, id: '2', username: 'bob', name: '<img src=x onerror="window.injected=true">', status: 'interrupted', sessions: [], stats: { ...alice.stats, following: 52, mutual: 12, queued: 0 }, checkpoints: [], nextFollowAt: null };
   const fixture = { generatedAt: now, accounts: [alice, bob], logs: [], steps: [], nextBefore: null };
   const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
-  let fail = false;
+  let fail = false, starts = 0, batchStarts = 0;
   await page.route('http://console.test/**', async route => {
     const url = new URL(route.request().url());
     if (url.pathname === '/console') return route.fulfill({ contentType: 'text/html', body: readFileSync(new URL('../src/console.html', import.meta.url), 'utf8') });
@@ -27,10 +27,24 @@ test('console expands account logs, preserves expansion on refresh, filters and 
       }
       return route.fulfill({ json: { revision: 'initial', schema: configSchema, values: Object.fromEntries(Object.entries(configSchema).map(([key, rule]) => [key, rule.default])) } });
     }
+    if (url.pathname === '/api/console/start-all') {
+      assert.equal(route.request().method(), 'POST');
+      assert.deepEqual(route.request().postDataJSON(), { confirm: true });
+      batchStarts++;
+      return route.fulfill({ status: 202, json: { message: '已启动 1 个，跳过 1 个，失败 0 个', results: [
+        { username: 'alice', message: '正在运行' }, { username: 'bob', message: '长 loop 已启动' },
+      ] } });
+    }
+    if (url.pathname === '/api/console/2/start') {
+      assert.equal(route.request().method(), 'POST');
+      assert.deepEqual(route.request().postDataJSON(), { target: '@fashion', confirm: true });
+      starts++;
+      return route.fulfill({ status: 202, json: { message: '长 loop 已启动' } });
+    }
     if (fail) return route.fulfill({ status: 503, body: '{}' });
     assert.equal(route.request().headers()['x-local-request'], '1');
-    const detail = url.pathname === '/api/console/1';
-    return route.fulfill({ contentType: 'application/json', body: JSON.stringify(detail ? { ...fixture, accounts: [alice],
+    const detail = /^\/api\/console\/[12]$/.test(url.pathname);
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify(detail ? { ...fixture, accounts: [url.pathname === '/api/console/2' ? bob : alice],
       steps: [{ id: 1, name: '筛选关注/粉丝比例', worker: 'loop', status: 'completed', startedAt: now - 90000, endedAt: now - 30000, durationMs: 60000 }],
       logs: [{ id: url.search ? 1 : 101, level: 'info', message: url.search ? '更早的日志' : '<script>window.injected=true</script> 粉丝本批 200 人', createdAt: now, elapsedMs: 1500, stage: '抓取粉丝', worker: 'loop' }], nextBefore: url.search ? null : 101 } : fixture) });
   });
@@ -59,10 +73,25 @@ test('console expands account logs, preserves expansion on refresh, filters and 
     await page.waitForFunction(() => document.querySelector('.logs')?.textContent?.includes('更早的日志'));
     await page.getByRole('button', { name: '返回最新' }).click();
     await page.waitForFunction(() => document.querySelector('.logs')?.textContent?.includes('粉丝本批'));
+    await page.locator('details[data-id="2"] summary').click();
+    await page.locator('details[data-id="2"] button[data-action="start"]').click();
+    await page.locator('#start-target').fill('@fashion');
+    await page.locator('#start-submit').click();
+    await page.waitForFunction(() => document.querySelector('#start-status')?.textContent?.includes('已启动'));
+    assert.equal(starts, 1);
+    await page.locator('#start-cancel').click();
+    assert.equal(await page.locator('details[data-id="1"] button[data-action="start"]').isDisabled(), true);
     await page.locator('#filter').selectOption('running');
     assert.equal(await page.locator('details:visible').count(), 1);
     await page.locator('#search').fill('no-match');
     assert.equal(await page.locator('#no-results').isVisible(), true);
+    await page.locator('#start-all').click();
+    assert.equal(await page.locator('#start-target').isVisible(), false);
+    await page.locator('#start-submit').click();
+    await page.waitForFunction(() => document.querySelector('#start-status')?.textContent?.includes('跳过 1 个'));
+    assert.match(await page.locator('#start-status').innerText(), /@bob：长 loop 已启动/);
+    assert.equal(batchStarts, 1);
+    await page.locator('#start-cancel').click();
     await page.locator('#search').fill('');
     await page.setViewportSize({ width: 390, height: 844 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);

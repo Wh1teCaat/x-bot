@@ -15,6 +15,7 @@ import { rankUsers } from "./user-ranking.ts";
 import { followFirstArabFollower } from "./arab-follow.ts";
 import { FollowStore, syncFollowing } from "./follow-store.ts";
 import { shouldAutoStartAccountSession, startAccountSession } from "./account-session-manager.ts";
+import { startAllConsoleLoops } from "./console-start.ts";
 import { readConsole } from "./console-data.ts";
 import { AccountStore } from "./account-store.ts";
 
@@ -365,6 +366,34 @@ async function usableAccount(id: string): Promise<Account> {
 
 const page = readFileSync(new URL("./index.html", import.meta.url), "utf8");
 const consolePage = readFileSync(new URL("./console.html", import.meta.url), "utf8");
+const consoleLoops = new Map<string, ReturnType<typeof spawn> | null>();
+async function launchConsoleLoop(id: string, target = "") {
+  const account = accountStore.getByUuid(id);
+  if (!account?.authenticated) throw new HttpError(404, "未找到已授权账号");
+  if (consoleLoops.has(id) || readConsole(dataDir, [account]).accounts.some(a => a.status === "running"))
+    throw new HttpError(409, "该账号已有任务运行，请勿重复启动");
+  consoleLoops.set(id, null);
+  let fd: number | undefined;
+  try {
+    const dir = join(dataDir, "console-loops");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fd = openSync(join(dir, id + ".log"), "a", 0o600);
+    const child = spawn(process.execPath, ["scripts/loop/flow.ts", id, "--yes",
+      ...(target ? ["--target", target] : [])],
+      { cwd: process.cwd(), detached: true, stdio: ["ignore", fd, fd] });
+    consoleLoops.set(id, child);
+    child.once("exit", () => { if (consoleLoops.get(id) === child) consoleLoops.delete(id); });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    child.unref();
+    return { pid: child.pid, message: "长 loop 已启动，请在账号详情查看进度" };
+  } catch (error) {
+    consoleLoops.delete(id);
+    throw new HttpError(502, "无法启动长 loop：" + (error instanceof Error ? error.message : String(error)));
+  } finally { if (fd !== undefined) closeSync(fd); }
+}
 let autoRunProcess: ReturnType<typeof spawn> | null = null;
 const followStore = new FollowStore(join(dataDir, "following.sqlite"));
 const runningFollow = new Set<string>();
@@ -608,6 +637,32 @@ const server = createServer(async (req, res) => {
         }
       }
       json(res, 200, { imported: results.filter((item) => item.ok).length, failed: results.filter((item) => !item.ok).length, results });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/console/start-all") {
+      if (req.headers.origin !== origin || req.headers["x-local-request"] !== "1")
+        throw new HttpError(403, "Invalid local request");
+      const body = await readJsonBody(req);
+      if (body.confirm !== true) throw new HttpError(400, "请确认启动所有账号");
+      const results = await startAllConsoleLoops(accountStore.list(), launchConsoleLoop);
+      const count = (status: string) => results.filter(item => item.status === status).length;
+      json(res, 202, { results, message: `已启动 ${count("started")} 个，跳过 ${count("skipped")} 个，失败 ${count("failed")} 个` });
+      return;
+    }
+
+    const startLoopMatch = url.pathname.match(/^\/api\/console\/(\d{1,19})\/start$/);
+    if (req.method === "POST" && startLoopMatch) {
+      if (req.headers.origin !== origin || req.headers["x-local-request"] !== "1")
+        throw new HttpError(403, "Invalid local request");
+      const id = startLoopMatch[1];
+      const account = accountStore.getByUuid(id);
+      if (!account?.authenticated) throw new HttpError(404, "未找到已授权账号");
+      const body = await readJsonBody(req);
+      const target = typeof body.target === "string" ? body.target.trim().replace(/^@/, "") : "";
+      if (target && !/^[A-Za-z0-9_]{1,15}$/.test(target)) throw new HttpError(400, "目标用户名无效");
+      if (body.confirm !== true) throw new HttpError(400, "请确认启动长 loop");
+      json(res, 202, await launchConsoleLoop(id, target));
       return;
     }
 
