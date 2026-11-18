@@ -109,7 +109,7 @@ http://127.0.0.1:3000/
 
 同一账号优先复用已打开且空闲的实例：再次授权或执行 `npm run account -- run <账号数字ID>` 可以启动下一轮。`npm run account -- status <账号数字ID>` 查看状态及错误；`npm run account -- stop <账号数字ID>` 关闭该账号的实例，保留其资料目录。实例只复用给绑定的账号，不在账号间共享登录状态。
 
-授权申请 `tweet.read`、`users.read`、`follows.read`、`follows.write`、`tweet.write`、`media.write` 和 `offline.access`。已有账号如缺少权限需重新授权。账号相关状态统一保存在 `.data/accounts.sqlite` 的账号表：自增主键、X 账号数字 ID（uuid）、用户名（索引）、是否已 clone、clone 来源账号信息（用户名/显示名/数字 ID/完成时间）、历史关键词字段（keywords）、是否已在账号资料 Chrome 登录并安装插件、是否已认证，以及 access / refresh 令牌（AES-GCM 加密，密钥在 `.data/key`）。二者位于同一机器，保护范围限于避免意外查看。服务只监听本机，不要将其公开到网络。用户查询和关注会消耗 API 额度，具体权限、费用及限额以 X 开发者控制台为准。
+授权申请 `tweet.read`、`users.read`、`follows.read`、`follows.write`、`tweet.write`、`media.write`、`dm.read`、`dm.write` 和 `offline.access`。已有账号如缺少权限需重新授权。账号相关状态统一保存在 `.data/accounts.sqlite` 的账号表：自增主键、X 账号数字 ID（uuid）、用户名（索引）、是否已 clone、clone 来源账号信息（用户名/显示名/数字 ID/完成时间）、历史关键词字段（keywords）、是否已在账号资料 Chrome 登录并安装插件、是否已认证，以及 access / refresh 令牌（AES-GCM 加密，密钥在 `.data/key`）。二者位于同一机器，保护范围限于避免意外查看。服务只监听本机，不要将其公开到网络。用户查询和关注会消耗 API 额度，具体权限、费用及限额以 X 开发者控制台为准。
 
 ## 单轮调试
 
@@ -281,6 +281,6 @@ npm run loop:health -- resolve-api-follow <授权账号数字ID> <目标账号�
 - `scripts/browser/`：浏览器连接、启动和 exporter24 计数读取。
 - `scripts/clone_user/`：独立的账号资料复制，使用 `npm run clone_user -- <目标用户名> <子账号资料名>`，可加 `--cookie <文件>`、`--dry-run`、`--update`。复制头像、显示名称、完整简介和横幅；`--update` 只刷新资料、不改用户名，已 clone 的账号也可用。clone 完成后，loop 默认使用该来源博主采集帖子回复。
 - `scripts/mirror/`：目标发帖镜像（准实时 hook）。使用 `npm run mirror -- <目标用户名> <发帖账号数字ID>` 注册并持续轮询目标新帖，复制文本用发帖账号发新帖；`npm run mirror -- list` 查看，`npm run mirror -- remove <目标用户名>` 移除。
-- `scripts/follow/`：关注操作。
+- `scripts/follow/`：关注操作与回关监听。`npm run follow-reply -- <账号数字ID> [--mock] [--app]` 独立监听入站关注（回关）并在收到后落库、用 LLM 生成欢迎私信发送（首句 `hello`）；`--mock` 跑本地自测（不访问 X、不调真实 LLM、不写真实数据库），`--app` 使用 `X_ACTIVITY_APP_BEARER_TOKEN` 连接应用流，否则经本机授权服务用用户令牌。
 - `scripts/loop/`：单轮任务、队列和恢复。
 - `scripts/replies/`：回复导出和筛选。

@@ -162,6 +162,14 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
       assert.ok(text);
       if (media) assert.deepEqual(media.media_ids, ["1234567890123456789"]);
       res.end(JSON.stringify({ data: { id: "5000", text } }));
+    } else if (/^\/2\/dm_conversations\/with\/\d+\/messages$/.test(url.pathname) && req.method === "POST") {
+      assert.equal(req.headers.authorization, "Bearer new1");
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const { text } = JSON.parse(body);
+      assert.ok(text);
+      const recipient = url.pathname.split("/")[4];
+      res.end(JSON.stringify({ data: { dm_conversation_id: `dm-${recipient}`, dm_event_id: `ev-${recipient}`, text } }));
     } else if (url.pathname === "/2/tweets/777") {
       assert.equal(req.headers.authorization, "Bearer new1");
       res.end(JSON.stringify({ data: { id: "777" }, includes: { media: [{ media_key: "k1", type: "photo", url: "https://pbs.twimg.com/media/foo.jpg" }, { media_key: "k2", type: "video" }] } }));
@@ -233,7 +241,7 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
       assert.equal(location.searchParams.get("code_challenge_method"), "S256");
       assert.match(location.searchParams.get("scope")!, /offline.access/);
       assert.match(location.searchParams.get("scope")!, /follows.write/);
-      assert.doesNotMatch(location.searchParams.get("scope")!, /\bdm\./);
+      assert.match(location.searchParams.get("scope")!, /\bdm\.write\b/);
       challenge = location.searchParams.get("code_challenge")!;
       const state = location.searchParams.get("state")!;
       const callback = await fetch(
@@ -435,6 +443,15 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
     const posted = await fetch(`${base}/api/accounts/1/tweets`, { method: "POST", headers: { ...followHeaders, "Content-Type": "application/json" }, body: JSON.stringify({ text: "mirror me" }) });
     assert.equal(posted.status, 200);
     assert.equal(((await posted.json()) as any).data.id, "5000");
+
+    // 私信端点：账号 2 无 dm.write，账号 1 具备。
+    assert.equal((await fetch(`${base}/api/accounts/2/messages`, { method: "POST", headers: followHeaders, body: JSON.stringify({ recipient_id: "123", text: "hello" }) })).status, 403);
+    assert.equal((await fetch(`${base}/api/accounts/1/messages`, { method: "POST", headers: followHeaders, body: JSON.stringify({ recipient_id: "bad", text: "hello" }) })).status, 400);
+    assert.equal((await fetch(`${base}/api/accounts/1/messages`, { method: "POST", headers: followHeaders, body: JSON.stringify({ recipient_id: "123", text: "  " }) })).status, 400);
+    assert.equal((await fetch(`${base}/api/accounts/1/messages`, { method: "POST", headers: header, body: JSON.stringify({ recipient_id: "123", text: "hello" }) })).status, 403);
+    const dm = await fetch(`${base}/api/accounts/1/messages`, { method: "POST", headers: { ...followHeaders, "Content-Type": "application/json" }, body: JSON.stringify({ recipient_id: "123", text: "hello there" }) });
+    assert.equal(dm.status, 200);
+    assert.equal(((await dm.json()) as any).data.dm_event_id, "ev-123");
     const timeline = await fetch(`${base}/api/accounts/1/users/77/tweets?since_id=900&exclude=retweets`, { headers: header });
     assert.equal(timeline.status, 200);
     assert.equal(((await timeline.json()) as any).data[0].text, "mirror me");

@@ -21,7 +21,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error("Invalid PORT");
 
 const origin = `http://127.0.0.1:${port}`;
-const authorizationScope = "users.read follows.read follows.write tweet.read tweet.write media.write offline.access";
+const authorizationScope = "users.read follows.read follows.write tweet.read tweet.write media.write dm.read dm.write offline.access";
 const redirectUri = process.env.X_REDIRECT_URI || `${origin}/oauth/callback`;
 if (redirectUri !== `${origin}/oauth/callback`)
   throw new Error(`X_REDIRECT_URI must be ${origin}/oauth/callback`);
@@ -650,6 +650,27 @@ const server = createServer(async (req, res) => {
         method: "POST",
         headers: { Authorization: `Bearer ${account.accessToken}`, "Content-Type": "application/json" },
         body: JSON.stringify(body),
+      });
+      json(res, 200, result);
+      return;
+    }
+
+    const dmMatch = url.pathname.match(/^\/api\/accounts\/(\d{1,19})\/messages$/);
+    if (req.method === "POST" && dmMatch) {
+      if (req.headers.origin !== origin || req.headers["x-local-request"] !== "1")
+        throw new HttpError(403, "Invalid local request");
+      const account = await usableAccount(dmMatch[1]);
+      if (!account.scope?.split(/\s+/).includes("dm.write"))
+        throw new HttpError(403, "账号缺少私信权限，请重新授权并授予 dm.write 权限。");
+      const { recipient_id, text } = await readJsonBody(req);
+      if (typeof recipient_id !== "string" || !/^\d{1,19}$/.test(recipient_id))
+        throw new HttpError(400, "recipient_id 必须是数字 ID。");
+      if (typeof text !== "string" || !text.trim() || text.length > 10000)
+        throw new HttpError(400, "text 必须为 1–10000 字符。");
+      const result = await xRequest(`/2/dm_conversations/with/${recipient_id}/messages`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${account.accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text.trim() }),
       });
       json(res, 200, result);
       return;
