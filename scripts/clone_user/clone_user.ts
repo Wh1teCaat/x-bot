@@ -9,7 +9,7 @@ import { stdin, stdout } from 'node:process';
 import { originalAvatarUrl, originalBannerUrl, parseHandle } from './core.ts';
 import { chooseFirstSuggestion } from './suggestions.ts';
 import { actionDelay } from '../browser/action-delay.ts';
-import { loadCookieJar } from '../browser/cookies.ts';
+import { loadCookieJar, findCookieFile } from '../browser/cookies.ts';
 import { fingerprintFor } from '../browser/fingerprint.ts';
 import { AccountStore } from '../../src/account-store.ts';
 
@@ -45,7 +45,10 @@ const executable = process.env.PROFILE_COPY_CHROME || '/Applications/Google Chro
 const input = createInterface({ input: stdin, output: stdout });
 let context;
 let accountStore;
-async function pause(prompt: string) { await input.question(prompt); }
+async function pause(prompt: string) {
+  if (!stdin.isTTY) throw new Error('未检测到 X 登录态。后台运行无法等待终端输入，请更新 .data/cookies/<账号ID>.json（或 .txt）中的 Cookie 后重试。');
+  await input.question(prompt);
+}
 async function currentHandle(page: Page): Promise<string> {
   const href = await page.getByTestId('AppTabBar_Profile_Link').getAttribute('href', { timeout: 15000 });
   if (!href || !/^\/[A-Za-z0-9_]{1,15}$/.test(href)) throw new Error('未检测到已登录的 X 账号');
@@ -109,6 +112,7 @@ async function firstVisible(page: Page, selectors: string[]) {
   throw new Error(`找不到页面控件：${selectors.join(' / ')}；X 页面可能已改版`);
 }
 try {
+  cookiePath = await findCookieFile(process.env.X_RUNTIME_ACCOUNT_ID, cookiePath);
   await mkdir(profile, { recursive: true, mode: 0o700 });
   const fp = fingerprintFor(profileName);
   context = await chromium.launchPersistentContext(profile, { executablePath: executable, headless: false,
@@ -130,6 +134,10 @@ try {
   }
   if (owner.toLowerCase() === target.toLowerCase()) throw new Error('当前登录账号就是目标账号，已停止');
   accountStore = new AccountStore(resolve('.data'));
+  const expectedAccount = process.env.X_RUNTIME_ACCOUNT_ID ? accountStore.getByUuid(process.env.X_RUNTIME_ACCOUNT_ID) : undefined;
+  if (process.env.X_RUNTIME_ACCOUNT_ID && (!expectedAccount || expectedAccount.username.toLowerCase() !== owner.toLowerCase())) {
+    throw new Error('Cookie 或浏览器登录账号与本次运行账号不一致，已停止复制资料');
+  }
   if (accountStore.getByUsername(owner)?.cloned && !dryRun && !updateOnly) {
     console.log(`账号 @${owner} 已克隆，跳过。`);
     input.close();

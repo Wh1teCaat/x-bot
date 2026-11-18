@@ -1,10 +1,10 @@
 /** 验证 cookie 文件解析、规范化与安全提示。 */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cookieFileCandidates, cookieFileFor, defaultCookiePath, loadCookieJar, normalizeCookieJar, parseCookieHeader, parseNetscapeCookies } from '../scripts/browser/cookies.ts';
+import { findCookieFile, cookieFileCandidates, cookieFileFor, defaultCookiePath, loadCookieJar, normalizeCookieJar, parseCookieHeader, parseNetscapeCookies } from '../scripts/browser/cookies.ts';
 
 const now = 1_700_000_000_000;
 
@@ -121,4 +121,28 @@ test('resolves the default and overridden cookie paths', () => {
     join(process.cwd(), '.data', 'cookies', '123.txt'),
   ]);
   assert.deepEqual(cookieFileCandidates('123', { X_COOKIE_FILE: 'tmp/custom.txt' }), [join(process.cwd(), 'tmp', 'custom.txt')]);
+});
+
+
+test('clone cookie lookup uses account defaults and respects explicit overrides', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'clone-cookie-'));
+  const previous = process.cwd();
+  try {
+    process.chdir(dir);
+    await mkdir('.data/cookies', { recursive: true });
+    assert.equal(await findCookieFile('123', undefined, {}), undefined);
+    const txt = join(process.cwd(), '.data/cookies/123.txt');
+    const json = join(process.cwd(), '.data/cookies/123.json');
+    await writeFile(txt, 'auth_token=test; ct0=test');
+    assert.equal(await findCookieFile('123', undefined, {}), txt);
+    await writeFile(json, '{}');
+    assert.equal(await findCookieFile('123', undefined, {}), json);
+    assert.equal(await findCookieFile('123', undefined, { X_COOKIE_FILE: txt }), txt);
+    assert.equal(await findCookieFile('123', json, { X_COOKIE_FILE: txt }), json);
+    await assert.rejects(findCookieFile('123', 'missing.json', {}), { code: 'ENOENT' });
+    assert.equal(await findCookieFile('456', undefined, {}), undefined);
+  } finally {
+    process.chdir(previous);
+    await rm(dir, { recursive: true, force: true });
+  }
 });

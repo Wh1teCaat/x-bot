@@ -1,6 +1,6 @@
 import '../../src/runtime-config.ts';
 /** 读取并规范化从浏览器导出的 X 登录 cookie，供 Playwright 注入。 */
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, stat, access } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 /** Playwright addCookies 所需的 cookie 结构；expires 为秒级时间戳。 */
@@ -37,6 +37,22 @@ export function cookieFileFor(accountId: string, env: NodeJS.ProcessEnv = proces
 export function cookieFileCandidates(accountId: string, env: NodeJS.ProcessEnv = process.env): string[] {
   if (env.X_COOKIE_FILE) return [cookieFileFor(accountId, env)];
   return [defaultCookiePath(accountId), resolve('.data', 'cookies', `${accountId}.txt`)];
+}
+
+/** 显式指定的文件必须可读；默认文件不存在时才允许复用浏览器登录态。 */
+export async function findCookieFile(accountId: string | undefined, explicit?: string, env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  const configured = explicit || env.X_COOKIE_FILE;
+  if (configured) {
+    const path = resolve(configured);
+    await access(path);
+    return path;
+  }
+  if (!accountId) return undefined;
+  for (const path of cookieFileCandidates(accountId, env)) {
+    try { await access(path); return path; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  return undefined;
 }
 
 /** 从三种常见导出格式中取出原始条目：数组、{ cookies } 或 { auth_token, ct0 }。 */

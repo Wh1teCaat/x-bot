@@ -74,7 +74,7 @@ $('start-all').addEventListener('click',()=>openStart(null));
 $('start-cancel').addEventListener('click',()=>$('start-dialog').close());
 $('start-form').addEventListener('submit',async event=>{
 event.preventDefault();$('start-submit').disabled=true;$('start-status').textContent='正在启动…';
-try{const response=await fetch(startingAccount===null?'/api/console/start-all':'/api/console/'+encodeURIComponent(startingAccount)+'/start',{method:'POST',headers:{'X-Local-Request':'1','Content-Type':'application/json'},body:JSON.stringify(startingAccount===null?{confirm:true}:{target:$('start-target').value,confirm:true}),signal:AbortSignal.timeout(10000)});const data=await response.json();if(!response.ok)throw Error(data.error||'启动失败');$('start-status').textContent=data.message+(data.results?'\n'+data.results.map(r=>'@'+r.username+'：'+r.message).join('\n'):'');await refresh()}
+try{const response=await fetch(startingAccount===null?'/api/console/start-all':'/api/console/'+encodeURIComponent(startingAccount)+'/start',{method:'POST',headers:{'X-Local-Request':'1','Content-Type':'application/json'},body:JSON.stringify(startingAccount===null?{confirm:true}:{target:$('start-target').value,confirm:true}),signal:AbortSignal.timeout(10000)});const data=await response.json();if(!response.ok)throw Error(data.error||'启动失败');const message=data.message+(data.results?'\n'+data.results.map(r=>'@'+r.username+'：'+r.message).join('\n'):'');$('notice').textContent=message;if(data.results?.some(r=>r.status==='failed')){$('start-status').textContent=message;$('start-submit').disabled=false}else{$('start-dialog').close()}await refresh()}
 catch(error){$('start-status').textContent=error.message;$('start-submit').disabled=false}
 });
 let settingsRevision='',settingsSchema={};
