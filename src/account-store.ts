@@ -100,6 +100,8 @@ export class AccountStore {
     this.dataDir = dataDir;
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(join(dataDir, "accounts.sqlite"));
+    // 服务端刷新令牌与 loop 子进程会并发访问账号库。
+    this.db.exec("PRAGMA busy_timeout=5000");
     this.db.exec(SCHEMA);
     this.migrateColumns();
     this.migrateIndexes();

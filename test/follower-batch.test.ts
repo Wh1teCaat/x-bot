@@ -15,7 +15,7 @@ test('checkpoint isolates accounts and targets and preserves due time and comple
     assert.equal(checkpoints.get('1', 'bob').offset, 0);
     checkpoints.save('1', 'alice', { ...value, offset: 225, done: true });
     assert.equal(checkpoints.get('1', 'alice').done, true);
-    assert.equal(FOLLOWER_INTERVAL_MS, 1800000);
+    assert.equal(FOLLOWER_INTERVAL_MS, 5 * 60 * 1000);
   } finally { db.close(); }
 });
 
@@ -82,5 +82,21 @@ test('page boundary stops before requesting more data once 200 are collected', a
     assert.equal(stopped, true);
     assert.equal(result.candidates.length, 200);
     assert.equal(result.done, false);
+  } finally { delete (globalThis as any).__followerStore; }
+});
+
+test('retries once when the exporter24 task page is slow to mount', async () => {
+  const store = fakeStore(200);
+  const page = fakePage(store);
+  const originalWait = page.waitForFunction;
+  let waits = 0;
+  page.waitForFunction = async (...args: any[]) => {
+    if (++waits === 1) throw new Error('page.waitForFunction: Timeout 15000ms exceeded.');
+    return originalWait(...args);
+  };
+  try {
+    const result = await readFollowerBatch(page, 'alice', { taskId: 'saved', offset: 0, due: 0, done: false }, () => {}, () => {});
+    assert.equal(result.candidates.length, 200);
+    assert.ok(waits >= 2);
   } finally { delete (globalThis as any).__followerStore; }
 });

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { spawnSync } from 'node:child_process';
 import { RuntimeMonitor, safeLog } from '../src/runtime-monitor.ts';
-import { readConsole } from '../src/console-data.ts';
+import { readConsole, groupConsoleSteps, stepPhase } from '../src/console-data.ts';
 import { FollowStore } from '../src/follow-store.ts';
 import { FollowOutbox } from '../src/follow-outbox.ts';
 
@@ -163,4 +163,63 @@ test('failed or manually stopped flow takes precedence over later child session 
     try { assert.equal(readConsole(f.dir, accounts, { now, alive: () => false }).accounts[0].status, status); }
     finally { f.cleanup(); }
   }
+});
+
+test('console phases merge fine steps into preprocessing, post scan and follower scan', () => {
+  const t = 1_000_000;
+  const step = (id: number, sessionId: string, worker: string, name: string, status: string, startedAt: number, endedAt: number | null, durationMs: number | null) => ({ id, sessionId, worker, name, status, startedAt, endedAt, durationMs });
+  // readConsole 返回的步骤是新到旧；groupConsoleSteps 自己按开始时间排序。
+  const phases = groupConsoleSteps([
+    step(9, 'followers', 'loop', '抓取粉丝（200 人） · 粉丝', 'running', t + 9000, null, 1000),
+    step(8, 'posts', 'loop', '写入关注队列 · 帖子 2/2', 'completed', t + 8000, t + 8200, 200),
+    step(7, 'posts', 'loop', '筛选关注/粉丝比例 · 帖子 2/2', 'completed', t + 7000, t + 7400, 400),
+    step(6, 'posts', 'loop', '整理候选用户 · 帖子 2/2', 'completed', t + 6000, t + 6100, 100),
+    step(5, 'posts', 'loop', '抓取帖子回复 · 帖子 1/2', 'completed', t + 3000, t + 5000, 2000),
+    step(4, 'posts', 'loop', '准备采集任务', 'completed', t + 2000, t + 2100, 100),
+    step(3, 'login', 'login', '等待采集任务完成', 'failed', t + 1900, t + 9500, 7600),
+    step(2, 'login', 'login', '检查登录与浏览器', 'completed', t + 1000, t + 1200, 200),
+    step(1, 'outbox', 'outbox', '关注 @alice', 'completed', t + 500, t + 600, 100),
+  ], t + 10_000);
+
+  assert.deepEqual(phases.map(phase => phase.name), ['扫描粉丝', '帖子扫描并关注', '预处理', '预处理', '执行关注队列']);
+  assert.equal(phases[0].status, 'running');
+  assert.equal(phases[0].durationMs, 1000);
+  assert.equal(phases[1].startedAt, t + 3000);
+  assert.equal(phases[1].endedAt, t + 8200);
+  assert.equal(phases[1].durationMs, 2700);
+  assert.equal(phases[1].status, 'completed');
+  assert.equal(phases[2].durationMs, 100);
+  assert.equal(phases[3].durationMs, 200, '等待采集任务完成的等待步骤不计入预处理');
+  // “筛选关注/粉丝比例”虽含“粉丝”，仍属于帖子扫描，不能误判成扫描粉丝。
+  assert.equal(stepPhase({ worker: 'loop', name: '筛选关注/粉丝比例 · 帖子 3/10' }), '帖子扫描并关注');
+  assert.equal(stepPhase({ worker: 'loop', name: '抓取粉丝（200 人） · 粉丝' }), '扫描粉丝');
+  assert.equal(stepPhase({ worker: 'activity', name: '监听关注与回关事件' }), null);
+});
+
+test('console phases keep failures, unknown durations and live elapsed time', () => {
+  const t = 1000;
+  const failed = groupConsoleSteps([
+    { id: 4, sessionId: 's', worker: 'loop', name: '写入关注队列 · 帖子 2/2', status: 'failed', startedAt: t + 400, endedAt: t + 500, durationMs: 100 },
+    { id: 3, sessionId: 's', worker: 'loop', name: '整理候选用户 · 帖子 2/2', status: 'completed', startedAt: t + 300, endedAt: t + 350, durationMs: 50 },
+    { id: 2, sessionId: 's', worker: 'loop', name: '抓取帖子回复 · 帖子 1/2', status: 'completed', startedAt: t + 200, endedAt: t + 250, durationMs: 50 },
+    { id: 1, sessionId: 's', worker: 'loop', name: '搜索博主帖子 · 帖子 1/2', status: 'completed', startedAt: t, endedAt: t + 50, durationMs: 50 },
+  ], t + 500);
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].status, 'failed');
+  assert.equal(failed[0].durationMs, 250);
+
+  const live = groupConsoleSteps([
+    { id: 2, sessionId: 'f', worker: 'loop', name: '抓取帖子回复 · 帖子 1/2', status: 'running', startedAt: t + 300, endedAt: null, durationMs: null },
+    { id: 1, sessionId: 'f', worker: 'loop', name: '搜索博主帖子 · 帖子 1/2', status: 'completed', startedAt: t, endedAt: t + 50, durationMs: 50 },
+  ], t + 500);
+  assert.equal(live.length, 1);
+  assert.equal(live[0].status, 'running');
+  assert.equal(live[0].endedAt, null);
+  assert.equal(live[0].durationMs, 250, '进行中的阶段按当前时间补足已用时长');
+
+  const interrupted = groupConsoleSteps([
+    { id: 1, sessionId: 'i', worker: 'loop', name: '抓取粉丝（200 人） · 粉丝', status: 'interrupted', startedAt: t, endedAt: null, durationMs: null },
+  ], t + 500);
+  assert.equal(interrupted[0].status, 'interrupted');
+  assert.equal(interrupted[0].durationMs, null, '中断步骤不推算耗时');
 });

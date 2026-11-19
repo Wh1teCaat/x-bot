@@ -123,6 +123,9 @@ export async function scanAndExport(page, post, outputDir = '.data/reply-exports
   await page.goto(post.url, { waitUntil: 'domcontentloaded' });
   await page.bringToFront();
   const postText = await page.locator('[data-testid="tweetText"]').first().innerText({ timeout: 5000 }).catch(() => '');
+  // 帖子上的回复计数用于说明扩展实际扫到多少（X 的计数包含页面上未展开/被折叠的回复）。
+  const replyLabel = await page.locator('[data-testid="reply"]').first().getAttribute('aria-label', { timeout: 3000 }).catch(() => null);
+  const displayedReplies = Number(String(replyLabel || '').replace(/,/g, '').match(/\d+/)?.[0]) || undefined;
   try {
     helper = await context.newPage();
     await helper.goto(`chrome-extension://${EXTENSION_ID}/popup/popup.html`);
@@ -190,7 +193,17 @@ export async function scanAndExport(page, post, outputDir = '.data/reply-exports
     if (current?.state !== 'done') throw new Error(`扫描未完成：${current?.error || current?.state || '状态不可用'}；请检查页面。`);
     if (!current.count) throw new Error('扫描结束但没有捕获评论，请检查页面。');
     await actionDelay(page);
-    await panelAction(session, 'download');
+    // 扫描刚结束时面板偶尔还没渲染出下载按钮，短重试几次再判定失败。
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await panelAction(session, 'download');
+        break;
+      } catch (error) {
+        if (attempt >= 9) throw error;
+        await page.waitForTimeout(500);
+        await panelAction(session, 'open').catch(() => {});
+      }
+    }
     const downloadPromise = page.waitForEvent('download', { timeout: 30000 });
     await actionDelay(page);
     await panelAction(session, 'csv');
@@ -201,6 +214,6 @@ export async function scanAndExport(page, post, outputDir = '.data/reply-exports
     const id = new URL(post.url).pathname.split('/').pop();
     const destination = path.join(outputDir, `${id}-${Date.now()}.csv`);
     await file.saveAs(destination);
-    return { destination, count: current.count, stoppedWhy: current.stoppedWhy, text: postText.trim().slice(0, 2000) };
+    return { destination, count: current.count, stoppedWhy: current.stoppedWhy, expectedCount: displayedReplies, plan: current.plan || null, text: postText.trim().slice(0, 2000) };
   } finally { if (helper) await helper.close().catch(() => {}); }
 }

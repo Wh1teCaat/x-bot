@@ -180,12 +180,13 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
       assert.equal(url.searchParams.get("exclude"), "retweets");
       res.end(JSON.stringify({ data: [{ id: "777", text: "mirror me" }], meta: { newest_id: "777" } }));
     } else if (url.pathname === "/2/tweets/search/stream/rules" && req.method === "GET") {
-      assert.equal(req.headers.authorization, "Bearer new1");
+      assert.equal(req.headers.authorization, "Bearer app-stream-token");
       res.end(JSON.stringify({ data: [] }));
     } else if (url.pathname === "/2/tweets/search/stream/rules" && req.method === "POST") {
+      assert.equal(req.headers.authorization, "Bearer app-stream-token");
       res.end(JSON.stringify({ data: [{ id: "r1", value: "from:Alice -is:retweet" }] }));
     } else if (url.pathname === "/2/tweets/search/stream") {
-      assert.equal(req.headers.authorization, "Bearer new1");
+      assert.equal(req.headers.authorization, "Bearer app-stream-token");
       res.write('{"id":"77-9","text":"streamed"}\n');
       res.write("\n");
       res.end('{"id":"77-10","text":"streamed2"}\n');
@@ -215,6 +216,7 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
       X_TEST_API_BASE: `http://127.0.0.1:${mockPort}`,
       X_TEST_AUTH_BASE: `http://127.0.0.1:${mockPort}`,
       X_TEST_DATA_DIR: dir,
+      X_STREAM_BEARER_TOKEN: "app-stream-token",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

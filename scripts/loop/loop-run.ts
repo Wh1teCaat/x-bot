@@ -15,7 +15,7 @@ import { findBloggerPosts, getCollectorPage, scanAndExport } from '../replies/re
 import { enrichCsv, partitionFollowerCandidates, partitionReplyCandidates } from '../replies/reply-candidates.ts';
 import { readProfileCounts } from '../replies/profile-counts.ts';
 import { sortPostsNewestFirst } from '../replies/post-order.ts';
-import { qualifyByFollowerBalance, selectFollowCandidates } from '../replies/follower-filter.ts';
+import { qualifyByFollowerBalance, selectFollowCandidates, MAX_FOLLOW_RATIO } from '../replies/follower-filter.ts';
 import { makeLlm, evaluateCandidates } from './loop-llm.ts';
 import { LocalFollowClient } from '../follow/api-follow.ts';
 import { FollowOutbox } from '../../src/follow-outbox.ts';
@@ -39,6 +39,8 @@ const clonedBlogger = () => {
 let blogger = clonedBlogger() || args.blogger;
 await mkdir('.data/loop-runs', { recursive: true });
 db = new DatabaseSync('.data/loop.sqlite');
+// 控制台、flow 定时器和本进程会并发读写同一份状态库；必须等待而不是立即报 database is locked。
+db.exec('PRAGMA busy_timeout=10000');
 db.exec(`CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, status TEXT NOT NULL, stage TEXT NOT NULL, state TEXT NOT NULL, error TEXT, pid INTEGER, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS posts(id TEXT PRIMARY KEY, run_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS evaluated_users(username TEXT PRIMARY KEY, run_id TEXT NOT NULL);`);
@@ -215,7 +217,10 @@ try {
     resilience.ensureClosed('x');
     resilience.resolve(runId, 'export');
     stage = 'filter'; persist('running');
-    console.log(`帖 ${state.postIndex + 1}/${state.posts.length} 回复导出 ${state.export.count} 条；停止原因 ${state.export.stoppedWhy || '未知'}`);
+    const source = state.export.expectedCount
+      ? `（帖子显示 ${state.export.expectedCount} 条回复${state.export.plan === 'free' ? '，CommentCrate 免费版仅一级评论' : ''}）`
+      : '';
+    console.log(`帖 ${state.postIndex + 1}/${state.posts.length} 回复导出 ${state.export.count} 条${source}；停止原因 ${state.export.stoppedWhy || '未知'}`);
   }
   // 帖子全部处理完后，用 exporter24 导出博主粉丝 CSV。
   if (stage === 'followers-export') {
@@ -223,7 +228,7 @@ try {
     const checkpoint = followerCheckpoints.get(state.followAccountId, state.blogger);
     if (checkpoint.done || checkpoint.due > Date.now()) {
       stage = 'done'; persist('completed');
-      console.log(checkpoint.done ? '博主粉丝已抓取完毕。' : '粉丝下一批尚未到期，等待半小时定时调度。');
+      console.log(checkpoint.done ? '博主粉丝已抓取完毕。' : `粉丝下一批尚未到期，等待 ${Math.round(FOLLOWER_INTERVAL_MS / 60_000)} 分钟定时调度。`);
       continue;
     }
     const page = await getPage();
@@ -402,7 +407,7 @@ try {
     const hasModelPool = state.phase === 'replies' && options.evaluate && qualifiedCandidates.length > 0;
     stage = hasModelPool ? 'evaluate' : 'follow';
     persist('running');
-    console.log(`固定规则（关注和粉丝均大于 50、相差不超过 2 倍）[${state.phase === 'followers' ? '粉丝' : '回复'}] 入选 ${qualifiedDirect.length + qualifiedCandidates.length} 人，排除 ${rejected.length} 人。`);
+    console.log(`固定规则（关注和粉丝均大于 50、相差不超过 ${MAX_FOLLOW_RATIO} 倍）[${state.phase === 'followers' ? '粉丝' : '回复'}] 入选 ${qualifiedDirect.length + qualifiedCandidates.length} 人，排除 ${rejected.length} 人。`);
   }
   if (stage === 'evaluate') {
     const pool = state.qualify.qualifiedCandidates;
@@ -535,16 +540,21 @@ try {
         console.log(`模型评估未完成，已保存降级结果供人工检查：${path}；未执行关注。`);
       } catch (saveError) { console.error(`无法保存降级文件：${saveError.message}`); }
     }
-    db.exec('BEGIN IMMEDIATE');
     try {
+      db.exec('BEGIN IMMEDIATE');
       if (stage === 'evaluate' && (classification.kind === 'rate_limit' || classification.kind === 'transient')) resilience.open('llm', classification.reason);
       if (['search', 'export', 'followers-export', 'qualify', 'follow'].includes(stage) && classification.kind === 'rate_limit') resilience.open('x', classification.reason);
       resilience.failure(runId, stage, classification);
       persist('failed', `${classification.reason}（${classification.kind}）`);
       db.exec('COMMIT');
     } catch (storageError) {
-      db.exec('ROLLBACK');
+      try { db.exec('ROLLBACK'); } catch { /* BEGIN 失败时没有事务可回滚 */ }
       console.error(`无法保存失败状态：${storageError.message}`);
+      // 至少把任务标记为失败，避免状态停在 running 影响后续启动和恢复。
+      try {
+        db.prepare('UPDATE runs SET status=?, error=?, pid=NULL, updated_at=? WHERE id=?')
+          .run('failed', `状态保存失败：${storageError.message}`.slice(0, 300), new Date().toISOString(), runId);
+      } catch (markError) { console.error(`无法标记任务失败：${markError.message}`); }
     }
   }
   console.error(`任务停止：${error.message}${runId ? `；任务 ID：${runId}，阶段：${stage}` : ''}`);

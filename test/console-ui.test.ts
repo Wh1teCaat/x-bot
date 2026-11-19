@@ -12,7 +12,7 @@ test('console expands account logs, preserves expansion on refresh, filters and 
   const alice = { id: '1', username: 'alice', name: 'Alice Studio', status: 'running', stats: { following: 128, mutual: 36, queued: 72, pending: 3, uncertain: 0, manual: 0, inbound: 41 }, sessions: [
     { worker: 'loop', stage: '抓取粉丝（200 人）', status: 'running', stageStatus: 'running' },
     { worker: 'outbox', stage: '等待下一批关注', status: 'running', stageStatus: 'waiting' },
-  ], checkpoints: [{ blogger: 'fashion', offset: 400, due: now + 1800000, done: false }], nextFollowAt: now + 300000 };
+  ], checkpoints: [{ blogger: 'fashion', offset: 400, due: now + 300000, done: false }], nextFollowAt: now + 300000 };
   const bob = { ...alice, id: '2', username: 'bob', name: '<img src=x onerror="window.injected=true">', status: 'interrupted', sessions: [], stats: { ...alice.stats, following: 52, mutual: 12, queued: 0 }, checkpoints: [], nextFollowAt: null };
   const fixture = { generatedAt: now, accounts: [alice, bob], logs: [], steps: [], nextBefore: null };
   const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
@@ -45,7 +45,8 @@ test('console expands account logs, preserves expansion on refresh, filters and 
     assert.equal(route.request().headers()['x-local-request'], '1');
     const detail = /^\/api\/console\/[12]$/.test(url.pathname);
     return route.fulfill({ contentType: 'application/json', body: JSON.stringify(detail ? { ...fixture, accounts: [url.pathname === '/api/console/2' ? bob : alice],
-      steps: [{ id: 1, name: '筛选关注/粉丝比例', worker: 'loop', status: 'completed', startedAt: now - 90000, endedAt: now - 30000, durationMs: 60000 }],
+      steps: [{ id: 1, name: '筛选关注/粉丝比例 · 帖子 3/10', worker: 'loop', status: 'completed', startedAt: now - 90000, endedAt: now - 30000, durationMs: 60000 }],
+      phaseSteps: [{ id: 1, name: '帖子扫描并关注', worker: 'loop', status: 'completed', startedAt: now - 90000, endedAt: now - 30000, durationMs: 60000 }],
       logs: [{ id: url.search ? 1 : 101, level: 'info', message: url.search ? '更早的日志' : '<script>window.injected=true</script> 粉丝本批 200 人', createdAt: now, elapsedMs: 1500, stage: '抓取粉丝', worker: 'loop' }], nextBefore: url.search ? null : 101 } : fixture) });
   });
   try {
@@ -62,6 +63,7 @@ test('console expands account logs, preserves expansion on refresh, filters and 
     await page.locator('#settings-close').click();
     await page.locator('details[data-id="1"] summary').click();
     await page.waitForSelector('.logs .log');
+    assert.match(await page.locator('.table-wrap').innerText(), /帖子扫描并关注/);
     assert.match(await page.locator('.table-wrap').innerText(), /1 分 0 秒/);
     assert.equal(await page.locator('img,script[src]').count(), 0);
     assert.equal(await page.evaluate(() => (window as any).injected), undefined);

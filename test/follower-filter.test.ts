@@ -7,13 +7,16 @@ import {
   selectFollowCandidates,
 } from "../scripts/replies/follower-filter.ts";
 
-test("requires both counts above 50 and a ratio no greater than two", () => {
+test("requires both counts above 50 and a ratio no greater than three", () => {
   assert.equal(followerBalance({ followers_count: 51, following_count: 51 }).eligible, true);
   assert.equal(followerBalance({ followers_count: 100, following_count: 200 }).eligible, true);
   assert.equal(followerBalance({ followers_count: 200, following_count: 100 }).eligible, true);
+  assert.equal(followerBalance({ followers_count: 100, following_count: 300 }).eligible, true);
+  assert.equal(followerBalance({ followers_count: 300, following_count: 100 }).eligible, true);
   assert.equal(followerBalance({ followers_count: 50, following_count: 200 }).eligible, false);
   assert.equal(followerBalance({ followers_count: 51, following_count: 50 }).eligible, false);
-  assert.equal(followerBalance({ followers_count: 100, following_count: 201 }).eligible, false);
+  assert.equal(followerBalance({ followers_count: 100, following_count: 301 }).eligible, false);
+  assert.equal(followerBalance({ followers_count: 301, following_count: 100 }).eligible, false);
   assert.equal(followerBalance({}).eligible, false);
   assert.equal(followerBalance({ followers_count: "100", following_count: 100 }).eligible, false);
   assert.equal(followerBalance(null).reason, "缺少关注数或粉丝数");
@@ -23,7 +26,7 @@ test("separates qualified and rejected CSV candidates in order", () => {
   const result = qualifyByFollowerBalance([
     { username: "a", replies: ["hello"], followers: 51, following: 102 },
     { username: "b", followers: 50, following: 50 },
-    { username: "c", followers: 300, following: 100 },
+    { username: "c", followers: 301, following: 100 },
     { username: "d" },
   ]);
   assert.deepEqual(result.qualified, [
@@ -31,7 +34,7 @@ test("separates qualified and rejected CSV candidates in order", () => {
   ]);
   assert.deepEqual(result.rejected.map((item) => item.username), ["b", "c", "d"]);
   assert.match(result.rejected[0].reason!, /大于 50/);
-  assert.match(result.rejected[1].reason!, /相差超过 2 倍/);
+  assert.match(result.rejected[1].reason!, /相差超过 3 倍/);
   assert.match(result.rejected[2].reason!, /缺少关注数或粉丝数/);
 });
 

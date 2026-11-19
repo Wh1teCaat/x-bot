@@ -2,9 +2,11 @@ import '../../src/runtime-config.ts';
 /** exporter24 的分页游标留在扩展历史中，本地只提交已筛选入队的偏移。 */
 import type { Page } from 'playwright';
 import type { DatabaseSync } from 'node:sqlite';
+import { ensureExporter24Auth, readExporter24Gate } from './exporter24.ts';
 
 export const FOLLOWER_BATCH_SIZE = 200;
-export const FOLLOWER_INTERVAL_MS = 30 * 60 * 1000;
+/** 导出节奏；关注速率由 Outbox worker 单独限制，这里只控制抓取批次间隔。 */
+export const FOLLOWER_INTERVAL_MS = 5 * 60 * 1000;
 export type FollowerCheckpoint = { taskId: string | null; offset: number; due: number; done: boolean };
 export class FollowerCheckpoints {
   private db: DatabaseSync;
@@ -46,11 +48,11 @@ export async function attachFollowerStore(page: Page) {
       queue.push(item.child, item.sibling);
     }
     return false;
-  }, undefined, { timeout: 15000 });
+  }, undefined, { timeout: 30000 });
 }
 
 /** 只在完整分页保存后暂停，多出的本页记录保留在扩展中，下批先消费。 */
-export async function readFollowerBatch(page: Page, username: string, checkpoint: FollowerCheckpoint,
+async function readFollowerBatchOnce(page: Page, username: string, checkpoint: FollowerCheckpoint,
   saveTask: (id: string) => void, guard: () => void | Promise<void>) {
   if (checkpoint.taskId) {
     const url = new URL(page.url());
@@ -63,7 +65,7 @@ export async function readFollowerBatch(page: Page, username: string, checkpoint
   }
   await attachFollowerStore(page);
   // 新任务仅创建，不自动点击 Start；先装好分页边界暂停钩子。
-  await page.waitForFunction(() => Boolean((globalThis as any).__followerStore.task), undefined, { timeout: 15000 });
+  await page.waitForFunction(() => Boolean((globalThis as any).__followerStore.task), undefined, { timeout: 30000 });
   const taskId = await page.evaluate(({ username, expected }) => {
     const s = (globalThis as any).__followerStore;
     if (s.task.type !== 'followers' || s.task.src?.username?.toLowerCase() !== username.toLowerCase()) throw new Error('exporter24 粉丝任务身份不匹配');
@@ -107,4 +109,34 @@ export async function readFollowerBatch(page: Page, username: string, checkpoint
     });
     return { candidates, nextOffset: offset + list.length, done: !s.profileList.hasMore && offset + list.length >= s.fetchedCount };
   }, { offset: checkpoint.offset, size: FOLLOWER_BATCH_SIZE });
+}
+
+/**
+ * 抓取一批粉丝；遇到 5 星评价/登录门槛时用 X_EXPORT_TOKEN 登录并重试一次。
+ * 登录会重新加载扩展页，任务从已保存的历史断点（taskId）继续，本地偏移不变。
+ */
+export async function readFollowerBatch(page: Page, username: string, checkpoint: FollowerCheckpoint,
+  saveTask: (id: string) => void, guard: () => void | Promise<void>) {
+  await ensureExporter24Auth(page, guard);
+  let loggedIn = false, retried = false;
+  for (;;) {
+    try {
+      return await readFollowerBatchOnce(page, username, checkpoint, saveTask, guard);
+    } catch (error) {
+      if (await readExporter24Gate(page)) {
+        if (loggedIn) throw error;
+        loggedIn = true;
+        await ensureExporter24Auth(page, guard);
+        continue;
+      }
+      // 扩展页偶发挂载慢（浏览器刚跑完 10 条帖子扫描时尤其明显），重载任务页再试一次。
+      if (!retried && /waitForFunction|Timeout/i.test(String(error?.message || error))) {
+        retried = true;
+        console.log('exporter24 任务页未在时限内就绪，重新加载后重试一次。');
+        await page.waitForTimeout(2000);
+        continue;
+      }
+      throw error;
+    }
+  }
 }

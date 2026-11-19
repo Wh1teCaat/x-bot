@@ -8,7 +8,7 @@ test("builds a rule that tracks only the user's non-retweets", () => {
 });
 
 test("parses NDJSON across chunk boundaries and extracts media keys", () => {
-  const tweets: { id: string; text: string; mediaKeys: string[] }[] = [];
+  const tweets: { id: string; text: string; mediaKeys: string[]; authorId: string; authorUsername: string }[] = [];
   const parser = createStreamParser((t) => tweets.push(t));
 
   parser('\n');
@@ -17,10 +17,12 @@ test("parses NDJSON across chunk boundaries and extracts media keys", () => {
   parser('{"id":"3","text":"partial'); // 半行，跨 chunk
   parser('"}\n');
   parser('{"id":"bad","text":"x"}\n'); // id 非数字，忽略
+  parser('{"data":{"id":"4","text":"by author","author_id":"9"},"includes":{"users":[{"id":"9","username":"Alice"}]}}\n');
 
   assert.deepEqual(tweets, [
-    { id: "1", text: "hello", mediaKeys: [] },
-    { id: "2", text: "wrapped", mediaKeys: ["k1"] },
-    { id: "3", text: "partial", mediaKeys: [] },
+    { id: "1", text: "hello", mediaKeys: [], authorId: "", authorUsername: "" },
+    { id: "2", text: "wrapped", mediaKeys: ["k1"], authorId: "", authorUsername: "" },
+    { id: "3", text: "partial", mediaKeys: [], authorId: "", authorUsername: "" },
+    { id: "4", text: "by author", mediaKeys: [], authorId: "9", authorUsername: "Alice" },
   ]);
 });

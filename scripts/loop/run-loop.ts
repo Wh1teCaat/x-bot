@@ -17,6 +17,7 @@ try { args = parseLoopArguments(process.argv.slice(2)); }
 catch (error) { console.error(`参数错误：${error.message}`); process.exit(1); }
 await mkdir('.data/loop-runs', { recursive: true });
 const db = new DatabaseSync('.data/loop.sqlite');
+db.exec('PRAGMA busy_timeout=10000');
 db.exec('CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, status TEXT NOT NULL, stage TEXT NOT NULL, state TEXT NOT NULL, error TEXT, pid INTEGER, updated_at TEXT NOT NULL)');
 new ResilienceStore(db);
 const runId = args.resumeId || randomUUID();

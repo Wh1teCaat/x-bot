@@ -13,27 +13,54 @@ function sessionStatus(session: any, now: number, alive: (pid: number) => boolea
   if (session.ended_at != null) return session.status;
   return now - session.updated_at <= 45000 && alive(session.pid) ? 'running' : 'interrupted';
 }
-/** 将同一采集进程中连续的细步骤合并，耗时为记录到的各步骤耗时之和。 */
-export function groupConsoleSteps(steps: any[]) {
+/** 采集流程中属于“帖子扫描并关注”的阶段；名称来自 stageLabels。 */
+const postStages = new Set(['搜索博主帖子', '抓取帖子回复', '整理候选用户', '筛选关注/粉丝比例', '模型评估', '写入关注队列']);
+/** clone 各细步骤都归入“预处理”。 */
+const cloneStages = new Set(['复制目标账号资料', '复制头像、显示名称和简介', '核对资料保存结果', '保存并核对用户名']);
+
+/** 把单个细步骤归入粗粒度阶段；监听、限流等待等不属于展示阶段时返回 null。 */
+export function stepPhase(step: { worker?: string; name?: string }): string | null {
+  const stage = String(step.name ?? '').split(' · ')[0].trim();
+  if (step.worker === 'loop') {
+    // “筛选关注/粉丝比例”含“粉丝”但不是抓粉丝，必须优先按完整阶段名判断。
+    if (postStages.has(stage)) return '帖子扫描并关注';
+    if (stage === '抓取粉丝（200 人）') return '扫描粉丝';
+    if (stage === '准备采集任务') return '预处理';
+    return null;
+  }
+  if (step.worker === 'login') return stage === '检查登录与浏览器' ? '预处理' : null;
+  if (step.worker === 'clone') return cloneStages.has(stage) ? '预处理' : null;
+  if (step.worker === 'outbox') return stage.startsWith('关注 @') ? '执行关注队列' : null;
+  return null;
+}
+
+/** 读取步骤耗时；运行中的步骤按当前时间补足已用时长。 */
+function stepDuration(step: any, now: number): number | null {
+  if (step.durationMs != null) return step.durationMs;
+  if (step.endedAt == null && step.status === 'running') return Math.max(0, now - step.startedAt);
+  return null;
+}
+
+/** 将同一进程中连续的细步骤合并为粗粒度阶段，耗时为各步骤耗时之和。 */
+export function groupConsoleSteps(steps: any[], now = Date.now()) {
   const grouped: any[] = [], lastBySession = new Map<string, any>();
-  for (const step of [...steps].reverse()) {
-    let name: string | null = null;
-    if (step.worker === 'loop') {
-      if (/准备采集任务/.test(step.name)) name = '预处理';
-      else if (/粉丝/.test(step.name)) name = '扫描粉丝';
-      else if (/帖子|搜索博主/.test(step.name)) name = '帖子扫描并加入关注队列';
-    } else if (step.worker === 'clone' || step.worker === 'login') name = '预处理';
-    if (!name) { lastBySession.delete(step.sessionId); continue; }
+  for (const step of [...steps].sort((a, b) => a.startedAt - b.startedAt || a.id - b.id)) {
+    const name = stepPhase(step);
+    if (!name) continue;
     let group = lastBySession.get(step.sessionId);
     if (!group || group.name !== name) {
-      group = { ...step, name }; grouped.push(group); lastBySession.set(step.sessionId, group);
-    } else {
-      group.endedAt = step.endedAt;
-      group.durationMs = group.durationMs == null || step.durationMs == null ? null : group.durationMs + step.durationMs;
-      if (['failed', 'interrupted', 'incomplete'].includes(step.status) || !['failed', 'interrupted', 'incomplete'].includes(group.status)) group.status = step.status;
+      group = { ...step, name, durationMs: stepDuration(step, now) };
+      grouped.push(group); lastBySession.set(step.sessionId, group);
+      continue;
     }
+    const duration = stepDuration(step, now);
+    group.endedAt = step.endedAt ?? null;
+    group.durationMs = group.durationMs == null || duration == null ? null : group.durationMs + duration;
+    if (step.status === 'failed') group.status = 'failed';
+    else if (step.status === 'interrupted' || step.status === 'incomplete') { if (group.status !== 'failed') group.status = step.status; }
+    else if (!['failed', 'interrupted', 'incomplete'].includes(group.status)) group.status = step.status;
   }
-  return grouped.reverse().slice(0, 80);
+  return grouped.sort((a, b) => b.startedAt - a.startedAt).slice(0, 80);
 }
 export function readConsole(dataDir: string, accounts: Account[], options: { accountId?: string; before?: number; now?: number; alive?: (pid: number) => boolean } = {}) {
   const now = options.now ?? Date.now(), alive = options.alive ?? processAlive;
@@ -89,6 +116,6 @@ export function readConsole(dataDir: string, accounts: Account[], options: { acc
             endedAt: row.ended_at, durationMs: interrupted ? null : row.duration_ms ?? Math.max(0, now - row.started_at) };
         });
     }
-    return { generatedAt: now, accounts: result, logs, steps, phaseSteps: groupConsoleSteps(steps), nextBefore: logs.length === 100 ? logs[logs.length - 1].id : null };
+    return { generatedAt: now, accounts: result, logs, steps, phaseSteps: groupConsoleSteps(steps, now), nextBefore: logs.length === 100 ? logs[logs.length - 1].id : null };
   } finally { for (const db of dbs) db.close(); }
 }

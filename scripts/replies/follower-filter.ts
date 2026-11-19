@@ -1,6 +1,6 @@
-/** 固定规则：关注与粉丝都大于 50，且两者相差不超过两倍。 */
+/** 固定规则：关注与粉丝都大于 50，且两者相差不超过三倍。 */
 export const MIN_FOLLOW_COUNT = 50;
-export const MAX_FOLLOW_RATIO = 2;
+export const MAX_FOLLOW_RATIO = 3;
 
 type Metrics = {
   followers_count?: unknown;

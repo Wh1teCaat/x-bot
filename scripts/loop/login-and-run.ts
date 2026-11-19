@@ -168,6 +168,12 @@ try {
       throw new Error(`CommentCrate 未就绪：${error.message}${hint}`);
     } finally { await helper.close().catch(() => {}); }
     store.upsert({ uuid: accountId, username, chromeReady: true });
+  } else {
+    // 就绪账号不再走登录检查；先把初始 about:blank 打开成 X 主页，
+    // 避免任务因限流冷却或立即失败时，窗口一直停在空白页。
+    const blank = context.pages().find(page => page.url() === 'about:blank');
+    if (blank) await blank.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 })
+      .catch(error => console.warn(`浏览器未能打开 X 主页：${error.message}`));
   }
   if (stopping) throw new Error('已取消');
   if (checkOnly) {

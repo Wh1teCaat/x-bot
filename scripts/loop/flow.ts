@@ -6,7 +6,7 @@ import { monitorProcess } from '../../src/runtime-monitor.ts';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { FollowerCheckpoints } from '../browser/follower-batch.ts';
+import { FollowerCheckpoints, FOLLOWER_INTERVAL_MS } from '../browser/follower-batch.ts';
 import { AccountStore } from '../../src/account-store.ts';
 import { MirrorStore } from '../../src/mirror-store.ts';
 import { resolveFlowTarget } from './flow-target.ts';
@@ -183,7 +183,7 @@ if (loopCode !== 0) {
   await stop('failed');
   process.exit(loopCode);
 }
-// --no-mirror 仍保留粉丝半小时调度和关注 Outbox。
+// --no-mirror 仍保留粉丝定时调度和关注 Outbox。
 if (mirror === 'once') {
   if (mirrorChild) await new Promise<void>((resolveExit) => mirrorChild!.once('exit', () => resolveExit()));
   await stop(loopCode ? 'failed' : 'completed');
@@ -203,6 +203,7 @@ let followerScheduleBlocked = loopCode !== 0;
 const processDueFollowerBatch = async (): Promise<boolean> => {
   if (followerScheduleBlocked || postUrl) return false;
   const db = new DatabaseSync(resolve(dataDir, 'loop.sqlite'));
+  db.exec('PRAGMA busy_timeout=10000');
   let checkpoint;
   try {
     checkpoint = new FollowerCheckpoints(db).get(accountId, resolvedTarget);
@@ -215,7 +216,7 @@ const processDueFollowerBatch = async (): Promise<boolean> => {
   } finally { db.close(); }
   if (checkpoint.done || checkpoint.due > Date.now()) return false;
   telemetry.stage('执行粉丝定时续抓');
-  console.log('开始半小时粉丝续抓：本批最多 200 人。');
+  console.log(`开始粉丝定时续抓（每 ${Math.round(FOLLOWER_INTERVAL_MS / 60_000)} 分钟一批）：本批最多 200 人。`);
   replyChild = spawn(process.execPath, [...loopArgs(resolvedTarget).filter(arg => arg !== '--followers-only'), '--followers-only'], { cwd: process.cwd(), stdio: 'inherit', env: loginEnv });
   const code = await new Promise<number>(resolveCode => {
     replyChild!.once('error', () => resolveCode(1));

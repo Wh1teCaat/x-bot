@@ -35,6 +35,11 @@ const clientId = process.env.X_CLIENT_ID;
 const clientSecret = process.env.X_CLIENT_SECRET;
 if (!clientId) throw new Error("Set X_CLIENT_ID in .env");
 
+// filtered stream 只接受 OAuth 2.0 Application-Only；用账号的 User Context token 会被 X 拒绝（403）。
+// 未单独配置时复用 Activity 的 app-only token；两者都没有时由调用方回退 REST 轮询。
+const streamBearerToken =
+  process.env.X_STREAM_BEARER_TOKEN || process.env.X_ACTIVITY_APP_BEARER_TOKEN;
+
 // The override is restricted to test processes; never point real credentials at a mock.
 const apiBase =
   (process.env.NODE_ENV === "test" && process.env.X_TEST_API_BASE) ||
@@ -148,36 +153,43 @@ async function readJsonBody(req: IncomingMessage, maxBytes = 4096): Promise<any>
 }
 
 /** 确保过滤规则存在；规则按应用共享，重复添加由 X 返回错误，故先查询。 */
-async function ensureFilterRule(account: Account, value: string) {
-  const list = await xRequest(`/2/tweets/search/stream/rules`, { headers: { Authorization: `Bearer ${account.accessToken}` } });
+async function ensureFilterRule(token: string, value: string) {
+  const list = await xRequest(`/2/tweets/search/stream/rules`, { headers: { Authorization: `Bearer ${token}` } });
   const exists = Array.isArray(list.data) && list.data.some((rule: { value?: string }) => rule.value === value);
   if (!exists) {
     await xRequest(`/2/tweets/search/stream/rules`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${account.accessToken}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify({ add: [{ value }] }),
     });
   }
 }
 
 /** 打开 X filtered stream 并把推文流透传给客户端；断线或出错时结束响应。 */
-async function proxyFilteredStream(res: ServerResponse, account: Account, username: string) {
-  await ensureFilterRule(account, `from:${username} -is:retweet`);
+async function proxyFilteredStream(res: ServerResponse, username: string) {
+  if (!streamBearerToken)
+    throw new HttpError(503, "未配置 filtered stream 的 App-Only token（X_STREAM_BEARER_TOKEN 或 X_ACTIVITY_APP_BEARER_TOKEN），已回退 REST 轮询。");
+  await ensureFilterRule(streamBearerToken, `from:${username} -is:retweet`);
   const controller = new AbortController();
   const onClose = () => controller.abort();
   res.once("close", onClose);
   try {
     const streamParams = new URLSearchParams({
-      "tweet.fields": "attachments,text",
-      expansions: "attachments.media_keys",
+      "tweet.fields": "attachments,text,author_id",
+      expansions: "attachments.media_keys,author_id",
+      "user.fields": "username",
       "media.fields": "type,url,preview_image_url",
     });
     const upstream = await fetch(`${apiBase}/2/tweets/search/stream?${streamParams}`, {
-      headers: { Authorization: `Bearer ${account.accessToken}` },
+      headers: { Authorization: `Bearer ${streamBearerToken}` },
       signal: controller.signal,
     });
     if (!upstream.ok || !upstream.body) {
-      throw new HttpError(upstream.status, `无法连接 X 推文流（HTTP ${upstream.status}），请确认 API 套餐支持 filtered stream。`);
+      const text = await upstream.text().catch(() => "");
+      let detail = "";
+      try { const payload = JSON.parse(text); detail = String(payload.detail || payload.title || ""); }
+      catch { detail = text; }
+      throw new HttpError(upstream.status, `无法连接 X 推文流（HTTP ${upstream.status}）${detail ? `：${detail.slice(0, 300)}` : "，请确认 App-Only token 与 API 套餐支持 filtered stream。"}`);
     }
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
     const reader = upstream.body.getReader();
@@ -894,7 +906,7 @@ const server = createServer(async (req, res) => {
       if (!account.scope?.split(/\s+/).includes("tweet.read")) throw new HttpError(403, "账号缺少读取推文权限，请重新授权。");
       const username = url.searchParams.get("username");
       if (!username || !/^[A-Za-z0-9_]{1,15}$/.test(username)) throw new HttpError(400, "username 无效");
-      await proxyFilteredStream(res, account, username);
+      await proxyFilteredStream(res, username);
       return;
     }
 

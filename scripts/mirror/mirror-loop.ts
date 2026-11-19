@@ -220,8 +220,16 @@ try {
         return false;
       }
       if (!response.ok || !response.body) {
+        const detail = await response.text().catch(() => '');
+        const reason = detail ? `：${detail.replace(/\s+/g, ' ').slice(0, 300)}` : '';
+        // 订阅/规则刚变更时 X 会返回 503 provisioning，等它生效后继续用流，不要立刻降级。
+        if (response.status === 503 && /provision|subscription/i.test(detail)) {
+          console.error(`filtered stream 正在生效（HTTP 503）${reason}，60 秒后重试。`);
+          await sleep(60_000);
+          continue;
+        }
         if ([400, 401, 403, 404].includes(response.status)) {
-          console.error(`filtered stream 不可用（HTTP ${response.status}），回退到 REST 轮询。`);
+          console.error(`filtered stream 不可用（HTTP ${response.status}）${reason}，回退到 REST 轮询。`);
           return false;
         }
         failures++;
@@ -244,6 +252,8 @@ try {
           batch.sort(compareTweetIds);
           for (const raw of batch) {
             if (stopping) break;
+            // 同一 app token 的规则是应用级共享的，多个 mirror 会收到所有目标的推文；只处理当前目标作者。
+            if (raw.authorUsername && raw.authorUsername.toLowerCase() !== targetUsername.toLowerCase()) continue;
             const images = raw.mediaKeys.length ? await client.fetchMedia(raw.id) : [];
             await mirrorOne({ id: raw.id, text: raw.text, images });
           }
