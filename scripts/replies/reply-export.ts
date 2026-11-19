@@ -16,7 +16,11 @@ export async function getCollectorPage(context) {
     if (await page.evaluate(key => sessionStorage.getItem(key) === '1', TAB_MARKER).catch(() => false)) return page;
   }
   // The user asked to reuse an existing X tab. Never close unrelated tabs.
-  return xPages.at(-1) || await context.newPage();
+  const existing = xPages.at(-1);
+  if (existing) return existing;
+  const page = await context.newPage();
+  await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  return page;
 }
 
 /** 解析页面显示的回复数量及常见单位。 */

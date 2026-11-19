@@ -21,11 +21,14 @@ test('reuses a marked X tab, then an existing X tab, before opening a new tab', 
   const marked = tab('https://x.com/search?q=first', true);
   const other = tab('https://x.com/home');
   let opened = 0;
-  const context = pages => ({ pages: () => pages, newPage: async () => { opened++; return 'new'; } });
+  const navigated = [];
+  const newTab = { goto: async url => { navigated.push(url); } };
+  const context = pages => ({ pages: () => pages, newPage: async () => { opened++; return newTab; } });
   assert.equal(await getCollectorPage(context([marked, other])), marked);
   assert.equal(await getCollectorPage(context([other])), other);
-  assert.equal(await getCollectorPage(context([tab('https://example.com/')])), 'new');
+  assert.equal(await getCollectorPage(context([tab('https://example.com/')])), newTab);
   assert.equal(opened, 1);
+  assert.deepEqual(navigated, ['https://x.com/home']);
 });
 
 test('handles CommentCrate onboarding and an already open panel', { skip: process.env.XBOT_BROWSER_TEST !== '1' }, async () => {
