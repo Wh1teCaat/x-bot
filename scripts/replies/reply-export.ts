@@ -8,7 +8,7 @@ declare const chrome: any;
 
 const TAB_MARKER = 'x-bot-reply-collector';
 
-/** 优先复用带采集标记或已有的 X 标签页。 */
+/** 优先复用 X 标签页，其次使用启动时的空白标签页。 */
 export async function getCollectorPage(context) {
   const pages = context.pages();
   const xPages = pages.filter(page => /^https:\/\/x\.com(?:\/|$)/.test(page.url()));
@@ -18,7 +18,7 @@ export async function getCollectorPage(context) {
   // The user asked to reuse an existing X tab. Never close unrelated tabs.
   const existing = xPages.at(-1);
   if (existing) return existing;
-  const page = await context.newPage();
+  const page = pages.find(page => page.url() === 'about:blank') || await context.newPage();
   await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
   return page;
 }

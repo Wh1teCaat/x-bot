@@ -19,7 +19,7 @@ if (!useAppToken && (!existsSync('.data/accounts.sqlite') || !existsSync('.data/
 
 const telemetry = monitorProcess(accountId, 'activity');
 telemetry.stage('准备关注事件监听');
-const streamState = (state: string) => telemetry.stage(state, 'waiting');
+const streamState = (state: string) => telemetry.stage(state, state === '监听关注与回关事件' ? 'running' : 'waiting');
 const controller = new AbortController();
 process.once('SIGINT', () => controller.abort());
 process.once('SIGTERM', () => controller.abort());

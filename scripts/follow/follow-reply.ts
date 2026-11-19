@@ -107,7 +107,7 @@ async function runReal(accountId: string): Promise<void> {
           else if (!llmWarningLogged) { llmWarningLogged = true; console.log('未配置 LLM，跳过回关私信回复。'); }
         }
       } finally { store.close(); }
-    }, state => telemetry.stage(state, 'waiting'));
+    }, state => telemetry.stage(state, state === '监听关注与回关事件' ? 'running' : 'waiting'));
   });
 }
 

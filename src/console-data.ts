@@ -13,6 +13,28 @@ function sessionStatus(session: any, now: number, alive: (pid: number) => boolea
   if (session.ended_at != null) return session.status;
   return now - session.updated_at <= 45000 && alive(session.pid) ? 'running' : 'interrupted';
 }
+/** 将同一采集进程中连续的细步骤合并，耗时为记录到的各步骤耗时之和。 */
+export function groupConsoleSteps(steps: any[]) {
+  const grouped: any[] = [], lastBySession = new Map<string, any>();
+  for (const step of [...steps].reverse()) {
+    let name: string | null = null;
+    if (step.worker === 'loop') {
+      if (/准备采集任务/.test(step.name)) name = '预处理';
+      else if (/粉丝/.test(step.name)) name = '扫描粉丝';
+      else if (/帖子|搜索博主/.test(step.name)) name = '帖子扫描并加入关注队列';
+    } else if (step.worker === 'clone' || step.worker === 'login') name = '预处理';
+    if (!name) { lastBySession.delete(step.sessionId); continue; }
+    let group = lastBySession.get(step.sessionId);
+    if (!group || group.name !== name) {
+      group = { ...step, name }; grouped.push(group); lastBySession.set(step.sessionId, group);
+    } else {
+      group.endedAt = step.endedAt;
+      group.durationMs = group.durationMs == null || step.durationMs == null ? null : group.durationMs + step.durationMs;
+      if (['failed', 'interrupted', 'incomplete'].includes(step.status) || !['failed', 'interrupted', 'incomplete'].includes(group.status)) group.status = step.status;
+    }
+  }
+  return grouped.reverse().slice(0, 80);
+}
 export function readConsole(dataDir: string, accounts: Account[], options: { accountId?: string; before?: number; now?: number; alive?: (pid: number) => boolean } = {}) {
   const now = options.now ?? Date.now(), alive = options.alive ?? processAlive;
   const dbs: DatabaseSync[] = [];
@@ -61,12 +83,12 @@ export function readConsole(dataDir: string, accounts: Account[], options: { acc
         WHERE l.account=? AND l.id<? ORDER BY l.id DESC LIMIT 100`).all(options.accountId, options.before || Number.MAX_SAFE_INTEGER)
         .map(row => ({ ...row, message: safeLog(String(row.message)) }));
       steps = runtime!.prepare(`SELECT p.*,s.worker,s.pid,s.updated_at heartbeat,s.ended_at session_ended FROM runtime_steps p JOIN runtime_sessions s ON p.session_id=s.id
-        WHERE p.account=? ORDER BY p.id DESC LIMIT 80`).all(options.accountId).map((row: any) => {
+        WHERE p.account=? ORDER BY p.id DESC LIMIT 2000`).all(options.accountId).map((row: any) => {
           const interrupted = row.ended_at == null && (row.session_ended != null || now - row.heartbeat > 45000 || !alive(row.pid));
-          return { id: row.id, name: row.name, worker: row.worker, status: interrupted ? 'interrupted' : row.status, startedAt: row.started_at,
+          return { id: row.id, sessionId: row.session_id, name: row.name, worker: row.worker, status: interrupted ? 'interrupted' : row.status, startedAt: row.started_at,
             endedAt: row.ended_at, durationMs: interrupted ? null : row.duration_ms ?? Math.max(0, now - row.started_at) };
         });
     }
-    return { generatedAt: now, accounts: result, logs, steps, nextBefore: logs.length === 100 ? logs[logs.length - 1].id : null };
+    return { generatedAt: now, accounts: result, logs, steps, phaseSteps: groupConsoleSteps(steps), nextBefore: logs.length === 100 ? logs[logs.length - 1].id : null };
   } finally { for (const db of dbs) db.close(); }
 }
