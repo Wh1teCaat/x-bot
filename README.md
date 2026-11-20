@@ -9,9 +9,13 @@
 3. 在另一个终端运行 `npm run loop -- <账号数字ID>`（可选追加 `--target <博主用户名>`、`--language ar`、`--evaluate`、`--loop-only`）。这是长时流程：必要时 clone → 启动 mirror 子进程监听 → 初始帖子/粉丝 loop → 父进程长时处理延迟回复任务。只想测试单轮 loop 时加 `--loop-only`。程序使用该账号独立资料打开正式版 Google Chrome；手动登录相同的 X 账号，安装 CommentCrate 并授予 X 访问权限。若希望用 exporter24 补充关注/粉丝数，必须在这个账号自己的浏览器资料中安装（只在默认 Chrome 安装不会生效）；未安装时会自动回退到主页读取。
 4. 关闭登录窗口；若关闭后终端未继续，按 Enter。程序会用 Playwright 重新打开同一份资料，检查账号和插件，然后自动执行一轮，进度直接显示在当前终端。下一次运行同一账号会复用这些资料；已登录并安装插件的账号会自动跳过登录与安装步骤，直接进入后续自动化流程。
 
-每个账号使用独立的 `.data/browser-profiles/<账号数字ID>`；不同账号需要分别授权和登录。正式版 Chrome 不支持 `--load-extension`，可通过下面的“插件模板”为每个账号资料复制一份已安装的 CommentCrate / exporter24，或手动安装。**单轮任务会实际发送关注请求。**
+每个账号使用独立的 `.data/browser-profiles/<账号数字ID>`；不同账号需要分别授权和登录。启动时会从本机已安装插件的 Chrome 资料复制插件配置，或手动安装。**单轮任务会实际发送关注请求。**
 
-### 插件模板：每个浏览器实例复制一份
+### 复制 Chrome 插件
+
+启动账号时，默认读取本机 `~/Library/Application Support/Google/Chrome` 的 `Default` 资料，要求源资料已安装并启用 CommentCrate。新账号直接复制插件资料；已有账号缺少插件注册时，复制源 Chrome 的 `Secure Preferences` 和插件文件，保留账号 Cookie、历史及扩展存储，并将被替换的配置备份在账号资料同级的 `*.extensions-backup-*` 目录。`Secure Preferences` 包含受保护的设置及所有插件注册，修复后其他插件可能需要重新检查。请先关闭该账号的 Chrome；插件授权及登录状态仍需实际检查。`X_PROFILE_TEMPLATE_SOURCE` 可指定其他 Chrome 用户数据根目录（包含 `Local State` 和 `Default`）。
+
+如果源 Chrome 不可用，仍可使用预先生成的插件模板作为新资料的后备来源：
 
 先从一个已经安装好 CommentCrate / exporter24 的 Chrome 资料生成模板：
 
@@ -32,9 +36,9 @@ npm run profile:template
 .data/profile-template
 ```
 
-新账号首次运行 `npm run loop` 时，如果 `.data/browser-profiles/<账号ID>` 不存在，会自动复制模板，然后注入账号 cookie。这样每个账号实例都有自己的一份插件目录和 `Local Extension Settings`，互不影响。
+新账号首次运行时，如果无法从源 Chrome 复制，则尝试复制此模板，然后注入账号 cookie。
 
-已存在的账号资料不会自动覆盖。如果账号资料缺少 CommentCrate，先停止账号任务并关闭该账号的 Chrome，然后运行 `npm run profile:repair -- <账号数字ID>`。命令将旧资料改名备份，从模板重建主账号资料；旧资料的登录状态不会复制到新资料，需使用已导入的 cookie 或重新登录。之后用 `npm run loop -- <账号数字ID> --check-only` 检查插件与登录。已存在的粉丝专用资料不会被此命令替换。
+也可以手动运行 `npm run profile:repair -- <账号数字ID>`，从模板重建主账号资料并备份旧资料；该命令需要重新登录，且不会替换粉丝专用资料。
 
 可用环境变量覆盖：
 

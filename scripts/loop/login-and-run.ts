@@ -12,7 +12,7 @@ import { createInterface } from 'node:readline';
 import { accountReadiness } from '../account/account-readiness.ts';
 import { cookieFileCandidates, loadCookieJar, type CookieJar } from '../browser/cookies.ts';
 import { fingerprintFor } from '../browser/fingerprint.ts';
-import { ensureProfileFromTemplate, PROFILE_TEMPLATE_DIR } from '../browser/profile-template.ts';
+import { ensureProfileFromChrome, ensureProfileFromTemplate, PROFILE_TEMPLATE_DIR } from '../browser/profile-template.ts';
 import { AccountStore } from '../../src/account-store.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { FollowerCheckpoints } from '../browser/follower-batch.ts';
@@ -98,15 +98,16 @@ try {
   await access(executable, constants.X_OK);
   await mkdir(root, { recursive: true, mode: 0o700 });
   await acquireLock();
-  const profileCopied = await ensureProfileFromTemplate(profile, process.env.X_PROFILE_TEMPLATE || PROFILE_TEMPLATE_DIR);
-  if (profileCopied) console.log('已从插件模板复制账号浏览器资料（含已安装的 CommentCrate / exporter24）。');
-  else if (!followerLoop && !existsSync(join(profile, 'Default', 'Extensions', 'haaahmifcccbgagmopbhbkgabgblmcbl')) && existsSync(join(process.env.X_PROFILE_TEMPLATE || PROFILE_TEMPLATE_DIR, 'Default', 'Extensions', 'haaahmifcccbgagmopbhbkgabgblmcbl')))
-    console.warn(`账号资料缺少 CommentCrate；已有资料不会被覆盖。关闭账号浏览器后可运行 npm run profile:repair -- ${accountId} 备份并从模板重建。`);
+  const chromeCopy = await ensureProfileFromChrome(profile);
+  const templateCopied = chromeCopy ? false : await ensureProfileFromTemplate(profile, process.env.X_PROFILE_TEMPLATE || PROFILE_TEMPLATE_DIR);
+  const profileCopied = chromeCopy === 'created' || templateCopied;
+  if (chromeCopy) console.log('已从本机 Chrome 复制插件配置和文件，请检查插件授权。');
+  else if (templateCopied) console.log('已从插件模板复制账号浏览器资料，请检查插件授权。');
   await mkdir(profile, { recursive: true, mode: 0o700 });
   store = new AccountStore(resolve('.data'));
   const fp = fingerprintFor(accountId);
   const chromeReady = !profileCopied && (store.getByUuid(accountId)?.chromeReady ?? false);
-  const needsCheck = followerLoop || !chromeReady || checkOnly;
+  const needsCheck = followerLoop || !chromeReady || checkOnly || chromeCopy === 'repaired';
   // cookie 文件只用于首次登录：已标记就绪的账号直接复用资料中的登录态，避免旧 cookie 覆盖有效会话。
   let cookiePath: string | null = null;
   let cookieJar: CookieJar | null = null;

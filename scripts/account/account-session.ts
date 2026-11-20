@@ -11,7 +11,7 @@ import { accountReadiness } from './account-readiness.ts';
 import { AccountPoolSlot } from './account-pool.ts';
 import { accountSocketPath } from './account-socket.ts';
 import { fingerprintFor } from '../browser/fingerprint.ts';
-import { ensureProfileFromTemplate, PROFILE_TEMPLATE_DIR } from '../browser/profile-template.ts';
+import { ensureProfileFromChrome, ensureProfileFromTemplate, PROFILE_TEMPLATE_DIR } from '../browser/profile-template.ts';
 import { AccountStore } from '../../src/account-store.ts';
 
 const [accountId, username] = process.argv.slice(2);
@@ -128,8 +128,10 @@ try {
   await acquireLock();
   await unlink(socketPath).catch(error => { if (error.code !== 'ENOENT') throw error; });
   const port = await allocatePort();
-  const copied = await ensureProfileFromTemplate(profile, process.env.X_PROFILE_TEMPLATE || PROFILE_TEMPLATE_DIR);
-  if (copied) console.log('已从插件模板复制账号浏览器资料。');
+  const chromeCopy = await ensureProfileFromChrome(profile);
+  const copied = chromeCopy ? false : await ensureProfileFromTemplate(profile, process.env.X_PROFILE_TEMPLATE || PROFILE_TEMPLATE_DIR);
+  if (chromeCopy) console.log('已从本机 Chrome 复制插件配置和文件，请检查插件授权。');
+  else if (copied) console.log('已从插件模板复制账号浏览器资料。');
   await mkdir(profile, { recursive: true, mode: 0o700 });
   // 不使用 Playwright 启动：直接执行 Chrome 命令，用户自行完成登录。
   const executable = process.env.X_BROWSER_EXECUTABLE || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -140,6 +142,7 @@ try {
   await new Promise<void>((resolve, reject) => { browserProcess.once('spawn', resolve); browserProcess.once('error', reject); });
   browserProcess.once('exit', () => shutdown());
   store = new AccountStore(resolve('.data'));
+  if (chromeCopy === 'repaired') store.upsert({ uuid: accountId, username, chromeReady: false });
   pool = new AccountPoolSlot({
     check: async () => {
       if (store.getByUuid(accountId)?.chromeReady) return;
