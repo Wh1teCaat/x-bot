@@ -28,6 +28,14 @@ node scripts/follow/follow-stream.ts stream 账号数字ID
 
 ## 独立命令：回关监听 + 私信回复
 
+欢迎私信的沟通规则保存在 `scripts/follow/dm-skill.md`，生成时加载。目前自动回复只支持回关后的第一条欢迎私信；入站私信仅有独立的流测试入口，尚未接入客服队列或保存对话上下文，因此 skill 中对方回复后的规则尚不会自动触发。
+
+### 入站 DM 和 XChat 流测试
+
+先停止占用 Activity 流锁的 loop / follow-reply，配置 `X_ACTIVITY_APP_BEARER_TOKEN`，启动本地授权服务 `npm start`，并为账号授权 `dm.read`。在项目目录执行 `npm run dm:stream-test -- <账号数字ID>`。命令用应用令牌查询 `dm.received` 和 `chat.received` 订阅并连接同一条流；缺少订阅时使用账号 OAuth 用户令牌创建。收到事件时仅输出事件类型及元数据，不解密、不发回复。Ctrl+C 停止，已创建的 X 端订阅保留。重复消息只在本次进程内去重，断线期间不补漏。
+
+若 X 返回 403，日志会标明失败的请求方法和路径。`GET /subscriptions` 是查询订阅，`POST /subscriptions` 是创建订阅，`GET /stream` 是连接流；检查账号 OAuth scope、X 应用权限和套餐后再排查对应步骤。账号页面显示已授权关注不代表已经授权 `dm.read`。
+
 不启动完整 loop 也可以单独跑「监听回关 → 落库 → LLM 生成 → 发私信」：
 
 ```bash

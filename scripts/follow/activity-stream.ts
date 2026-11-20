@@ -16,6 +16,45 @@ export type FollowEvent = {
   accountId: string;
 };
 
+export type DmEvent = { eventId: string; messageId: string; accountId: string; senderId: string; text: string; occurredAt?: string };
+export type ChatEvent = { eventId: string; messageId: string; accountId: string; senderId: string; conversationId: string };
+
+/** 提取 XChat 加密事件的元数据，不处理密文或密钥。 */
+export function parseChatEvent(event: any): ChatEvent | null {
+  const accountId = event?.filter?.user_id;
+  const payload = event?.payload;
+  if (event?.event_type !== 'chat.received' || typeof event.event_uuid !== 'string' || !event.event_uuid || typeof accountId !== 'string' || !/^\d{1,19}$/.test(accountId) || typeof payload?.sender_id !== 'string' || !/^\d{1,19}$/.test(payload.sender_id) || payload.sender_id === accountId || typeof payload.id !== 'string' || !payload.id || typeof payload.conversation_id !== 'string' || !payload.conversation_id) return null;
+  return { eventId: event.event_uuid, messageId: payload.id, accountId, senderId: payload.sender_id, conversationId: payload.conversation_id };
+}
+
+/** 解析旧版入站 DM，校验接收账号，忽略自己发送及不含文本的事件。 */
+export function parseDmEvents(event: any): DmEvent[] {
+  if (event?.event_type !== 'dm.received' || typeof event.event_uuid !== 'string' || !Array.isArray(event.payload?.direct_message_events)) return [];
+  const accountId = event.filter?.user_id;
+  if (typeof accountId !== 'string' || !/^\d{1,19}$/.test(accountId)) return [];
+  return event.payload.direct_message_events.flatMap((item: any) => {
+    const message = item?.message_create;
+    const senderId = message?.sender_id;
+    if (item?.type !== 'message_create' || typeof item.id !== 'string' || !/^\d{1,19}$/.test(item.id) || typeof senderId !== 'string' || !/^\d{1,19}$/.test(senderId) || senderId === accountId || message?.target?.recipient_id !== accountId || typeof message?.message_data?.text !== 'string' || !message.message_data.text.trim()) return [];
+    return [{ eventId: event.event_uuid, messageId: item.id, accountId, senderId, text: message.message_data.text, occurredAt: event.created_at }];
+  });
+}
+
+/** 复用或创建入站私信订阅；可用的认证方式以 X 实际响应为准。 */
+export async function ensureMessageSubscription(api: ActivityHttp, accountId: string, eventType: 'dm.received' | 'chat.received', createApi: ActivityHttp = api): Promise<string> {
+  const response = await api(`/subscriptions?${new URLSearchParams({ user_id: accountId })}`);
+  const result: any = await response.json();
+  if (!Array.isArray(result.data) && result.data !== undefined) throw new Error('私信订阅列表格式无效');
+  if ((result.data || []).some((item: any) => item.event_type === eventType && item.filter?.user_id === accountId && !item.filter?.qualifiers?.conversation_type)) return `已有 ${eventType} 订阅。`;
+  const created = await createApi('/subscriptions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ event_type: eventType, filter: { user_id: accountId }, tag: eventType === 'chat.received' ? 'chat-inbound' : 'dm-inbound' }) });
+  await created.json();
+  return `${eventType} 订阅已创建。`;
+}
+
+export async function ensureDmSubscription(api: ActivityHttp, accountId: string, createApi: ActivityHttp = api): Promise<string> {
+  return ensureMessageSubscription(api, accountId, 'dm.received', createApi);
+}
+
 /** 构造 Activity API 请求函数；app 令牌或经本地授权服务获取用户令牌。 */
 export function makeActivityApi(opts: {
   accountId: string;
@@ -45,7 +84,7 @@ export function makeActivityApi(opts: {
     const response = await fetch(BASE + path, { ...init, headers: { Authorization: `Bearer ${token}`, ...init.headers }, signal: controller.signal });
     if (!response.ok) {
       const detail = (await response.text()).slice(0, 1000).replaceAll(token, '[已隐藏]');
-      throw new Error(`X API HTTP ${response.status}: ${detail}`);
+      throw new Error(`X API HTTP ${response.status}: ${init.method || 'GET'} ${path.split('?')[0]}: ${detail}`);
     }
     return response;
   };
@@ -65,7 +104,7 @@ export async function ensureFollowSubscription(api: ActivityHttp, accountId: str
 }
 
 /** 持续读取 Activity 流；每条有效入站关注事件回调一次，不补漏、不保存。 */
-export async function receiveFollowEvents(api: ActivityHttp, controller: AbortController, onFollow: (event: FollowEvent) => void, onState: (state: string) => void = () => {}): Promise<void> {
+export async function receiveFollowEvents(api: ActivityHttp, controller: AbortController, onFollow: (event: FollowEvent) => void, onState: (state: string) => void = () => {}, onDm: (event: DmEvent) => void = () => {}, onChat: (event: ChatEvent) => void = () => {}): Promise<void> {
   let retry = 1;
   while (!controller.signal.aborted) {
     try {
@@ -73,7 +112,7 @@ export async function receiveFollowEvents(api: ActivityHttp, controller: AbortCo
       const response = await api('/stream');
       if (!response.body) throw new Error('X 未返回流数据');
       onState('监听关注与回关事件');
-      console.log('Activity 流已连接；收到关注事件时会打印。');
+      console.log('Activity 流已连接。');
       retry = 1;
       const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
       let buffer = '';
@@ -90,6 +129,15 @@ export async function receiveFollowEvents(api: ActivityHttp, controller: AbortCo
             try { item = JSON.parse(text); } catch { console.error('收到无法解析的流数据，跳过'); continue; }
             if (item.errors?.length) console.error('流返回错误：', JSON.stringify(item.errors));
             const event = item.data;
+            if (event?.event_type === 'chat.received') {
+              const chat = parseChatEvent(event);
+              if (chat) onChat(chat);
+              continue;
+            }
+            if (event?.event_type === 'dm.received') {
+              for (const dm of parseDmEvents(event)) onDm(dm);
+              continue;
+            }
             if (event?.event_type !== 'follow.follow') continue;
             const source = event.payload?.source?.data, target = event.payload?.target?.data;
             if (typeof source?.id !== 'string' || !/^\d{1,19}$/.test(source.id) || typeof target?.id !== 'string' || !/^\d{1,19}$/.test(target.id) || typeof event.event_uuid !== 'string') continue;
@@ -103,7 +151,7 @@ export async function receiveFollowEvents(api: ActivityHttp, controller: AbortCo
           }
         }
       } finally { await reader.cancel().catch(() => {}); }
-      console.error('连接结束，准备重连；断线期间可能漏事件。');
+      if (!controller.signal.aborted) console.error('连接结束，准备重连；断线期间可能漏事件。');
     } catch (error) {
       if (controller.signal.aborted) break;
       const message = error instanceof Error ? error.message : String(error);

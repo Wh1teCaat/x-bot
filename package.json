@@ -18,6 +18,7 @@
     "clone_user": "node scripts/clone_user/clone_user.ts",
     "mirror": "node scripts/mirror/mirror-loop.ts",
     "follow-reply": "node scripts/follow/follow-reply.ts",
+    "dm:stream-test": "node scripts/follow/dm-stream-test.ts",
     "profile:template": "node scripts/browser/make-profile-template.ts"
   },
   "devDependencies": {
