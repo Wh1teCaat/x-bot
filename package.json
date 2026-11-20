@@ -21,7 +21,8 @@
     "dm:stream-test": "node scripts/follow/dm-stream-test.ts",
     "exporter:retry-reset": "node scripts/browser/exporter-retry-reset.ts",
     "x:page-circuit-reset": "node scripts/browser/x-page-circuit-reset.ts",
-    "profile:template": "node scripts/browser/make-profile-template.ts"
+    "profile:template": "node scripts/browser/make-profile-template.ts",
+    "profile:repair": "node scripts/browser/repair-profile.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

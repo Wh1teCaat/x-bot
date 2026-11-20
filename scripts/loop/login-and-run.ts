@@ -5,7 +5,7 @@ import { monitorProcess } from '../../src/runtime-monitor.ts';
 import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
 import { access, mkdir, open, readFile, unlink } from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { constants, existsSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { resolve, join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -100,6 +100,8 @@ try {
   await acquireLock();
   const profileCopied = await ensureProfileFromTemplate(profile, process.env.X_PROFILE_TEMPLATE || PROFILE_TEMPLATE_DIR);
   if (profileCopied) console.log('已从插件模板复制账号浏览器资料（含已安装的 CommentCrate / exporter24）。');
+  else if (!followerLoop && !existsSync(join(profile, 'Default', 'Extensions', 'haaahmifcccbgagmopbhbkgabgblmcbl')) && existsSync(join(process.env.X_PROFILE_TEMPLATE || PROFILE_TEMPLATE_DIR, 'Default', 'Extensions', 'haaahmifcccbgagmopbhbkgabgblmcbl')))
+    console.warn(`账号资料缺少 CommentCrate；已有资料不会被覆盖。关闭账号浏览器后可运行 npm run profile:repair -- ${accountId} 备份并从模板重建。`);
   await mkdir(profile, { recursive: true, mode: 0o700 });
   store = new AccountStore(resolve('.data'));
   const fp = fingerprintFor(accountId);

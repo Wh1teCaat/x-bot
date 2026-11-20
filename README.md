@@ -34,6 +34,8 @@ npm run profile:template
 
 新账号首次运行 `npm run loop` 时，如果 `.data/browser-profiles/<账号ID>` 不存在，会自动复制模板，然后注入账号 cookie。这样每个账号实例都有自己的一份插件目录和 `Local Extension Settings`，互不影响。
 
+已存在的账号资料不会自动覆盖。如果账号资料缺少 CommentCrate，先停止账号任务并关闭该账号的 Chrome，然后运行 `npm run profile:repair -- <账号数字ID>`。命令将旧资料改名备份，从模板重建主账号资料；旧资料的登录状态不会复制到新资料，需使用已导入的 cookie 或重新登录。之后用 `npm run loop -- <账号数字ID> --check-only` 检查插件与登录。已存在的粉丝专用资料不会被此命令替换。
+
 可用环境变量覆盖：
 
 ```env
