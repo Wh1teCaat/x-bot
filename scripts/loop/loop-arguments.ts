@@ -17,6 +17,12 @@ export type LoopArguments = {
   yes: boolean;
   /** 只处理指定帖子（镜像延迟回复爬取使用）。 */
   postUrl?: string;
+  /** 连到外部常驻 Chrome，不在结束时关闭浏览器（粉丝常驻 loop 使用）。 */
+  keepBrowser?: boolean;
+  /** 主 loop 只处理帖子，粉丝交给独立常驻 loop。 */
+  noFollowers?: boolean;
+  /** 跳过“存在未完成粉丝任务”启动守卫（常驻粉丝 loop / 只跑帖子的主 loop 使用）。 */
+  ignorePendingFollowers?: boolean;
 };
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const handle = /^[A-Za-z0-9_]{1,15}$/;
@@ -31,6 +37,9 @@ export function parseLoopArguments(args: string[], internal = false): LoopArgume
     if (seen.has(key)) throw new Error('参数不能重复');
     seen.add(key);
     if (key === '--followers-only') { result.followersOnly = true; continue; }
+    if (key === '--keep-browser') { result.keepBrowser = true; continue; }
+    if (key === '--no-followers') { result.noFollowers = true; continue; }
+    if (key === '--ignore-pending-followers') { result.ignorePendingFollowers = true; continue; }
     if (key === '--evaluate') { result.evaluate = true; continue; }
     if (key === '--yes') { result.yes = true; continue; }
     if (key === '--follow-probe' && internal) { result.followProbe = true; continue; }

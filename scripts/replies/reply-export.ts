@@ -184,10 +184,24 @@ export async function scanAndExport(page, post, outputDir = '.data/reply-exports
       else throw new Error('两次点击 Scan 后扫描都没有启动。');
     }
     let current;
+    let lastCount = -1, quietSince = Date.now();
     for (let i = 0; i < 600; i++) {
       await guard();
       current = await status();
       if (current.state === 'done' || current.state === 'error') break;
+      const count = Number(current.count) || 0;
+      if (count > lastCount) { lastCount = count; quietSince = Date.now(); }
+      else if (lastCount > 0 && Date.now() - quietSince >= 5000) {
+        // 帖子回复按用户要求：超过 5 秒没有新增评论就停止，保留已抓到的结果。
+        console.log('超过 5 秒没有新增评论，停止扫描并下载已有结果。');
+        await helper.evaluate(id => chrome.tabs.sendMessage(id, { type: 'cc:stop' }), tabId).catch(() => {});
+        for (let j = 0; j < 20; j++) {
+          await page.waitForTimeout(500);
+          current = await status();
+          if (current.state === 'done' || current.state === 'error') break;
+        }
+        break;
+      }
       await page.waitForTimeout(1000);
     }
     if (current?.state !== 'done') throw new Error(`扫描未完成：${current?.error || current?.state || '状态不可用'}；请检查页面。`);

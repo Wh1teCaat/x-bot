@@ -2,11 +2,11 @@ import '../../src/runtime-config.ts';
 /** exporter24 的分页游标留在扩展历史中，本地只提交已筛选入队的偏移。 */
 import type { Page } from 'playwright';
 import type { DatabaseSync } from 'node:sqlite';
-import { ensureExporter24Auth, readExporter24Gate } from './exporter24.ts';
+import { ensureExporter24Auth, readExporter24Gate, EXPORTER24_EXTENSION_ID } from './exporter24.ts';
 
 export const FOLLOWER_BATCH_SIZE = 200;
 /** 导出节奏；关注速率由 Outbox worker 单独限制，这里只控制抓取批次间隔。 */
-export const FOLLOWER_INTERVAL_MS = 5 * 60 * 1000;
+export const FOLLOWER_INTERVAL_MS = 15 * 60 * 1000;
 export type FollowerCheckpoint = { taskId: string | null; offset: number; due: number; done: boolean };
 export class FollowerCheckpoints {
   private db: DatabaseSync;
@@ -29,7 +29,7 @@ export class FollowerCheckpoints {
 }
 
 /** 从 React 组件的 source 属性取得扩展自己的 store；版本不兼容时停止。 */
-export async function attachFollowerStore(page: Page) {
+export async function attachFollowerStore(page: Page, timeout = 30000) {
   await page.waitForFunction(() => {
     const root = document.getElementById('ext-root');
     const key = root && Object.keys(root).find(key => key.startsWith('__reactContainer$'));
@@ -48,19 +48,29 @@ export async function attachFollowerStore(page: Page) {
       queue.push(item.child, item.sibling);
     }
     return false;
-  }, undefined, { timeout: 30000 });
+  }, undefined, { timeout });
 }
 
 /** 只在完整分页保存后暂停，多出的本页记录保留在扩展中，下批先消费。 */
 async function readFollowerBatchOnce(page: Page, username: string, checkpoint: FollowerCheckpoint,
   saveTask: (id: string) => void, guard: () => void | Promise<void>) {
+  let reused = false;
   if (checkpoint.taskId) {
+    // 常驻粉丝页：页面没关时直接复用内存里的任务，避免按 taskId 重新加载。
+    for (let attempt = 0; attempt < 3 && !reused; attempt++) {
+      try {
+        await attachFollowerStore(page, 2000);
+        const openTaskId = await page.evaluate(() => (globalThis as any).__followerStore?.task?.id ?? null);
+        reused = String(openTaskId) === checkpoint.taskId;
+      } catch { /* 页面还没挂载，稍后重试 */ }
+      if (!reused) await page.waitForTimeout(800);
+    }
+  }
+  if (!reused) {
     const url = new URL(page.url());
-    url.search = new URLSearchParams({ taskId: checkpoint.taskId, tab: 'follower' }).toString();
-    await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
-  } else {
-    const url = new URL(page.url());
-    url.search = new URLSearchParams({ type: 'followers', username, confirmed: '1' }).toString();
+    url.search = checkpoint.taskId
+      ? new URLSearchParams({ taskId: checkpoint.taskId, tab: 'follower' }).toString()
+      : new URLSearchParams({ type: 'followers', username, confirmed: '1' }).toString();
     await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
   }
   await attachFollowerStore(page);
@@ -112,6 +122,29 @@ async function readFollowerBatchOnce(page: Page, username: string, checkpoint: F
 }
 
 /**
+ * 历史任务页加载不出来时，用 History 里最新一条该博主的粉丝任务恢复。
+ * 扩展的 History 行点击后会跳到 index.html?taskId=<最新任务>&tab=follower，返回这个任务 ID。
+ */
+export async function resumeLatestFollowerTask(page: Page, username: string): Promise<string | null> {
+  await page.goto(`chrome-extension://${EXPORTER24_EXTENSION_ID}/history.html`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+  await page.locator('tbody tr').first().waitFor({ state: 'attached', timeout: 15000 }).catch(() => {});
+  const rows = page.locator('tbody tr');
+  const count = await rows.count();
+  for (let index = 0; index < count; index++) {
+    const text = await rows.nth(index).innerText().catch(() => '');
+    if (!text.toLowerCase().includes(`@${username.toLowerCase()}`) || !/FOLLOWERS/i.test(text)) continue;
+    await rows.nth(index).click();
+    await page.waitForFunction(() => /[?&]taskId=/.test(location.href), undefined, { timeout: 15000 }).catch(() => {});
+    const taskId = new URL(page.url()).searchParams.get('taskId');
+    if (!taskId) return null;
+    await attachFollowerStore(page, 30000);
+    const openTaskId = await page.evaluate(() => (globalThis as any).__followerStore?.task?.id ?? null);
+    return String(openTaskId) === taskId ? taskId : null;
+  }
+  return null;
+}
+
+/**
  * 抓取一批粉丝；遇到 5 星评价/登录门槛时用 X_EXPORT_TOKEN 登录并重试一次。
  * 登录会重新加载扩展页，任务从已保存的历史断点（taskId）继续，本地偏移不变。
  */
@@ -129,10 +162,26 @@ export async function readFollowerBatch(page: Page, username: string, checkpoint
         await ensureExporter24Auth(page, guard);
         continue;
       }
-      // 扩展页偶发挂载慢（浏览器刚跑完 10 条帖子扫描时尤其明显），重载任务页再试一次。
+      // 任务页加载不出来时，先用 History 最新一条恢复；没有可恢复任务才新建，按本地 offset 从 0 补抓。
       if (!retried && /waitForFunction|Timeout/i.test(String(error?.message || error))) {
         retried = true;
-        console.log('exporter24 任务页未在时限内就绪，重新加载后重试一次。');
+        if (checkpoint.taskId) {
+          console.log('exporter24 历史任务加载失败，尝试从 History 最新一条恢复。');
+          const latest = await resumeLatestFollowerTask(page, username).catch((resumeError) => {
+            console.log(`从 History 恢复失败：${resumeError?.message || resumeError}`);
+            return null;
+          });
+          if (latest) {
+            checkpoint.taskId = latest;
+            saveTask(latest);
+            console.log(`已恢复 History 最新任务 ${latest}，从本地 offset ${checkpoint.offset} 继续。`);
+          } else {
+            console.log('History 中没有可恢复的粉丝任务，改用新任务并按本地 offset 继续（会从 0 补抓）。');
+            checkpoint.taskId = null;
+          }
+        } else {
+          console.log('exporter24 任务页未在时限内就绪，重新加载后重试一次。');
+        }
         await page.waitForTimeout(2000);
         continue;
       }

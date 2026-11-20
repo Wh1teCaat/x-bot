@@ -5,7 +5,8 @@ import { monitorProcess } from '../../src/runtime-monitor.ts';
 import { stageLabels } from '../../src/console-data.ts';
 import { connectTestingBrowser } from '../browser/browser-connection.ts';
 import { actionDelay, createProfileVisitDelay } from '../browser/action-delay.ts';
-import { openExporter24, readExporter24Counts } from '../browser/exporter24.ts';
+import { openExporter24, readExporter24Counts, EXPORTER24_EXTENSION_ID } from '../browser/exporter24.ts';
+import { acquireExporterLock, withExporterLock } from '../browser/exporter-lock.ts';
 import { FollowerCheckpoints, readFollowerBatch, FOLLOWER_INTERVAL_MS } from '../browser/follower-batch.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
@@ -112,7 +113,7 @@ try {
     persist('running');
   } else {
     if (!handle.test(blogger)) throw new Error('未找到 clone 来源博主；请先 clone，或用 --blogger <用户名> 指定');
-    if (args.accountId && !args.postUrl) {
+    if (args.accountId && !args.postUrl && !args.noFollowers && !args.ignorePendingFollowers) {
       const pending = db.prepare("SELECT id,state FROM runs WHERE status!='completed'").all().find(row => {
         const saved = JSON.parse(String(row.state));
         return saved.followAccountId === args.accountId && saved.blogger?.toLowerCase() === blogger.toLowerCase() && saved.phase === 'followers';
@@ -129,15 +130,22 @@ try {
       ...(args.accountId ? { followAccountId: args.accountId } : {}),
       ...(args.username ? { browserUsername: args.username } : {}),
     };
-    // 当前去重与熔断仍为全局状态，先原子地限制为同一时刻只执行一轮。
+    // 帖子和粉丝是两条独立 lane：各自最多一个任务，彼此可以并发。
+    const lane = args.followersOnly ? 'followers' : 'posts';
     db.exec('BEGIN IMMEDIATE');
     try {
-      // 冷却中的存活队列同样占用全局熔断；其他账号暂不并行探测。
-      for (const job of db.prepare("SELECT owner_pid FROM loop_jobs WHERE id<>? AND status IN ('running','cooldown') AND owner_pid IS NOT NULL").all(runId)) {
-        try { process.kill(Number(job.owner_pid), 0); throw new Error('已有其他账号的任务运行或冷却，当前版本不支持并行'); }
-        catch (error) { if (error.code !== 'ESRCH') throw error; }
+      // 非 lane 模式（手工启动）仍保持原来的全局串行限制。
+      if (!args.followersOnly && !args.noFollowers && !args.ignorePendingFollowers) {
+        for (const job of db.prepare("SELECT owner_pid FROM loop_jobs WHERE id<>? AND status IN ('running','cooldown') AND owner_pid IS NOT NULL").all(runId)) {
+          try { process.kill(Number(job.owner_pid), 0); throw new Error('已有其他账号的任务运行或冷却，当前版本不支持并行'); }
+          catch (error) { if (error.code !== 'ESRCH') throw error; }
+        }
       }
-      for (const row of db.prepare("SELECT * FROM runs WHERE status='running'").all()) assertNotRunning(row);
+      for (const row of db.prepare("SELECT * FROM runs WHERE status='running'").all()) {
+        let saved: { phase?: string } = {};
+        try { saved = JSON.parse(String(row.state)); } catch { /* 旧数据按 posts lane 处理 */ }
+        if ((saved.phase === 'followers' ? 'followers' : 'posts') === lane) assertNotRunning(row);
+      }
       db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?, NULL, ?, ?)').run(runId, 'running', stage, JSON.stringify(state), process.pid, new Date().toISOString());
       db.exec('COMMIT');
       runPersisted = true;
@@ -232,14 +240,19 @@ try {
       continue;
     }
     const page = await getPage();
-    const exporterPage = await openExporter24(page.context());
+    let exporterPage = null;
+    if (args.keepBrowser) {
+      // 常驻粉丝页：复用同一 Chrome 里已经打开的 exporter 页面，避免按 taskId 重新加载。
+      exporterPage = page.context().pages().find(item => !item.isClosed() && item.url().startsWith(`chrome-extension://${EXPORTER24_EXTENSION_ID}/`)) ?? null;
+    }
+    if (!exporterPage) exporterPage = await openExporter24(page.context());
     if (!exporterPage) throw new Error('未检测到 exporter24 扩展');
     let batchSaved = false;
     try {
-      const result = await readFollowerBatch(exporterPage, state.blogger, checkpoint, taskId => {
+      const result = await withExporterLock(() => readFollowerBatch(exporterPage, state.blogger, checkpoint, taskId => {
         checkpoint.taskId = taskId;
         followerCheckpoints.save(state.followAccountId, state.blogger, checkpoint);
-      }, guardX);
+      }, guardX));
       state.followerBatch = result;
       state.phase = 'followers';
       state.post = null;
@@ -249,7 +262,7 @@ try {
       batchSaved = true;
       console.log(`粉丝本批 ${result.candidates.length} 人，开始筛选并入队。`);
     } finally {
-      if (batchSaved) await exporterPage.close().catch(() => {});
+      if (batchSaved && !args.keepBrowser) await exporterPage.close().catch(() => {});
     }
   }
   // 按阶段解析回复 CSV 或博主粉丝 CSV；语言筛选/模型评估只用于帖子回复。
@@ -308,7 +321,17 @@ try {
     if (needCounts.length) {
       const page = await getPage();
       let exporterPage = null;
-      try { exporterPage = await openExporter24(page.context()); } catch { exporterPage = null; }
+      let releaseExporter = async () => {};
+      try {
+        // 粉丝抓取和补数共用 exporter，同一时间只允许一个任务。
+        releaseExporter = await acquireExporterLock();
+        exporterPage = await openExporter24(page.context());
+      } catch (error) {
+        console.log(`exporter24 补数未执行：${error?.message || error}，改用主页读取。`);
+        exporterPage = null;
+        await releaseExporter();
+      }
+      if (!exporterPage) await releaseExporter();
       if (exporterPage) {
         console.log(`检测到 exporter24，用扩展读取 ${needCounts.length} 人的关注/粉丝数。`);
         let consecutiveFailures = 0;
@@ -342,6 +365,7 @@ try {
           }
         } finally {
           await exporterPage.close().catch(() => {});
+          await releaseExporter();
         }
         persist('running');
       } else {
@@ -503,6 +527,9 @@ try {
             state.post = state.posts[state.postIndex];
             stage = 'export'; persist('running');
             console.log(`转入下一条帖子 ${state.postIndex + 1}/${state.posts.length}：${state.post.url}`);
+          } else if (args.noFollowers) {
+            stage = 'done'; persist('completed');
+            console.log(`所有帖子处理完毕；粉丝由独立常驻 loop 负责。结果 ${output}`);
           } else {
             state.phase = 'followers';
             state.post = null;
@@ -560,7 +587,9 @@ try {
   console.error(`任务停止：${error.message}${runId ? `；任务 ID：${runId}，阶段：${stage}` : ''}`);
   process.exitCode = 1;
 } finally {
-  if (browser?.isConnected()) await browser.close();
+  if (browser?.isConnected() && !args.keepBrowser) await browser.close();
   db?.close();
   accountStore.close();
+  // keep-browser 的 CDP 连接会一直吊着事件循环；共享 Chrome 不能关，只能强制结束本进程。
+  if (args.keepBrowser) process.exit(process.exitCode ?? 0);
 }

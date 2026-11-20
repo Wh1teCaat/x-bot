@@ -15,7 +15,7 @@ test('checkpoint isolates accounts and targets and preserves due time and comple
     assert.equal(checkpoints.get('1', 'bob').offset, 0);
     checkpoints.save('1', 'alice', { ...value, offset: 225, done: true });
     assert.equal(checkpoints.get('1', 'alice').done, true);
-    assert.equal(FOLLOWER_INTERVAL_MS, 5 * 60 * 1000);
+    assert.equal(FOLLOWER_INTERVAL_MS, 15 * 60 * 1000);
   } finally { db.close(); }
 });
 

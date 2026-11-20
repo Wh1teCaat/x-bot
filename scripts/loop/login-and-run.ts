@@ -14,13 +14,19 @@ import { cookieFileCandidates, loadCookieJar, type CookieJar } from '../browser/
 import { fingerprintFor } from '../browser/fingerprint.ts';
 import { ensureProfileFromTemplate, PROFILE_TEMPLATE_DIR } from '../browser/profile-template.ts';
 import { AccountStore } from '../../src/account-store.ts';
+import { DatabaseSync } from 'node:sqlite';
+import { FollowerCheckpoints } from '../browser/follower-batch.ts';
 
 const args = process.argv.slice(2);
 const accountId = args[0];
 const telemetry = monitorProcess(accountId, 'login');
 telemetry.stage('检查登录与浏览器');
 const checkOnly = args.includes('--check-only');
-const forwarded = args.slice(1).filter(argument => argument !== '--check-only');
+const followerLoop = args.includes('--follower-loop');
+const forwarded = args.slice(1).filter(argument => !['--check-only', '--follower-loop'].includes(argument));
+const bloggerArgIndex = forwarded.indexOf('--blogger');
+const followerBlogger = followerLoop && bloggerArgIndex >= 0 ? String(forwarded[bloggerArgIndex + 1] || '').replace(/^@/, '') : '';
+if (followerLoop && !/^[A-Za-z0-9_]{1,15}$/.test(followerBlogger)) { console.error('--follower-loop 需要 --blogger <博主用户名>'); process.exit(1); }
 if (!/^\d{1,19}$/.test(accountId || '')) {
   console.error('用法：npm run loop -- <已授权账号数字ID> [--check-only] [--blogger <博主用户名>] [--language ar] [--evaluate]'); process.exit(1);
 }
@@ -29,8 +35,9 @@ const portText = process.env.PORT || '3000';
 if (!/^\d{1,5}$/.test(portText) || +portText < 1 || +portText > 65535) { console.error('PORT 无效'); process.exit(1); }
 const origin = `http://127.0.0.1:${portText}`;
 const root = resolve('.data', 'browser-profiles');
-const profile = join(root, accountId);
-const lockPath = join(root, `${accountId}.lock`);
+const profileSuffix = followerLoop ? '-follow' : '';
+const profile = join(root, accountId + profileSuffix);
+const lockPath = join(root, `${accountId}${profileSuffix}.lock`);
 const executable = process.env.X_BROWSER_EXECUTABLE || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 let lockOwned = false, loginBrowser, context, worker, store;
 let stopping = false;
@@ -95,7 +102,7 @@ try {
   store = new AccountStore(resolve('.data'));
   const fp = fingerprintFor(accountId);
   const chromeReady = !profileCopied && (store.getByUuid(accountId)?.chromeReady ?? false);
-  const needsCheck = !chromeReady || checkOnly;
+  const needsCheck = followerLoop || !chromeReady || checkOnly;
   // cookie 文件只用于首次登录：已标记就绪的账号直接复用资料中的登录态，避免旧 cookie 覆盖有效会话。
   let cookiePath: string | null = null;
   let cookieJar: CookieJar | null = null;
@@ -132,11 +139,43 @@ try {
     console.log(`已读取 @${username} 的 cookie，接下来检查登录态与 CommentCrate。`);
   }
   const cdpPort = await allocatePort();
+async function runFollowerLoop() {
+  const db = new DatabaseSync(resolve('.data', 'loop.sqlite'));
+  db.exec('PRAGMA busy_timeout=10000');
+  const checkpoints = new FollowerCheckpoints(db);
+  const sleep = (ms: number) => new Promise<void>(resolveWait => setTimeout(resolveWait, ms));
+  try {
+    for (;;) {
+      if (stopping) break;
+      const checkpoint = checkpoints.get(accountId, followerBlogger);
+      if (checkpoint.done) { console.log('粉丝已抓完，粉丝常驻 loop 退出。'); break; }
+      if (checkpoint.due > Date.now()) {
+        await sleep(Math.min(30000, Math.max(500, checkpoint.due - Date.now() + 300)));
+        continue;
+      }
+      telemetry.stage('执行粉丝定时续抓');
+      console.log('粉丝常驻 loop：开始抓取下一批。');
+      const code = await new Promise<number>((resolveCode) => {
+        const child = spawn(process.execPath, ['scripts/loop/run-loop.ts', '--account-id', accountId, '--username', username,
+          '--cdp-port', String(cdpPort), '--followers-only', '--keep-browser', '--ignore-pending-followers', '--blogger', followerBlogger, '--yes'],
+          { stdio: 'inherit', detached: true });
+        worker = child;
+        child.once('error', () => { worker = null; resolveCode(1); });
+        child.once('exit', value => { worker = null; resolveCode(value ?? 1); });
+      });
+      telemetry.stage('等待粉丝批次', 'waiting');
+      if (code !== 0) { console.error('粉丝本批失败，断点保留；60 秒后重试。'); if (!stopping) await sleep(60000); }
+    }
+  } finally { db.close(); }
+}
+
   console.log(needsCheck
     ? '正在用 Playwright 打开该账号的浏览器资料并检查登录和插件……'
     : '正在用 Playwright 打开该账号的浏览器资料并执行任务……');
+  const headless = /^(1|true|yes)$/i.test(process.env.X_HEADLESS || '');
+  if (headless) console.log('X_HEADLESS=1：浏览器以无界面模式启动。');
   context = await chromium.launchPersistentContext(profile, {
-    headless: false, executablePath: executable,
+    headless, executablePath: executable,
     ignoreDefaultArgs: ['--disable-extensions', '--use-mock-keychain', '--password-store=basic'],
     args: [`--remote-debugging-port=${cdpPort}`, '--no-first-run'],
     locale: fp.locale, timezoneId: fp.timezoneId, viewport: fp.viewport, screen: fp.screen, colorScheme: fp.colorScheme,
@@ -154,19 +193,21 @@ try {
       throw new Error(`请先在登录窗口登录 @${username} 后重试`);
     }
     if (readiness === 'wrong_account') throw new Error(`浏览器登录账号与 @${username} 不一致`);
-    const helper = await context.newPage();
-    try {
-      await helper.goto('chrome-extension://haaahmifcccbgagmopbhbkgabgblmcbl/popup/popup.html', { timeout: 5000 });
-      const granted = await helper.evaluate(async () => {
-        const api = (globalThis as any).chrome, crate = (globalThis as any).CommentCrate;
-        const platform = crate?.platformsMeta?.PLATFORMS?.find(p => p.id === 'x');
-        return !!platform && await crate.permissions.create(api).has(platform);
-      });
-      if (!granted) throw new Error('请授予 CommentCrate 对 X 的访问权限');
-    } catch (error) {
-      const hint = cookieJar ? '（cookie 只代替登录，CommentCrate 仍需安装在该账号的浏览器资料中）' : '';
-      throw new Error(`CommentCrate 未就绪：${error.message}${hint}`);
-    } finally { await helper.close().catch(() => {}); }
+    if (!followerLoop) {
+      const helper = await context.newPage();
+      try {
+        await helper.goto('chrome-extension://haaahmifcccbgagmopbhbkgabgblmcbl/popup/popup.html', { timeout: 5000 });
+        const granted = await helper.evaluate(async () => {
+          const api = (globalThis as any).chrome, crate = (globalThis as any).CommentCrate;
+          const platform = crate?.platformsMeta?.PLATFORMS?.find(p => p.id === 'x');
+          return !!platform && await crate.permissions.create(api).has(platform);
+        });
+        if (!granted) throw new Error('请授予 CommentCrate 对 X 的访问权限');
+      } catch (error) {
+        const hint = cookieJar ? '（cookie 只代替登录，CommentCrate 仍需安装在该账号的浏览器资料中）' : '';
+        throw new Error(`CommentCrate 未就绪：${error.message}${hint}`);
+      } finally { await helper.close().catch(() => {}); }
+    }
     store.upsert({ uuid: accountId, username, chromeReady: true });
   } else {
     // 就绪账号不再走登录检查；先把初始 about:blank 打开成 X 主页，
@@ -178,6 +219,10 @@ try {
   if (stopping) throw new Error('已取消');
   if (checkOnly) {
     console.log('登录与插件检查通过；--check-only 未执行任务，也未发送关注请求。');
+  } else if (followerLoop) {
+    console.log(`账号及插件检查通过；粉丝常驻 loop 启动（账号 @${username}，博主 @${followerBlogger}）。`);
+    telemetry.stage('等待粉丝批次', 'waiting');
+    await runFollowerLoop();
   } else {
     console.log('账号及插件检查通过，开始执行单轮任务；任务可能发送关注请求。');
     telemetry.stage('等待采集任务完成', 'waiting');

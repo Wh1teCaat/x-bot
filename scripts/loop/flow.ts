@@ -4,9 +4,12 @@ import '../../src/runtime-config.ts';
 import { stopProcessTree } from '../../src/process-stop.ts';
 import { monitorProcess } from '../../src/runtime-monitor.ts';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { cp, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { FollowerCheckpoints, FOLLOWER_INTERVAL_MS } from '../browser/follower-batch.ts';
+import { EXPORTER24_EXTENSION_ID } from '../browser/exporter24.ts';
 import { AccountStore } from '../../src/account-store.ts';
 import { MirrorStore } from '../../src/mirror-store.ts';
 import { resolveFlowTarget } from './flow-target.ts';
@@ -66,6 +69,19 @@ const readAccount = () => {
 let account = readAccount();
 if (!account) { console.error(`未找到账号 ${accountId}，请先完成 X 授权`); process.exit(1); }
 const loginEnv = { ...process.env, ...(cookiePath ? { X_COOKIE_FILE: resolve(cookiePath) } : {}) };
+/** 粉丝常驻 loop 用独立资料：首次启动时从主资料复制（必须没有 Chrome 占用）。 */
+async function ensureFollowerProfile() {
+  const source = join(dataDir, 'browser-profiles', accountId);
+  const destination = `${source}-follow`;
+  if (existsSync(destination)) return;
+  console.log('首次启动：复制账号资料给粉丝常驻 loop（Chrome 必须全部关闭）……');
+  await cp(source, destination, { recursive: true, verbatimSymlinks: true });
+  for (const name of [
+    `chrome-extension_${EXPORTER24_EXTENSION_ID}_0.indexeddb.leveldb`,
+    `chrome-extension_${EXPORTER24_EXTENSION_ID}_0.indexeddb.blob`,
+  ]) await rm(join(destination, 'Default', 'IndexedDB', name), { recursive: true, force: true });
+  console.log(`粉丝资料已生成：${destination}`);
+}
 let stopping = false;
 let mirrorChild: ChildProcess | null = null;
 let outboxChild: ChildProcess | null = null;
@@ -75,6 +91,8 @@ let restartTimer: ReturnType<typeof setTimeout> | null = null;
 let replyChild: ChildProcess | null = null;
 let replyTimer: ReturnType<typeof setInterval> | null = null;
 let mirrorStore: MirrorStore | null = null;
+let followerLoopChild: ChildProcess | null = null;
+let followerLoopUsed = false;
 let resolveStop: (() => void) | null = null;
 const stopPromise = new Promise<void>((resolveSignal) => { resolveStop = resolveSignal; });
 let stopTask: Promise<void> | null = null;
@@ -141,6 +159,15 @@ if (account.cloned) {
 }
 
 
+if (!loopOnly && !postUrl && !followersOnly) {
+  await ensureFollowerProfile();
+  followerLoopUsed = true;
+  followerLoopChild = spawn(process.execPath, ['scripts/loop/login-and-run.ts', accountId, '--follower-loop', '--blogger', resolvedTarget, ...(yes ? ['--yes'] : [])], { cwd: process.cwd(), stdio: 'inherit', env: loginEnv });
+  followerLoopChild.once('error', error => console.error(`粉丝常驻 loop 启动失败：${error.message}`));
+  followerLoopChild.once('exit', (code, signal) => { followerLoopChild = null; if (!stopping) console.error(`粉丝常驻 loop 已停止（code=${code}, signal=${signal}）；请检查日志。`); });
+  console.log('粉丝常驻 loop 已启动（独立资料，与帖子 loop 并发）。');
+}
+
 outboxChild = spawn(process.execPath, ['scripts/follow/outbox-worker.ts', accountId, ...(confirmFollow ? ['--confirm-follow'] : [])], { cwd: process.cwd(), stdio: 'inherit' });
 outboxChild.once('error', error => console.error(`关注 Outbox 子进程启动失败：${error.message}`));
 outboxChild.once('exit', (code, signal) => { outboxChild = null; if (!stopping) console.error(`关注 Outbox 已停止（code=${code}, signal=${signal}），队列保留。`); });
@@ -201,7 +228,7 @@ console.log(`loop 进入长时运行；每 ${Math.round(schedulerMs / 1000)} 秒
 /** 处理到期的单帖回复任务；串行，避免与当前 loop 争用账号。 */
 let followerScheduleBlocked = loopCode !== 0;
 const processDueFollowerBatch = async (): Promise<boolean> => {
-  if (followerScheduleBlocked || postUrl) return false;
+  if (followerLoopUsed || followerScheduleBlocked || postUrl) return false;
   const db = new DatabaseSync(resolve(dataDir, 'loop.sqlite'));
   db.exec('PRAGMA busy_timeout=10000');
   let checkpoint;
@@ -269,7 +296,7 @@ process.exit(0);
 
 function loopArgs(blogger: string): string[] {
   return ['scripts/loop/login-and-run.ts', accountId, '--blogger', blogger,
-    ...(followersOnly ? ['--followers-only'] : []), ...(language ? ['--language', language] : []), ...(evaluate ? ['--evaluate'] : []),
+    ...(followersOnly ? ['--followers-only'] : []), ...(!followersOnly ? ['--no-followers'] : []), ...(language ? ['--language', language] : []), ...(evaluate ? ['--evaluate'] : []),
     ...(yes ? ['--yes'] : []), ...(postUrl ? ['--post', postUrl] : []), ...(resumeId ? ['--resume', resumeId] : [])];
 }
 

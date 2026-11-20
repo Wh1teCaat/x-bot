@@ -32,6 +32,7 @@ const execute = ({ resume, probe = false }) => new Promise<number>((resolve, rej
     ...(args.accountId ? ['--account-id', args.accountId] : []), ...(args.username ? ['--username', args.username] : []),
     ...(args.blogger ? ['--blogger', args.blogger] : []), ...(args.language ? ['--language', args.language] : []),
     ...(args.followersOnly ? ['--followers-only'] : []), ...(args.evaluate ? ['--evaluate'] : []), ...(args.yes ? ['--yes'] : []), ...(args.postUrl ? ['--post', args.postUrl] : []),
+    ...(args.keepBrowser ? ['--keep-browser'] : []), ...(args.noFollowers ? ['--no-followers'] : []), ...(args.ignorePendingFollowers ? ['--ignore-pending-followers'] : []),
     ...(args.cdpPort ? ['--cdp-port', String(args.cdpPort)] : []), ...(probe ? ['--follow-probe'] : [])];
   const child = spawn(process.execPath, childArgs, { stdio: 'inherit' });
   child.once('error', reject);
