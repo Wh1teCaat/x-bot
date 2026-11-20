@@ -13,7 +13,7 @@ export function ensureHello(text: string): string {
 }
 
 /** 使用 LLM 生成一句简短的欢迎私信，首句固定为 "hello"。 */
-export async function generateDmReply(client: any, follower: { username: string }): Promise<string> {
+export async function generateDmReply(client: any, follower: { username: string }, stage: '回关后的第一条私信' | '一次性欢迎' = '回关后的第一条私信'): Promise<string> {
   const response = await client.chat.completions.create({
     model: process.env.LLM_MODEL,
     stream: false,
@@ -21,12 +21,30 @@ export async function generateDmReply(client: any, follower: { username: string 
     max_tokens: 200,
     messages: [
       { role: 'system', content: readFileSync(new URL('./dm-skill.md', import.meta.url), 'utf8') },
-      { role: 'user', content: JSON.stringify({ stage: '回关后的第一条私信', username: follower.username }) },
+      { role: 'user', content: JSON.stringify({ stage, username: follower.username }) },
     ],
   });
   const choice = response.choices?.[0];
   if (choice?.finish_reason !== 'stop' || !choice.message?.content?.trim()) throw new Error('模型未返回完整私信');
-  return ensureHello(choice.message.content.trim());
+  const text = ensureHello(choice.message.content.trim());
+  if (stage === '一次性欢迎' && !text.replace(/\D/g, '').includes('85257127467')) {
+    return `${text} If you are interested in buying clothing, please add our customer service on WhatsApp: +852 5712 7467.`;
+  }
+  return text;
+}
+
+/** 根据本账号与对方的已记录对话生成后续回复。 */
+export async function generateCustomerReply(client: any, messages: Array<{ role: string; text: string }>): Promise<string> {
+  const response = await client.chat.completions.create({
+    model: process.env.LLM_MODEL, stream: false, temperature: 0.7, max_tokens: 250,
+    messages: [
+      { role: 'system', content: readFileSync(new URL('./dm-skill.md', import.meta.url), 'utf8') },
+      { role: 'user', content: JSON.stringify({ stage: '对方回复后', messages }) },
+    ],
+  });
+  const choice = response.choices?.[0];
+  if (choice?.finish_reason !== 'stop' || !choice.message?.content?.trim()) throw new Error('模型未返回完整私信');
+  return choice.message.content.trim();
 }
 
 /** 封装仅连接本机授权服务发送私信的客户端。 */
@@ -55,6 +73,7 @@ export class LocalDmClient {
       error.retryAfter = response.headers.get('retry-after');
       throw error;
     }
+    if (body.errors?.length || typeof body.data?.dm_event_id !== 'string') throw new Error('私信发送结果不完整，请人工核查');
     return body;
   }
 }
@@ -67,7 +86,7 @@ export type ReplyDispatcher = {
 };
 
 export function createReplyDispatcher(opts: {
-  generate: (follower: { username: string }) => Promise<string>;
+  generate: (follower: { username: string }, accountId: string) => Promise<string>;
   send: (accountId: string, recipientId: string, text: string) => Promise<unknown>;
   onError?: (message: string) => void;
   onSent?: (message: string) => void;
@@ -81,7 +100,7 @@ export function createReplyDispatcher(opts: {
       queue.add(followerId);
       chain = chain
         .then(async () => {
-          const text = await generate({ username: followerUsername });
+          const text = await generate({ username: followerUsername }, accountId);
           await send(accountId, followerId, text);
           const message = `已向 @${followerUsername || followerId} 发送回关私信：${text}`;
           if (onSent) onSent(message); else console.log(message);

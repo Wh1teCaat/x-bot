@@ -3,6 +3,7 @@ import '../../src/runtime-config.ts';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AccountStore } from '../../src/account-store.ts';
 import { open, readFile, unlink } from 'node:fs/promises';
+import { fetchXWithCircuit } from '../../src/x-api-circuit.ts';
 
 const BASE = 'https://api.x.com/2/activity';
 
@@ -17,14 +18,16 @@ export type FollowEvent = {
 };
 
 export type DmEvent = { eventId: string; messageId: string; accountId: string; senderId: string; text: string; occurredAt?: string };
-export type ChatEvent = { eventId: string; messageId: string; accountId: string; senderId: string; conversationId: string };
+export type ChatEvent = { eventId: string; messageId: string; accountId: string; senderId: string; conversationId: string; encodedEvent?: string; conversationKeyChangeEvent?: string };
 
-/** 提取 XChat 加密事件的元数据，不处理密文或密钥。 */
+/** 提取 XChat 事件的元数据和解密所需的密文，不记录密文。 */
 export function parseChatEvent(event: any): ChatEvent | null {
   const accountId = event?.filter?.user_id;
   const payload = event?.payload;
   if (event?.event_type !== 'chat.received' || typeof event.event_uuid !== 'string' || !event.event_uuid || typeof accountId !== 'string' || !/^\d{1,19}$/.test(accountId) || typeof payload?.sender_id !== 'string' || !/^\d{1,19}$/.test(payload.sender_id) || payload.sender_id === accountId || typeof payload.id !== 'string' || !payload.id || typeof payload.conversation_id !== 'string' || !payload.conversation_id) return null;
-  return { eventId: event.event_uuid, messageId: payload.id, accountId, senderId: payload.sender_id, conversationId: payload.conversation_id };
+  return { eventId: event.event_uuid, messageId: payload.id, accountId, senderId: payload.sender_id, conversationId: payload.conversation_id,
+    ...(typeof payload.encoded_event === 'string' && payload.encoded_event ? { encodedEvent: payload.encoded_event } : {}),
+    ...(typeof payload.conversation_key_change_event === 'string' && payload.conversation_key_change_event ? { conversationKeyChangeEvent: payload.conversation_key_change_event } : {}) };
 }
 
 /** 解析旧版入站 DM，校验接收账号，忽略自己发送及不含文本的事件。 */
@@ -81,7 +84,7 @@ export function makeActivityApi(opts: {
         token = account.accessToken;
       } finally { store.close(); }
     }
-    const response = await fetch(BASE + path, { ...init, headers: { Authorization: `Bearer ${token}`, ...init.headers }, signal: controller.signal });
+    const response = await fetchXWithCircuit(BASE + path, { ...init, headers: { Authorization: `Bearer ${token}`, ...init.headers }, signal: controller.signal });
     if (!response.ok) {
       const detail = (await response.text()).slice(0, 1000).replaceAll(token, '[已隐藏]');
       throw new Error(`X API HTTP ${response.status}: ${init.method || 'GET'} ${path.split('?')[0]}: ${detail}`);
@@ -157,6 +160,11 @@ export async function receiveFollowEvents(api: ActivityHttp, controller: AbortCo
       const message = error instanceof Error ? error.message : String(error);
       if (/X API HTTP (400|401|403|404):/.test(message)) throw error;
       console.error(`连接失败：${message}`);
+      if (/X API HTTP 429/.test(message)) {
+        onState('X API 限流，等待熔断冷却');
+        try { await delay(15 * 60_000, undefined, { signal: controller.signal }); } catch { break; }
+        continue;
+      }
     }
     onState('连接断开，等待重连');
     try { await delay(retry * 1000, undefined, { signal: controller.signal }); } catch { break; }

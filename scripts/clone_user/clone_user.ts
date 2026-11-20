@@ -12,6 +12,7 @@ import { actionDelay } from '../browser/action-delay.ts';
 import { loadCookieJar, findCookieFile } from '../browser/cookies.ts';
 import { fingerprintFor } from '../browser/fingerprint.ts';
 import { AccountStore } from '../../src/account-store.ts';
+import { XPageCircuit } from '../browser/x-page-circuit.ts';
 
 const telemetry = monitorProcess(process.env.X_RUNTIME_ACCOUNT_ID, 'clone');
 telemetry.stage('复制目标账号资料');
@@ -45,6 +46,7 @@ const executable = process.env.PROFILE_COPY_CHROME || '/Applications/Google Chro
 const input = createInterface({ input: stdin, output: stdout });
 let context;
 let accountStore;
+let xCircuit: XPageCircuit | undefined;
 async function pause(prompt: string) {
   if (!stdin.isTTY) throw new Error('未检测到 X 登录态。后台运行无法等待终端输入，请更新 .data/cookies/<账号ID>.json（或 .txt）中的 Cookie 后重试。');
   await input.question(prompt);
@@ -112,6 +114,8 @@ async function firstVisible(page: Page, selectors: string[]) {
   throw new Error(`找不到页面控件：${selectors.join(' / ')}；X 页面可能已改版`);
 }
 try {
+  xCircuit = new XPageCircuit();
+  xCircuit.guard();
   cookiePath = await findCookieFile(process.env.X_RUNTIME_ACCOUNT_ID, cookiePath);
   await mkdir(profile, { recursive: true, mode: 0o700 });
   const fp = fingerprintFor(profileName);
@@ -119,6 +123,7 @@ try {
     ignoreDefaultArgs: ['--disable-extensions', '--use-mock-keychain', '--password-store=basic'],
     locale: fp.locale, timezoneId: fp.timezoneId, viewport: fp.viewport, screen: fp.screen, colorScheme: fp.colorScheme,
     extraHTTPHeaders: { 'Accept-Language': fp.acceptLanguage } });
+  xCircuit.attach(context);
   if (cookiePath) {
     const jar = await loadCookieJar(resolve(cookiePath));
     for (const warning of jar.warnings) console.warn(warning);
@@ -145,7 +150,7 @@ try {
     accountStore.close();
     process.exit(0);
   }
-  await page.goto(`https://x.com/${target}`, { waitUntil: 'domcontentloaded' });
+  xCircuit.guard(); await page.goto(`https://x.com/${target}`, { waitUntil: 'domcontentloaded' });
   const heading = page.getByTestId('UserName').first();
   await heading.waitFor({ state: 'visible', timeout: 20000 });
   const lines = (await heading.innerText()).split('\n').map(x => x.trim()).filter(Boolean);
@@ -189,7 +194,7 @@ try {
   console.log('正在自动复制头像、显示名称和简介。');
   // 资料页上的“Edit profile”按钮会把未完成引导的账号带进 /i/flow/setup_profile，
   // 该引导流程依赖 api.x.com 的跨域请求；设置页提供同一套字段并提交到站内接口。
-  await page.goto('https://x.com/settings/profile', { waitUntil: 'domcontentloaded' });
+  xCircuit.guard(); await page.goto('https://x.com/settings/profile', { waitUntil: 'domcontentloaded' });
   const nameField = page.locator('input[name="displayName"]');
   await nameField.waitFor({ state: 'visible', timeout: 20000 });
   await actionDelay(page);
@@ -200,6 +205,7 @@ try {
   const beforeBanner = await page.locator('img[src*="pbs.twimg.com/profile_banners/"]').first().getAttribute('src').catch(() => null);
   // 头像上传挂在“Add avatar photo”按钮上；直接给隐藏 input 赋值不会触发 X 的裁剪和上传。
   await actionDelay(page);
+  xCircuit.guard();
   const [chooser] = await Promise.all([
     page.waitForEvent('filechooser', { timeout: 15000 }),
     page.getByRole('button', { name: /avatar photo|头像照片/i }).first().click({ timeout: 15000 }),
@@ -207,11 +213,12 @@ try {
   await chooser.setFiles({ name: `avatar.${type === 'image/png' ? 'png' : type === 'image/webp' ? 'webp' : 'jpg'}`, mimeType: type, buffer: image });
   // 头像由 X 异步上传；保存后等 update_profile_image 返回，避免离开页面时中断上传。
   const avatarUpdate = page.waitForResponse(response => response.url().includes('/account/update_profile_image.json'), { timeout: 40000 }).catch(() => null);
-  await applyCrop(page, '头像');
+  xCircuit.guard(); await applyCrop(page, '头像');
   await page.waitForTimeout(1000);
   let bannerUpdate = null;
   if (bannerImage) {
     await actionDelay(page);
+    xCircuit.guard();
     const [bannerChooser] = await Promise.all([
       page.waitForEvent('filechooser', { timeout: 15000 }),
       page.getByRole('button', { name: /banner photo|banner|横幅/i }).first().click({ timeout: 15000 }),
@@ -222,14 +229,14 @@ try {
       buffer: bannerImage,
     });
     bannerUpdate = page.waitForResponse(response => /update_profile_banner/.test(response.url()), { timeout: 40000 }).catch(() => null);
-    await applyCrop(page, '横幅', false);
+    xCircuit.guard(); await applyCrop(page, '横幅', false);
     await page.waitForTimeout(1000);
   }
   const save = page.getByTestId('Profile_Save_Button');
   for (let attempt = 0; attempt < 20 && !await save.isEnabled(); attempt++) await page.waitForTimeout(500);
   if (!await save.isEnabled()) throw new Error('资料保存按钮不可用，未提交修改');
   await actionDelay(page);
-  await save.click({ timeout: 15000 });
+  xCircuit.guard(); await save.click({ timeout: 15000 });
   const avatarResult = await avatarUpdate;
   if (!avatarResult?.ok()) throw new Error('头像上传未完成，请在浏览器检查；名称和简介可能已保存');
   if (bannerUpdate) {
@@ -239,7 +246,7 @@ try {
   await page.waitForTimeout(2000);
   telemetry.stage('核对资料保存结果');
   console.log('资料保存请求已提交，正在检查结果……');
-  await page.goto(`https://x.com/${owner}`, { waitUntil: 'domcontentloaded' });
+  xCircuit.guard(); await page.goto(`https://x.com/${owner}`, { waitUntil: 'domcontentloaded' });
   const ownLines = (await page.getByTestId('UserName').first().innerText({ timeout: 15000 })).split('\n').map(x => x.trim()).filter(Boolean);
   const ownBio = await readBio(page);
   if (normalizeText(ownLines[0]) !== normalizeText(name) || normalizeText(ownBio) !== normalizeText(description)) throw new Error('名称或简介未通过保存后核对，请在浏览器检查；头像也需人工确认');
@@ -251,7 +258,7 @@ try {
   if (updateOnly) {
     console.log('资料已更新；--update 不修改用户名。');
   } else {
-  await page.goto('https://x.com/settings/screen_name', { waitUntil: 'domcontentloaded' });
+  xCircuit.guard(); await page.goto('https://x.com/settings/screen_name', { waitUntil: 'domcontentloaded' });
   const field = await firstVisible(page, ['input[name="typedScreenName"]', 'input[autocomplete="username"]', 'input[name="screen_name"]', 'input[name="username"]', 'input[data-testid="ocfEnterTextTextInput"]']);
   // 输入被占用的目标用户名，让 X 显示自己的用户名建议；改名是高风险步骤，多停一会再拟人化输入。
   await page.waitForTimeout(1000 + Math.floor(Math.random() * 2000));
@@ -265,11 +272,12 @@ try {
   telemetry.stage('保存并核对用户名');
   console.log(`正在保存 X 推荐的第一个用户名：@${suggestion}`);
   await page.waitForTimeout(1000 + Math.floor(Math.random() * 2000));
-  await saveUsername.click();
+  xCircuit.guard(); await saveUsername.click();
   // 保存成功后设置页会回到 /settings/account；用户名生效可能有延迟，轮询核对。
   await page.waitForURL(/\/settings\/account/, { timeout: 10000 }).catch(() => {});
   let actual = '';
   for (let attempt = 0; attempt < 12; attempt++) {
+    xCircuit.guard();
     await page.waitForTimeout(1200);
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded' }).catch(() => {});
     actual = await currentHandle(page).catch(() => '');
@@ -296,4 +304,5 @@ try {
   input.close();
   accountStore?.close();
   await context?.close().catch(() => {});
+  xCircuit?.close();
 }

@@ -8,6 +8,27 @@ import { createCipheriv, randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { AccountStore } from "../src/account-store.ts";
 
+test('PIN is encrypted and isolated by authenticated account; updating clears blocked state', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'x-pin-'));
+  try {
+    const store = new AccountStore(dir);
+    store.upsert({ uuid: '1', username: 'a', authenticated: true });
+    store.upsert({ uuid: '2', username: 'b', authenticated: true });
+    assert.equal(store.setXChatPin('1', '4826'), true);
+    assert.equal(store.getXChatPin('1'), '4826');
+    assert.equal(store.getXChatPin('2'), null);
+    assert.throws(() => store.setXChatPin('1', '123'), /四位/);
+    store.blockXChatPin('1');
+    assert.equal(store.isXChatPinBlocked('1'), true);
+    store.setXChatPin('1', '4826');
+    assert.equal(store.isXChatPinBlocked('1'), false);
+    const db = new DatabaseSync(join(dir, 'accounts.sqlite'));
+    const row = db.prepare('SELECT xchat_pin FROM accounts WHERE uuid=?').get('1') as {xchat_pin: string};
+    assert.notEqual(row.xchat_pin, '4826');
+    db.close(); store.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("persists account identity, flags and encrypted tokens", () => {
   const dir = mkdtempSync(join(tmpdir(), "x-account-store-"));
   try {

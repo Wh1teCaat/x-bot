@@ -3,10 +3,35 @@ import '../../src/runtime-config.ts';
 import type { Page } from 'playwright';
 import type { DatabaseSync } from 'node:sqlite';
 import { ensureExporter24Auth, readExporter24Gate, EXPORTER24_EXTENSION_ID } from './exporter24.ts';
+import { ExporterError } from './exporter-retry.ts';
 
 export const FOLLOWER_BATCH_SIZE = 200;
 /** 导出节奏；关注速率由 Outbox worker 单独限制，这里只控制抓取批次间隔。 */
 export const FOLLOWER_INTERVAL_MS = 15 * 60 * 1000;
+
+/** 只在能证明扩展采集已停止时允许重新运行。 */
+export async function stopFollowerBatchForRetry(page: Page): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      page.evaluate(async () => {
+        const store = (globalThis as any).__followerStore;
+        if (!store) throw new Error('扩展状态不可用');
+        if (store.runningTaskId || store.isProcessing) {
+          if (typeof store.stopRun !== 'function') throw new Error('扩展停止接口不可用');
+          await store.stopRun();
+        }
+      }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('扩展停止超时')), 10_000); }),
+    ]);
+    await page.waitForFunction(() => {
+      const store = (globalThis as any).__followerStore;
+      return Boolean(store && !store.runningTaskId && !store.isProcessing);
+    }, undefined, { timeout: 10_000 });
+    return true;
+  } catch { return false; }
+  finally { if (timer) clearTimeout(timer); }
+}
 export type FollowerCheckpoint = { taskId: string | null; offset: number; due: number; done: boolean };
 export class FollowerCheckpoints {
   private db: DatabaseSync;
@@ -149,7 +174,7 @@ export async function resumeLatestFollowerTask(page: Page, username: string): Pr
  * 登录会重新加载扩展页，任务从已保存的历史断点（taskId）继续，本地偏移不变。
  */
 export async function readFollowerBatch(page: Page, username: string, checkpoint: FollowerCheckpoint,
-  saveTask: (id: string) => void, guard: () => void | Promise<void>) {
+  saveTask: (id: string) => void, guard: () => void | Promise<void>, options: { recoverTimeout?: boolean } = {}) {
   await ensureExporter24Auth(page, guard);
   let loggedIn = false, retried = false;
   for (;;) {
@@ -163,8 +188,9 @@ export async function readFollowerBatch(page: Page, username: string, checkpoint
         continue;
       }
       // 任务页加载不出来时，先用 History 最新一条恢复；没有可恢复任务才新建，按本地 offset 从 0 补抓。
-      if (!retried && /waitForFunction|Timeout/i.test(String(error?.message || error))) {
+      if (options.recoverTimeout && !retried && /waitForFunction|Timeout/i.test(String(error?.message || error))) {
         retried = true;
+        if (!await stopFollowerBatchForRetry(page)) throw new ExporterError('无法确认 exporter24 任务已停止，请人工检查后恢复', false, error);
         if (checkpoint.taskId) {
           console.log('exporter24 历史任务加载失败，尝试从 History 最新一条恢复。');
           const latest = await resumeLatestFollowerTask(page, username).catch((resumeError) => {

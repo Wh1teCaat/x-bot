@@ -16,6 +16,7 @@ import { ensureProfileFromTemplate, PROFILE_TEMPLATE_DIR } from '../browser/prof
 import { AccountStore } from '../../src/account-store.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { FollowerCheckpoints } from '../browser/follower-batch.ts';
+import { XPageCircuit } from '../browser/x-page-circuit.ts';
 
 const args = process.argv.slice(2);
 const accountId = args[0];
@@ -40,6 +41,7 @@ const profile = join(root, accountId + profileSuffix);
 const lockPath = join(root, `${accountId}${profileSuffix}.lock`);
 const executable = process.env.X_BROWSER_EXECUTABLE || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 let lockOwned = false, loginBrowser, context, worker, store;
+let pageCircuit: XPageCircuit | undefined;
 let stopping = false;
 
 async function acquireLock() {
@@ -164,7 +166,12 @@ async function runFollowerLoop() {
         child.once('exit', value => { worker = null; resolveCode(value ?? 1); });
       });
       telemetry.stage('等待粉丝批次', 'waiting');
-      if (code !== 0) { console.error('粉丝本批失败，断点保留；60 秒后重试。'); if (!stopping) await sleep(60000); }
+      if (code !== 0) {
+        const exporter = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='exporter_retry'").get();
+        const manual = exporter && db.prepare("SELECT state FROM exporter_retry WHERE scope IN (?,?) AND state='manual' LIMIT 1").get(`exporter:${accountId}`, `exporter-open:${accountId}`) as { state?: string } | undefined;
+        if (manual?.state === 'manual') { console.error('exporter24 需要人工检查，粉丝常驻流程已停止；断点保留。'); break; }
+        console.error('粉丝本批失败，断点保留；60 秒后重试。'); if (!stopping) await sleep(60000);
+      }
     }
   } finally { db.close(); }
 }
@@ -174,6 +181,7 @@ async function runFollowerLoop() {
     : '正在用 Playwright 打开该账号的浏览器资料并执行任务……');
   const headless = /^(1|true|yes)$/i.test(process.env.X_HEADLESS || '');
   if (headless) console.log('X_HEADLESS=1：浏览器以无界面模式启动。');
+  pageCircuit = new XPageCircuit();
   context = await chromium.launchPersistentContext(profile, {
     headless, executablePath: executable,
     ignoreDefaultArgs: ['--disable-extensions', '--use-mock-keychain', '--password-store=basic'],
@@ -181,10 +189,16 @@ async function runFollowerLoop() {
     locale: fp.locale, timezoneId: fp.timezoneId, viewport: fp.viewport, screen: fp.screen, colorScheme: fp.colorScheme,
     extraHTTPHeaders: { 'Accept-Language': fp.acceptLanguage },
   });
-  if (needsCheck) {
+  pageCircuit.attach(context);
+  const xBlockedAtStartup = pageCircuit.isBlocked();
+  if (xBlockedAtStartup && checkOnly) throw new Error('X 页面熔断中，暂不能检查登录状态');
+  if (xBlockedAtStartup) {
+    console.log('X 页面熔断中，跳过启动时的页面读取，交由采集调度器执行冷却和恢复探测。');
+  } else if (needsCheck) {
     if (!chromeReady && cookieJar) await context.addCookies(cookieJar.cookies);
     const page = context.pages()[0] || await context.newPage();
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    pageCircuit.guard(); await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    pageCircuit.guard();
     const href = await page.getByTestId('AppTabBar_Profile_Link').getAttribute('href', { timeout: 10000 }).catch(() => null);
     const readiness = accountReadiness(href, username, false);
     if (readiness === 'login') {
@@ -213,8 +227,10 @@ async function runFollowerLoop() {
     // 就绪账号不再走登录检查；先把初始 about:blank 打开成 X 主页，
     // 避免任务因限流冷却或立即失败时，窗口一直停在空白页。
     const blank = context.pages().find(page => page.url() === 'about:blank');
+    pageCircuit.guard();
     if (blank) await blank.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 })
       .catch(error => console.warn(`浏览器未能打开 X 主页：${error.message}`));
+    pageCircuit.guard();
   }
   if (stopping) throw new Error('已取消');
   if (checkOnly) {
@@ -237,5 +253,6 @@ async function runFollowerLoop() {
   stop();
   store?.close();
   await context?.close().catch(() => {});
+  pageCircuit?.close();
   if (lockOwned) await unlink(lockPath).catch(() => {});
 }

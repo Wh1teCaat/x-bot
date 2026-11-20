@@ -6,8 +6,9 @@ import { stageLabels } from '../../src/console-data.ts';
 import { connectTestingBrowser } from '../browser/browser-connection.ts';
 import { actionDelay, createProfileVisitDelay } from '../browser/action-delay.ts';
 import { openExporter24, readExporter24Counts, EXPORTER24_EXTENSION_ID } from '../browser/exporter24.ts';
-import { acquireExporterLock, withExporterLock } from '../browser/exporter-lock.ts';
-import { FollowerCheckpoints, readFollowerBatch, FOLLOWER_INTERVAL_MS } from '../browser/follower-batch.ts';
+import { withExporterLock, withExporterRetryLock } from '../browser/exporter-lock.ts';
+import { FollowerCheckpoints, readFollowerBatch, stopFollowerBatchForRetry, FOLLOWER_INTERVAL_MS } from '../browser/follower-batch.ts';
+import { ExporterRetry, ExporterError } from '../browser/exporter-retry.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -157,6 +158,7 @@ try {
   let llm;
   const getLlm = () => llm || (llm = makeLlm());
   let page;
+  let xTransientFailures = 0;
   /** 连接测试浏览器并监听 X 页面请求中的 429 响应。 */
   async function getPage() {
     ensureX();
@@ -168,7 +170,12 @@ try {
     context.on('response', response => {
       try {
         const host = new URL(response.url()).hostname.toLowerCase();
-        if (response.status() === 429 && (host === 'x.com' || host.endsWith('.x.com') || host === 'twitter.com' || host.endsWith('.twitter.com'))) resilience.open('x', 'X 返回 HTTP 429');
+        if (host === 'x.com' || host.endsWith('.x.com') || host === 'twitter.com' || host.endsWith('.twitter.com')) {
+          if (response.status() === 429) resilience.open('x', 'X 返回 HTTP 429');
+          else if (response.status() >= 500) {
+            if (++xTransientFailures >= 3) resilience.open('x', 'X 页面请求连续出现服务端错误');
+          } else if (response.status() < 400) xTransientFailures = 0;
+        }
       } catch {}
     });
     page = await getCollectorPage(context); await page.bringToFront();
@@ -245,14 +252,25 @@ try {
       // 常驻粉丝页：复用同一 Chrome 里已经打开的 exporter 页面，避免按 taskId 重新加载。
       exporterPage = page.context().pages().find(item => !item.isClosed() && item.url().startsWith(`chrome-extension://${EXPORTER24_EXTENSION_ID}/`)) ?? null;
     }
-    if (!exporterPage) exporterPage = await openExporter24(page.context());
+    if (!exporterPage) {
+      const openRetry = new ExporterRetry(db, `exporter-open:${state.followAccountId}`);
+      exporterPage = await withExporterRetryLock(state.followAccountId, () => openRetry.run(() => withExporterLock(() => openExporter24(page.context(), { throwOnLoadedError: true })), { guard: guardX }));
+    }
     if (!exporterPage) throw new Error('未检测到 exporter24 扩展');
     let batchSaved = false;
     try {
-      const result = await withExporterLock(() => readFollowerBatch(exporterPage, state.blogger, checkpoint, taskId => {
-        checkpoint.taskId = taskId;
-        followerCheckpoints.save(state.followAccountId, state.blogger, checkpoint);
-      }, guardX));
+      const retry = new ExporterRetry(db, `exporter:${state.followAccountId}`);
+      const result = await withExporterRetryLock(state.followAccountId, () => retry.run(() => withExporterLock(async () => {
+        try {
+          return await readFollowerBatch(exporterPage, state.blogger, checkpoint, taskId => {
+            checkpoint.taskId = taskId;
+            followerCheckpoints.save(state.followAccountId, state.blogger, checkpoint);
+          }, guardX, { recoverTimeout: (retry.get()?.attempts || 0) > 0 });
+        } catch (error) {
+          if (!await stopFollowerBatchForRetry(exporterPage)) throw new ExporterError('无法确认 exporter24 任务已停止，请人工检查后恢复', false, error);
+          throw error;
+        }
+      }), { guard: guardX }));
       state.followerBatch = result;
       state.phase = 'followers';
       state.post = null;
@@ -321,19 +339,18 @@ try {
     if (needCounts.length) {
       const page = await getPage();
       let exporterPage = null;
-      let releaseExporter = async () => {};
       try {
         // 粉丝抓取和补数共用 exporter，同一时间只允许一个任务。
-        releaseExporter = await acquireExporterLock();
-        exporterPage = await openExporter24(page.context());
+        const openRetry = new ExporterRetry(db, `exporter-open:${state.followAccountId || 'shared'}`);
+        exporterPage = await withExporterRetryLock(state.followAccountId, () => openRetry.run(() => withExporterLock(() => openExporter24(page.context(), { throwOnLoadedError: true })), { guard: guardX }));
       } catch (error) {
+        if (error instanceof ExporterError || resilience.circuit('x')?.state === 'open') throw error;
         console.log(`exporter24 补数未执行：${error?.message || error}，改用主页读取。`);
         exporterPage = null;
-        await releaseExporter();
       }
-      if (!exporterPage) await releaseExporter();
       if (exporterPage) {
         console.log(`检测到 exporter24，用扩展读取 ${needCounts.length} 人的关注/粉丝数。`);
+        const retry = new ExporterRetry(db, `exporter:${state.followAccountId || 'shared'}`);
         let consecutiveFailures = 0;
         try {
           for (let index = 0; index < needCounts.length; index++) {
@@ -341,9 +358,12 @@ try {
             if (hasBoth(candidate)) continue;
             const key = candidate.username.toLowerCase();
             await guardX();
-            await actionDelay(exporterPage);
             try {
-              const counts = await readExporter24Counts(exporterPage, candidate.username, guardX);
+              const counts = await withExporterRetryLock(state.followAccountId, () => retry.run(() => withExporterLock(async () => {
+                await guardX();
+                await actionDelay(exporterPage);
+                return readExporter24Counts(exporterPage, candidate.username, guardX);
+              }), { guard: guardX }));
               consecutiveFailures = 0;
               state.profileCounts[key] = counts;
               if (counts.followers !== undefined) candidate.followers = counts.followers;
@@ -353,6 +373,7 @@ try {
               }
             } catch (error) {
               if (resilience.circuit('x')?.state === 'open') throw error;
+              if (error instanceof ExporterError) throw error;
               consecutiveFailures++;
               state.profileCounts[key] = { error: String(error?.message || error).slice(0, 300) };
               console.log(`exporter24 失败 @${candidate.username}：${error?.message || error}`);
@@ -365,7 +386,6 @@ try {
           }
         } finally {
           await exporterPage.close().catch(() => {});
-          await releaseExporter();
         }
         persist('running');
       } else {

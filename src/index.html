@@ -68,6 +68,40 @@ h2{font-size:16px;margin:0 0 10px}.intro{margin-bottom:28px}.panel{border:1px so
         readyTag.className = 'tag';
         readyTag.textContent = account.chromeReady ? '浏览器已就绪' : '待检查';
         item.append(scopeTag, cookieTag, readyTag);
+        const pinForm = document.createElement('form');
+        pinForm.className = 'row';
+        const pinInput = document.createElement('input');
+        pinInput.type = 'password'; pinInput.inputMode = 'numeric'; pinInput.maxLength = 4; pinInput.pattern = '[0-9]{4}'; pinInput.required = true; pinInput.autocomplete = 'off'; pinInput.placeholder = '四位 XChat PIN';
+        const pinButton = document.createElement('button');
+        pinButton.type = 'submit'; pinButton.className = 'secondary'; pinButton.textContent = account.hasXChatPin ? '更新 PIN' : '导入 PIN';
+        const pinStatus = document.createElement('small');
+        pinStatus.textContent = account.xchatPinBlocked ? '解锁失败，请检查后重新导入 PIN' : account.hasXChatPin ? '已保存 PIN' : '未保存 PIN';
+        pinForm.append(pinInput, pinButton, pinStatus);
+        if (account.hasXChatPin) {
+          const removePin = document.createElement('button');
+          removePin.type = 'button'; removePin.className = 'secondary'; removePin.textContent = '移除 PIN';
+          removePin.addEventListener('click', async () => {
+            removePin.disabled = true;
+            try {
+              const response = await fetch(`/api/accounts/${account.user.id}/xchat-pin`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ pin: null }) });
+              const result = await response.json();
+              if (!response.ok) throw new Error(result.error || '移除失败');
+              await loadAccounts();
+            } catch (error) { pinStatus.textContent = `移除失败：${error.message}`; removePin.disabled = false; }
+          });
+          pinForm.append(removePin);
+        }
+        pinForm.addEventListener('submit', async (event) => {
+          event.preventDefault(); pinButton.disabled = true;
+          try {
+            const response = await fetch(`/api/accounts/${account.user.id}/xchat-pin`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ pin: pinInput.value }) });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || '保存失败');
+            pinInput.value = ''; pinStatus.textContent = '已保存 PIN'; pinButton.textContent = '更新 PIN';
+          } catch (error) { pinStatus.textContent = `保存失败：${error.message}`; }
+          finally { pinButton.disabled = false; }
+        });
+        item.append(pinForm);
         list.append(item);
       }
       if (!data.accounts.length) list.textContent = '尚未授权账号';

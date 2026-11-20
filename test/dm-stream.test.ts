@@ -20,7 +20,7 @@ test('DM parsing validates direction and dispatches the valid message from the s
 
 test('encrypted chat events are dispatched as metadata without exposing encoded content', async () => {
   const chat = { event_type: 'chat.received', event_uuid: 'delivery-2', filter: { user_id: '1' }, payload: { id: 'message-uuid', sender_id: '2', conversation_id: '1:2', encoded_event: 'ciphertext' } };
-  assert.deepEqual(parseChatEvent(chat), { eventId: 'delivery-2', messageId: 'message-uuid', accountId: '1', senderId: '2', conversationId: '1:2' });
+  assert.deepEqual(parseChatEvent(chat), { eventId: 'delivery-2', messageId: 'message-uuid', accountId: '1', senderId: '2', conversationId: '1:2', encodedEvent: 'ciphertext' });
   assert.equal(parseChatEvent({ ...chat, payload: { ...chat.payload, sender_id: '1' } }), null);
   const controller = new AbortController();
   const received: string[] = [];

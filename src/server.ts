@@ -20,6 +20,7 @@ import { shouldAutoStartAccountSession, startAccountSession } from "./account-se
 import { startAllConsoleLoops } from "./console-start.ts";
 import { readConsole } from "./console-data.ts";
 import { AccountStore } from "./account-store.ts";
+import { XApiCircuit, rateLimitDelay } from './x-api-circuit.ts';
 
 const port = Number(process.env.PORT || 3000);
 if (!Number.isInteger(port) || port < 1 || port > 65535)
@@ -51,6 +52,9 @@ const dataDir =
   (process.env.NODE_ENV === "test" && process.env.X_TEST_DATA_DIR) || ".data";
 
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+const apiCircuitDb = new DatabaseSync(join(dataDir, 'x-api-circuits.sqlite'));
+apiCircuitDb.exec('PRAGMA busy_timeout=5000');
+const apiCircuit = new XApiCircuit(apiCircuitDb);
 
 type User = { id: string; name: string; username: string };
 
@@ -173,24 +177,30 @@ async function proxyFilteredStream(res: ServerResponse, username: string) {
   const controller = new AbortController();
   const onClose = () => controller.abort();
   res.once("close", onClose);
+  const streamScope = apiCircuit.key('/2/tweets/search/stream', 'GET', `Bearer ${streamBearerToken}`);
   try {
+    if (!apiCircuit.allow(streamScope)) throw new HttpError(429, 'X API 熔断冷却中，暂不连接推文流。');
     const streamParams = new URLSearchParams({
       "tweet.fields": "attachments,text,author_id",
       expansions: "attachments.media_keys,author_id",
       "user.fields": "username",
       "media.fields": "type,url,preview_image_url",
     });
-    const upstream = await fetch(`${apiBase}/2/tweets/search/stream?${streamParams}`, {
+    let upstream: Response;
+    try { upstream = await fetch(`${apiBase}/2/tweets/search/stream?${streamParams}`, {
       headers: { Authorization: `Bearer ${streamBearerToken}` },
       signal: controller.signal,
-    });
+    }); } catch (error) { if (!controller.signal.aborted) apiCircuit.failure(streamScope, 503); throw error; }
     if (!upstream.ok || !upstream.body) {
+      if (upstream.status === 429 || upstream.status >= 500) apiCircuit.failure(streamScope, upstream.status, rateLimitDelay(upstream.headers));
+      else apiCircuit.reject(streamScope);
       const text = await upstream.text().catch(() => "");
       let detail = "";
       try { const payload = JSON.parse(text); detail = String(payload.detail || payload.title || ""); }
       catch { detail = text; }
       throw new HttpError(upstream.status, `无法连接 X 推文流（HTTP ${upstream.status}）${detail ? `：${detail.slice(0, 300)}` : "，请确认 App-Only token 与 API 套餐支持 filtered stream。"}`);
     }
+    apiCircuit.success(streamScope);
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
     const reader = upstream.body.getReader();
     for (;;) {
@@ -224,6 +234,8 @@ async function uploadMedia(account: Account, url: string): Promise<string> {
   if (!bytes.length || bytes.length > 5 * 1024 * 1024) throw new HttpError(400, "图片为空或超过 5 MB。");
 
   let result: Response;
+  const scope = apiCircuit.key('/2/media/upload', 'POST', `Bearer ${account.accessToken}`);
+  if (!apiCircuit.allow(scope)) throw new HttpError(429, 'X API 熔断冷却中，暂不上传图片。');
   try {
     result = await fetch(`${apiBase}/2/media/upload`, {
       method: "POST",
@@ -231,9 +243,14 @@ async function uploadMedia(account: Account, url: string): Promise<string> {
       body: JSON.stringify({ media: bytes.toString("base64"), media_category: "tweet_image", media_type: type }),
       signal: AbortSignal.timeout(60000),
     });
-  } catch { throw new HttpError(502, "无法上传图片到 X。"); }
+  } catch { apiCircuit.failure(scope, 503); throw new HttpError(502, "无法上传图片到 X。"); }
   const payload: any = await result.json().catch(() => ({}));
-  if (!result.ok) throw new HttpError(result.status === 429 ? 429 : 502, `X 图片上传失败（HTTP ${result.status}）。`);
+  if (!result.ok) {
+    if (result.status === 429 || result.status >= 500) apiCircuit.failure(scope, result.status, rateLimitDelay(result.headers));
+    else apiCircuit.reject(scope);
+    throw new HttpError(result.status === 429 ? 429 : 502, `X 图片上传失败（HTTP ${result.status}）。`);
+  }
+  apiCircuit.success(scope);
   const mediaId = payload.data?.media_id_string ?? payload.data?.id;
   if (!mediaId) throw new HttpError(502, "X 未返回 media_id。");
   return String(mediaId);
@@ -251,6 +268,8 @@ function cookie(req: IncomingMessage, name: string) {
 /** 调用 X API，限制超时并转换可安全暴露的错误。 */
 async function xRequest(path: string, init: RequestInit = {}) {
   let response: Response;
+  const scope = apiCircuit.key(path, init.method || 'GET', new Headers(init.headers).get('authorization') || '');
+  if (!apiCircuit.allow(scope)) throw new HttpError(429, 'X API 熔断冷却中，暂不发送请求。', { 'retry-after': '900' });
 
   try {
     response = await fetch(`${apiBase}${path}`, {
@@ -259,11 +278,14 @@ async function xRequest(path: string, init: RequestInit = {}) {
       signal: AbortSignal.timeout(15000),
     });
   } catch {
+    apiCircuit.failure(scope, 503);
     throw new HttpError(502, "无法连接 X API，请检查网络后重试。");
   }
   const payload: any = await response.json().catch(() => ({}));
 
   if (!response.ok) {
+    if (response.status === 429 || response.status >= 500) apiCircuit.failure(scope, response.status, rateLimitDelay(response.headers));
+    else apiCircuit.reject(scope);
     const forwarded: Record<string, string> = {};
 
     for (const name of [
@@ -291,6 +313,7 @@ async function xRequest(path: string, init: RequestInit = {}) {
     );
   }
 
+  apiCircuit.success(scope);
   return payload;
 }
 
@@ -626,6 +649,16 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const pinMatch = url.pathname.match(/^\/api\/accounts\/(\d{1,19})\/xchat-pin$/);
+    if (req.method === 'POST' && pinMatch) {
+      if (req.headers.origin !== origin || req.headers['x-local-request'] !== '1') throw new HttpError(403, 'Invalid local request');
+      const { pin } = await readJsonBody(req);
+      if (pin !== null && (typeof pin !== 'string' || !/^\d{4}$/.test(pin))) throw new HttpError(400, 'PIN 必须是四位数字');
+      if (!accountStore.setXChatPin(pinMatch[1], pin)) throw new HttpError(404, '未找到已授权账号');
+      json(res, 200, { hasXChatPin: pin !== null });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/cookies/import") {
       if (req.headers["x-local-request"] !== "1" || (req.headers.origin && req.headers.origin !== origin))
         throw new HttpError(403, "Invalid local request");
@@ -842,6 +875,8 @@ const server = createServer(async (req, res) => {
         scope: record.scope,
         expiresAt: record.expiresAt,
         chromeReady: record.chromeReady,
+        hasXChatPin: accountStore.hasXChatPin(record.uuid!),
+        xchatPinBlocked: accountStore.isXChatPinBlocked(record.uuid!),
         hasCookie: existsSync(join(dataDir, "cookies", `${record.uuid}.json`)) || existsSync(join(dataDir, "cookies", `${record.uuid}.txt`)),
       }));
       json(res, 200, { accounts });

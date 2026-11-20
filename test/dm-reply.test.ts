@@ -31,6 +31,9 @@ test('welcome generation loads the conversation skill and identifies the greetin
   assert.match(request.messages[0].content, /\+852 5712 7467/);
   assert.match(request.messages[0].content, /此时不要询问购买衣物/);
   assert.deepEqual(JSON.parse(request.messages[1].content), { stage: '回关后的第一条私信', username: 'alice' });
+  await generateDmReply(llm, { username: 'alice' }, '一次性欢迎');
+  assert.equal(JSON.parse(request.messages[1].content).stage, '一次性欢迎');
+  assert.match(await generateDmReply(client('hello there'), { username: 'alice' }, '一次性欢迎'), /\+852 5712 7467/);
 });
 
 test('LocalDmClient sends a DM through the local service and validates ids', async () => {

@@ -38,6 +38,7 @@ function fakeStore(total: number, more = false) {
     task: { id: 'saved', type: 'followers', src: { username: 'alice' } },
     runningTaskId: null, isProcessing: false, fetchedCount: total, profileList: { hasMore: more },
     cooldownManager: { sleepForSearch: async () => {} },
+    stopRun: async () => {},
     profileChunkStore: { queryPage: async ({ page, pageSize }) => users.slice((page - 1) * pageSize, page * pageSize) },
     toggleRun: async (): Promise<void> => { throw new Error('should use cached users'); },
   };
@@ -95,7 +96,7 @@ test('retries once when the exporter24 task page is slow to mount', async () => 
     return originalWait(...args);
   };
   try {
-    const result = await readFollowerBatch(page, 'alice', { taskId: 'saved', offset: 0, due: 0, done: false }, () => {}, () => {});
+    const result = await readFollowerBatch(page, 'alice', { taskId: 'saved', offset: 0, due: 0, done: false }, () => {}, () => {}, { recoverTimeout: true });
     assert.equal(result.candidates.length, 200);
     assert.ok(waits >= 2);
   } finally { delete (globalThis as any).__followerStore; }

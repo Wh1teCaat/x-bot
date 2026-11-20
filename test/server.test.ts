@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
+import { DatabaseSync } from 'node:sqlite';
 
 test("multi-account PKCE, persistence, refresh and follower pagination", async () => {
   let tokenCalls = 0;
@@ -373,8 +374,14 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
     const rateLimited = await fetch(`${base}/api/accounts/1/users/429/follow`, { method: "POST", headers: followHeaders });
     assert.equal(rateLimited.status, 429);
     assert.equal(rateLimited.headers.get("retry-after"), "20");
+    const afterLimit = calls.length;
     const againLimited = await fetch(`${base}/api/accounts/1/users/429/follow`, { method: "POST", headers: followHeaders });
     assert.equal(againLimited.status, 429);
+    assert.equal(calls.length, afterLimit);
+    // 下一次相同接口的请求受熔断保护；模拟冷却期到达再继续后续集成流程。
+    const circuitDb = new DatabaseSync(join(dir, 'x-api-circuits.sqlite'));
+    circuitDb.prepare("UPDATE x_api_circuits SET next_at=0 WHERE state='open'").run();
+    circuitDb.close();
     const autoUrl = `${base}/api/accounts/1/follow-arab-follower`;
     assert.equal((await fetch(autoUrl, { method: "POST", headers: header })).status, 403);
     const callCount = calls.length;
@@ -495,6 +502,13 @@ test("multi-account PKCE, persistence, refresh and follower pagination", async (
     assert.equal(((await posted.json()) as any).data.id, "5000");
 
     // 私信端点：账号 2 无 dm.write，账号 1 具备。
+    const pinUrl = `${base}/api/accounts/1/xchat-pin`;
+    assert.equal((await fetch(pinUrl, { method: 'POST', headers: header, body: JSON.stringify({ pin: '4826' }) })).status, 403);
+    assert.equal((await fetch(pinUrl, { method: 'POST', headers: followHeaders, body: JSON.stringify({ pin: '123' }) })).status, 400);
+    assert.equal((await fetch(pinUrl, { method: 'POST', headers: followHeaders, body: JSON.stringify({ pin: '4826' }) })).status, 200);
+    const cookieAccounts = await (await fetch(`${base}/api/cookies`, { headers: header })).json() as any;
+    assert.equal(cookieAccounts.accounts.find((a: any) => a.user.id === '1').hasXChatPin, true);
+    assert.equal(JSON.stringify(cookieAccounts).includes('4826'), false);
     assert.equal((await fetch(`${base}/api/accounts/2/messages`, { method: "POST", headers: followHeaders, body: JSON.stringify({ recipient_id: "123", text: "hello" }) })).status, 403);
     assert.equal((await fetch(`${base}/api/accounts/1/messages`, { method: "POST", headers: followHeaders, body: JSON.stringify({ recipient_id: "bad", text: "hello" }) })).status, 400);
     assert.equal((await fetch(`${base}/api/accounts/1/messages`, { method: "POST", headers: followHeaders, body: JSON.stringify({ recipient_id: "123", text: "  " }) })).status, 400);

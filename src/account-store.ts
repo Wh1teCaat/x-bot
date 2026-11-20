@@ -122,6 +122,8 @@ export class AccountStore {
     add("copied_from_name", "copied_from_name TEXT");
     add("copied_at", "copied_at TEXT");
     add("keywords", "keywords TEXT");
+    add("xchat_pin", "xchat_pin TEXT");
+    add("xchat_pin_blocked", "xchat_pin_blocked INTEGER NOT NULL DEFAULT 0");
   }
 
   /** 惰性读取或创建加密密钥；仅在首次读写令牌时访问。 */
@@ -195,6 +197,29 @@ export class AccountStore {
   getByUuid(uuid: string): AccountRecord | undefined {
     const row = this.db.prepare("SELECT * FROM accounts WHERE uuid=?").get(uuid) as Row | undefined;
     return row ? this.toRecord(row) : undefined;
+  }
+
+  /** PIN 单独读取，避免随普通账号对象流入接口和日志。 */
+  getXChatPin(uuid: string): string | null {
+    const row = this.db.prepare('SELECT xchat_pin FROM accounts WHERE uuid=? AND authenticated=1').get(uuid) as { xchat_pin: string | null } | undefined;
+    return row?.xchat_pin ? this.decrypt(row.xchat_pin) : null;
+  }
+
+  hasXChatPin(uuid: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM accounts WHERE uuid=? AND authenticated=1 AND xchat_pin IS NOT NULL').get(uuid);
+  }
+
+  isXChatPinBlocked(uuid: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM accounts WHERE uuid=? AND xchat_pin_blocked=1').get(uuid);
+  }
+
+  blockXChatPin(uuid: string): void {
+    this.db.prepare('UPDATE accounts SET xchat_pin_blocked=1 WHERE uuid=?').run(uuid);
+  }
+
+  setXChatPin(uuid: string, pin: string | null): boolean {
+    if (pin !== null && !/^\d{4}$/.test(pin)) throw new Error('PIN 必须是四位数字');
+    return !!this.db.prepare('UPDATE accounts SET xchat_pin=?, xchat_pin_blocked=0, updated_at=? WHERE uuid=? AND authenticated=1').run(pin === null ? null : this.encrypt(pin), new Date().toISOString(), uuid).changes;
   }
 
   getByUsername(username: string): AccountRecord | undefined {

@@ -27,6 +27,13 @@ export class FollowOutbox {
     catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }
   pending(account: string): OutboxItem[] { return this.db.prepare("SELECT * FROM follow_outbox WHERE account_id=? AND status='queued' ORDER BY updated_at,target_id LIMIT 20").all(account) as OutboxItem[]; }
+  /** 已确认回关且由入站关注触发的目标；pending 和不确定结果不发送欢迎。 */
+  completedInbound(): OutboxItem[] {
+    return this.db.prepare(`SELECT o.* FROM follow_outbox o
+      JOIN follow_outbox_sources s ON s.account_id=o.account_id AND s.target_id=o.target_id AND s.source='inbound-follow'
+      JOIN follows f ON f.account_id=o.account_id AND f.target_id=o.target_id AND f.status='following'
+      WHERE o.status='done'`).all() as OutboxItem[];
+  }
   begin(account: string, target: string) { return !!this.db.prepare("UPDATE follow_outbox SET status='processing',updated_at=? WHERE account_id=? AND target_id=? AND status='queued'").run(Date.now(), account, target).changes; }
   finish(account: string, target: string, status: 'done' | 'manual' | 'queued', error: string | null = null) { this.db.prepare("UPDATE follow_outbox SET status=?,error=?,updated_at=? WHERE account_id=? AND target_id=? AND status='processing'").run(status, error, Date.now(), account, target); }
   recover(account: string) { this.db.prepare("UPDATE follow_outbox SET status='manual',error='进程中断，关注结果需核实',updated_at=? WHERE account_id=? AND status='processing'").run(Date.now(), account); }

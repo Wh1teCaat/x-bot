@@ -3,10 +3,13 @@ import '../../src/runtime-config.ts';
 
 import { monitorProcess, recordRuntimeEvent } from '../../src/runtime-monitor.ts';
 import { existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { FollowStore } from '../../src/follow-store.ts';
 import { makeLlm } from '../loop/loop-llm.ts';
 import { ensureHello, generateDmReply, LocalDmClient, createReplyDispatcher } from './dm-reply.ts';
-import { makeActivityApi, ensureFollowSubscription, receiveFollowEvents, withActivityStreamLock } from './activity-stream.ts';
+import { makeActivityApi, ensureFollowSubscription, ensureMessageSubscription, receiveFollowEvents, withActivityStreamLock } from './activity-stream.ts';
+import { createCustomerService } from './customer-service.ts';
+import { queueInboundFollow, completedInboundFollows } from './inbound-follow.ts';
 
 const accountId = process.argv[2];
 const mock = process.argv.includes('--mock');
@@ -86,28 +89,44 @@ async function runReal(accountId: string): Promise<void> {
     const llmConfigured = Boolean(process.env.LLM_API_KEY && process.env.LLM_MODEL && process.env.LLM_BASE_URL);
     let llmWarningLogged = false;
     const ensureLlm = () => { if (!llm) llm = makeLlm(); return llm; };
+    const customer = createCustomerService({ llm: ensureLlm, dm: dmClient });
     const dispatcher = createReplyDispatcher({
-      generate: (follower) => generateDmReply(ensureLlm(), follower),
-      send: (acct, recipientId, text) => dmClient.send(acct, recipientId, text),
+      generate: (follower, acct) => generateDmReply(ensureLlm(), follower, customer.hasPin(acct) ? '回关后的第一条私信' : '一次性欢迎'),
+      send: async (acct, recipientId, text) => { const result = await dmClient.send(acct, recipientId, text); customer.recordWelcome(acct, recipientId, text); return result; },
     });
+    const welcome = (acct: string, peer: string, username: string) => {
+      if (llmConfigured && customer.reserveWelcome(acct, peer)) dispatcher.enqueue(acct, peer, username);
+    };
+    const scan = () => { if (llmConfigured) for (const item of completedInboundFollows()) welcome(item.account_id, item.target_id, item.username); };
+    const worker = spawn(process.execPath, ['scripts/follow/outbox-worker.ts', accountId, ...(process.argv.includes('--confirm-follow') ? ['--confirm-follow'] : [])], { stdio: 'inherit' });
+    worker.once('error', () => console.error('关注队列启动失败；请检查日志并手动启动 Outbox。'));
+    const timer = setInterval(() => { try { scan(); } catch { console.error('检查已确认回关失败，将稍后重试。'); } }, 5000);
 
+    try {
     console.log(await ensureFollowSubscription(api, accountId));
+    const userApi = makeActivityApi({ accountId, useAppToken: false, controller });
+    for (const eventType of ['dm.received', 'chat.received'] as const) {
+      try { console.log(await ensureMessageSubscription(api, accountId, eventType, userApi)); }
+      catch (error) { console.error(`${eventType} 订阅失败：${error instanceof Error ? error.message : String(error)}`); }
+    }
     if (!llmConfigured) console.log('未配置 LLM_API_KEY/LLM_MODEL/LLM_BASE_URL，只监听落库、不发送回关私信。');
+    scan();
 
     await receiveFollowEvents(api, controller, (event) => {
       const eventMessage = JSON.stringify({ eventId: event.eventId, time: event.occurredAt, followerId: event.followerId, follower: event.followerUsername, accountId: event.accountId });
       if (event.accountId === accountId) console.log(eventMessage);
-      const store = new FollowStore('.data/following.sqlite');
-      try {
-        const outcome = store.recordInboundFollow(event.eventId, event.accountId, event.followerId, event.occurredAt);
+      {
+        const { outcome, status, queued } = queueInboundFollow(event);
         if (event.accountId === accountId) console.log(`关注事件已保存：${outcome}`);
         else recordRuntimeEvent(event.accountId, `${eventMessage}\n关注事件已保存：${outcome}`);
-        if (outcome !== '重复事件') {
-          if (llmConfigured) dispatcher.enqueue(event.accountId, event.followerId, event.followerUsername);
-          else if (!llmWarningLogged) { llmWarningLogged = true; console.log('未配置 LLM，跳过回关私信回复。'); }
+        if (queued) console.log(`已将 @${event.followerUsername || event.followerId} 加入回关队列。`);
+        if (status === 'following') {
+          if (llmConfigured) welcome(event.accountId, event.followerId, event.followerUsername);
+          else if (!llmConfigured && !llmWarningLogged) { llmWarningLogged = true; console.log('未配置 LLM，跳过回关私信回复。'); }
         }
-      } finally { store.close(); }
-    }, state => telemetry.stage(state, state === '监听关注与回关事件' ? 'running' : 'waiting'));
+      }
+    }, state => telemetry.stage(state, state === '监听关注与回关事件' ? 'running' : 'waiting'), event => { if (llmConfigured) customer.dm(event); }, event => { if (llmConfigured) customer.chat(event); });
+    } finally { clearInterval(timer); if (worker.exitCode === null) worker.kill('SIGTERM'); await dispatcher.drain(); await customer.close(); }
   });
 }
 

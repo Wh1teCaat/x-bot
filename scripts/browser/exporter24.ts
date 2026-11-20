@@ -114,7 +114,7 @@ export async function ensureExporter24Auth(
 }
 
 /** 在已有浏览器上下文里打开 exporter24 页面；未安装时返回 null。 */
-export async function openExporter24(context: BrowserContext): Promise<Page | null> {
+export async function openExporter24(context: BrowserContext, options: { throwOnLoadedError?: boolean } = {}): Promise<Page | null> {
   let page: Page | undefined;
   let loaded = false;
   try {
@@ -134,6 +134,7 @@ export async function openExporter24(context: BrowserContext): Promise<Page | nu
     return page;
   } catch (error) {
     await page?.close().catch(() => {});
+    if (loaded && options.throwOnLoadedError) throw error;
     // 扩展不存在时静默回退；页面已经打开却不可用（登录失败等）时给出原因。
     if (loaded) console.warn(`exporter24 不可用：${error instanceof Error ? error.message : error}`);
     return null;
