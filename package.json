@@ -8,6 +8,8 @@
   },
   "scripts": {
     "browser": "node scripts/browser/open-testing-browser.ts",
+    "browser:authorize": "node scripts/browser/authorize-slots.ts",
+    "bitbrowser:pool": "node scripts/browser/bitbrowser-pool.ts",
     "start": "node src/server.ts",
     "test": "node --test test/*.test.ts",
     "account": "node scripts/account/account-control.ts",

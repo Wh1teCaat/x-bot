@@ -4,6 +4,11 @@ import { readFileSync } from 'node:fs';
 
 /** 校验输入是否为合法的 X 数字用户 ID。 */
 const validId = (value: unknown): value is string => typeof value === 'string' && /^\d{1,19}$/.test(value);
+function shortReplyOptions() {
+  try { if (new URL(process.env.LLM_BASE_URL || '').hostname === 'api.deepseek.com') return { thinking: { type: 'disabled' } }; }
+  catch { /* 客户端会报告无效的模型服务地址 */ }
+  return {};
+}
 
 /** 确保私信首句为字面 "hello"（大小写不敏感）。 */
 export function ensureHello(text: string): string {
@@ -12,39 +17,54 @@ export function ensureHello(text: string): string {
   return `hello ${trimmed}`;
 }
 
+const CONTACT = '+852 5712 7467';
+const hasContact = (text: string) => text.replace(/\D/g, '').includes('85257127467');
+
 /** 使用 LLM 生成一句简短的欢迎私信，首句固定为 "hello"。 */
 export async function generateDmReply(client: any, follower: { username: string }, stage: '回关后的第一条私信' | '一次性欢迎' = '回关后的第一条私信'): Promise<string> {
+  if (stage === '一次性欢迎') {
+    const name = /^[A-Za-z0-9_]{1,15}$/.test(follower.username) ? ` @${follower.username}` : '';
+    return `hello${name}, thanks for following and please add our customer service on WhatsApp at ${CONTACT} if you are interested in clothing.`;
+  }
   const response = await client.chat.completions.create({
     model: process.env.LLM_MODEL,
     stream: false,
     temperature: 0.8,
     max_tokens: 200,
+    ...shortReplyOptions(),
     messages: [
       { role: 'system', content: readFileSync(new URL('./dm-skill.md', import.meta.url), 'utf8') },
       { role: 'user', content: JSON.stringify({ stage, username: follower.username }) },
     ],
   });
   const choice = response.choices?.[0];
-  if (choice?.finish_reason !== 'stop' || !choice.message?.content?.trim()) throw new Error('模型未返回完整私信');
-  const text = ensureHello(choice.message.content.trim());
-  if (stage === '一次性欢迎' && !text.replace(/\D/g, '').includes('85257127467')) {
-    return `${text} If you are interested in buying clothing, please add our customer service on WhatsApp: +852 5712 7467.`;
+  if (choice?.finish_reason !== 'stop' || !choice.message?.content?.trim()) {
+    const reason = ['stop', 'length', 'content_filter', 'tool_calls', 'function_call'].includes(choice?.finish_reason) ? choice.finish_reason : 'missing';
+    throw Object.assign(new Error('模型未返回完整私信'), { completionReason: reason });
   }
-  return text;
+  const text = ensureHello(choice.message.content.trim());
+  return /whats\s*app/i.test(text) || hasContact(text) ? 'hello, thanks for following and nice to connect with you!' : text;
 }
 
 /** 根据本账号与对方的已记录对话生成后续回复。 */
-export async function generateCustomerReply(client: any, messages: Array<{ role: string; text: string }>): Promise<string> {
+export async function generateCustomerReply(client: any, messages: Array<{ role: string; text: string }>, stage: '第二条引导' | '引导后回复' = '引导后回复'): Promise<string> {
   const response = await client.chat.completions.create({
     model: process.env.LLM_MODEL, stream: false, temperature: 0.7, max_tokens: 250,
+    ...shortReplyOptions(),
     messages: [
       { role: 'system', content: readFileSync(new URL('./dm-skill.md', import.meta.url), 'utf8') },
-      { role: 'user', content: JSON.stringify({ stage: '对方回复后', messages }) },
+      { role: 'user', content: JSON.stringify({ stage, messages }) },
     ],
   });
   const choice = response.choices?.[0];
-  if (choice?.finish_reason !== 'stop' || !choice.message?.content?.trim()) throw new Error('模型未返回完整私信');
-  return choice.message.content.trim();
+  if (choice?.finish_reason !== 'stop' || !choice.message?.content?.trim()) {
+    const reason = ['stop', 'length', 'content_filter', 'tool_calls', 'function_call'].includes(choice?.finish_reason) ? choice.finish_reason : 'missing';
+    throw Object.assign(new Error('模型未返回完整私信'), { completionReason: reason });
+  }
+  const text = choice.message.content.trim();
+  return stage === '第二条引导' && !hasContact(text)
+    ? `${text} For more information, please add our customer service on WhatsApp at ${CONTACT}.`
+    : text;
 }
 
 /** 封装仅连接本机授权服务发送私信的客户端。 */

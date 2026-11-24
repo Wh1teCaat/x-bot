@@ -56,6 +56,8 @@ export class FollowerCheckpoints {
 /** 从 React 组件的 source 属性取得扩展自己的 store；版本不兼容时停止。 */
 export async function attachFollowerStore(page: Page, timeout = 30000) {
   await page.waitForFunction(() => {
+    const existing = (globalThis as any).__followerStore;
+    if (existing && typeof existing.fetchFollowList === 'function' && existing.cooldownManager) return true;
     const root = document.getElementById('ext-root');
     const key = root && Object.keys(root).find(key => key.startsWith('__reactContainer$'));
     const fiber = key && (root as any)[key];
@@ -92,7 +94,7 @@ async function readFollowerBatchOnce(page: Page, username: string, checkpoint: F
     }
   }
   if (!reused) {
-    const url = new URL(page.url());
+    const url = new URL(`chrome-extension://${EXPORTER24_EXTENSION_ID}/index.html`);
     url.search = checkpoint.taskId
       ? new URLSearchParams({ taskId: checkpoint.taskId, tab: 'follower' }).toString()
       : new URLSearchParams({ type: 'followers', username, confirmed: '1' }).toString();
@@ -100,14 +102,19 @@ async function readFollowerBatchOnce(page: Page, username: string, checkpoint: F
   }
   await attachFollowerStore(page);
   // 新任务仅创建，不自动点击 Start；先装好分页边界暂停钩子。
-  await page.waitForFunction(() => Boolean((globalThis as any).__followerStore.task), undefined, { timeout: 30000 });
-  const taskId = await page.evaluate(({ username, expected }) => {
+  await page.waitForFunction(() => {
+    const s = (globalThis as any).__followerStore;
+    if (!s?.task || s.loading || !s.profileChunkStore?.queryPage || s._chunkTaskId !== s.task.id) return false;
+    return s.task.storage?.version !== 'v2' || Number(s.fetchedCount) === Number(s.task.storage.totalFetched || 0);
+  }, undefined, { timeout: 30000 });
+  const taskId = await page.evaluate(({ username, expected, offset }) => {
     const s = (globalThis as any).__followerStore;
     if (s.task.type !== 'followers' || s.task.src?.username?.toLowerCase() !== username.toLowerCase()) throw new Error('exporter24 粉丝任务身份不匹配');
     if (expected && s.task.id !== expected) throw new Error('exporter24 未恢复指定历史任务');
     if (s.runningTaskId || s.isProcessing) throw new Error('exporter24 已有正在执行的任务');
+    if (!Number.isFinite(s.fetchedCount) || s.fetchedCount < offset) throw new Error('exporter24 历史记录少于本地已处理偏移，无法安全恢复');
     return String(s.task.id);
-  }, { username, expected: checkpoint.taskId });
+  }, { username, expected: checkpoint.taskId, offset: checkpoint.offset });
   saveTask(taskId);
   const target = checkpoint.offset + FOLLOWER_BATCH_SIZE;
   await page.evaluate(async target => {
@@ -146,27 +153,76 @@ async function readFollowerBatchOnce(page: Page, username: string, checkpoint: F
   }, { offset: checkpoint.offset, size: FOLLOWER_BATCH_SIZE });
 }
 
-/**
- * 历史任务页加载不出来时，用 History 里最新一条该博主的粉丝任务恢复。
- * 扩展的 History 行点击后会跳到 index.html?taskId=<最新任务>&tab=follower，返回这个任务 ID。
- */
+/** 历史不可读与确认没有记录必须区别处理，避免意外新建任务。 */
+export class FollowerHistoryError extends ExporterError {
+  constructor(cause: unknown) { super('无法确认 exporter24 历史记录，请检查扩展历史后重试', false, cause); }
+}
+
+/** 从扩展的历史数据库只读选出该博主最近更新的粉丝任务。 */
 export async function resumeLatestFollowerTask(page: Page, username: string): Promise<string | null> {
+  if (!/^[A-Za-z0-9_]{1,15}$/.test(username)) throw new Error('用户名无效');
   await page.goto(`chrome-extension://${EXPORTER24_EXTENSION_ID}/history.html`, { waitUntil: 'domcontentloaded', timeout: 15000 });
-  await page.locator('tbody tr').first().waitFor({ state: 'attached', timeout: 15000 }).catch(() => {});
-  const rows = page.locator('tbody tr');
-  const count = await rows.count();
-  for (let index = 0; index < count; index++) {
-    const text = await rows.nth(index).innerText().catch(() => '');
-    if (!text.toLowerCase().includes(`@${username.toLowerCase()}`) || !/FOLLOWERS/i.test(text)) continue;
-    await rows.nth(index).click();
-    await page.waitForFunction(() => /[?&]taskId=/.test(location.href), undefined, { timeout: 15000 }).catch(() => {});
-    const taskId = new URL(page.url()).searchParams.get('taskId');
-    if (!taskId) return null;
-    await attachFollowerStore(page, 30000);
-    const openTaskId = await page.evaluate(() => (globalThis as any).__followerStore?.task?.id ?? null);
-    return String(openTaskId) === taskId ? taskId : null;
+  await page.locator('#ext-root').waitFor({ state: 'attached', timeout: 15000 });
+  const read = page.evaluate(async (target) => {
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      const databases = await indexedDB.databases();
+      if (databases.some(db => db.name === 'IGE24Store')) {
+        const db = await new Promise<IDBDatabase>((resolve, reject) => {
+          const request = indexedDB.open('IGE24Store');
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error ?? new Error('无法打开扩展历史数据库'));
+          request.onblocked = () => reject(new Error('扩展历史数据库被占用'));
+        });
+        try {
+          if (db.objectStoreNames.contains('ig_exporter_24_store')) {
+            return await new Promise<string | null>((resolve, reject) => {
+              let latest: { id: string; updated: number } | null = null;
+              const request = db.transaction('ig_exporter_24_store', 'readonly').objectStore('ig_exporter_24_store').openCursor();
+              request.onerror = () => reject(request.error ?? new Error('无法读取扩展历史记录'));
+              request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) { resolve(latest?.id ?? null); return; }
+                const item = cursor.value;
+                if (item?.type === 'followers' && typeof item.src?.username === 'string' && item.src.username.toLowerCase() === target.toLowerCase()) {
+                  const id = String(item.id || cursor.primaryKey || '');
+                  const updated = Number(item.updatedAt);
+                  if (!id || id.length > 200 || !Number.isFinite(updated) || updated <= 0) { reject(new Error('扩展粉丝历史记录不完整')); return; }
+                  if (!latest || updated > latest.updated) latest = { id, updated };
+                }
+                cursor.continue();
+              };
+            });
+          }
+        } finally { db.close(); }
+      }
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    throw new Error('扩展历史数据库未就绪');
+  }, username);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([read, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('读取扩展历史超时')), 20000); })]); }
+  finally { if (timer) clearTimeout(timer); }
+}
+
+/** 根据历史选择任务；不同任务不能沿用旧任务的本地偏移。 */
+export async function selectFollowerHistory(page: Page, username: string, checkpoint: FollowerCheckpoint,
+  lookup: (page: Page, username: string) => Promise<string | null> = resumeLatestFollowerTask): Promise<void> {
+  let latest: string | null;
+  try { latest = await lookup(page, username); }
+  catch (error) {
+    if (!/扩展粉丝历史记录不完整/.test(String(error?.message || error))) throw new FollowerHistoryError(error);
+    console.warn('exporter24 历史记录不完整，无法恢复，将从头抓取。');
+    latest = null;
   }
-  return null;
+  if (latest === checkpoint.taskId && latest) {
+    console.log(`已找到最新粉丝历史任务 ${latest}，从本地偏移 ${checkpoint.offset} 继续。`);
+    return;
+  }
+  if (latest) console.log(`已找到最新粉丝历史任务 ${latest}；任务不同，从该历史记录的开头处理。`);
+  else console.log('没有找到该博主的粉丝历史，从头开始抓取。');
+  checkpoint.taskId = latest;
+  checkpoint.offset = 0;
 }
 
 /**
@@ -174,9 +230,11 @@ export async function resumeLatestFollowerTask(page: Page, username: string): Pr
  * 登录会重新加载扩展页，任务从已保存的历史断点（taskId）继续，本地偏移不变。
  */
 export async function readFollowerBatch(page: Page, username: string, checkpoint: FollowerCheckpoint,
-  saveTask: (id: string) => void, guard: () => void | Promise<void>, options: { recoverTimeout?: boolean } = {}) {
+  saveTask: (id: string) => void, guard: () => void | Promise<void>, options: { recoverTimeout?: boolean; historyLookup?: (page: Page, username: string) => Promise<string | null> } = {}) {
   await ensureExporter24Auth(page, guard);
-  let loggedIn = false, retried = false;
+  await guard();
+  await selectFollowerHistory(page, username, checkpoint, options.historyLookup);
+  let loggedIn = false, retried = false, restarted = false;
   for (;;) {
     try {
       return await readFollowerBatchOnce(page, username, checkpoint, saveTask, guard);
@@ -187,27 +245,20 @@ export async function readFollowerBatch(page: Page, username: string, checkpoint
         await ensureExporter24Auth(page, guard);
         continue;
       }
-      // 任务页加载不出来时，先用 History 最新一条恢复；没有可恢复任务才新建，按本地 offset 从 0 补抓。
+      // 只有明确证实已保存任务不匹配或记录不足，且已停止扩展任务时，才新建任务。
+      if (checkpoint.taskId && !restarted && /粉丝任务身份不匹配|未恢复指定历史任务|历史记录少于本地已处理偏移/.test(String(error?.message || error))) {
+        if (!await stopFollowerBatchForRetry(page)) throw new ExporterError('无法确认 exporter24 任务已停止，请人工检查后恢复', false, error);
+        console.warn('exporter24 历史任务无法恢复，已停止原任务，将从头抓取。');
+        checkpoint.taskId = null;
+        checkpoint.offset = 0;
+        restarted = true;
+        continue;
+      }
+      // 重试前必须确认同一个任务已停止，不能把加载错误当成历史不存在。
       if (options.recoverTimeout && !retried && /waitForFunction|Timeout/i.test(String(error?.message || error))) {
         retried = true;
         if (!await stopFollowerBatchForRetry(page)) throw new ExporterError('无法确认 exporter24 任务已停止，请人工检查后恢复', false, error);
-        if (checkpoint.taskId) {
-          console.log('exporter24 历史任务加载失败，尝试从 History 最新一条恢复。');
-          const latest = await resumeLatestFollowerTask(page, username).catch((resumeError) => {
-            console.log(`从 History 恢复失败：${resumeError?.message || resumeError}`);
-            return null;
-          });
-          if (latest) {
-            checkpoint.taskId = latest;
-            saveTask(latest);
-            console.log(`已恢复 History 最新任务 ${latest}，从本地 offset ${checkpoint.offset} 继续。`);
-          } else {
-            console.log('History 中没有可恢复的粉丝任务，改用新任务并按本地 offset 继续（会从 0 补抓）。');
-            checkpoint.taskId = null;
-          }
-        } else {
-          console.log('exporter24 任务页未在时限内就绪，重新加载后重试一次。');
-        }
+        console.log('exporter24 任务页未在时限内就绪，确认已停止后重新加载。');
         await page.waitForTimeout(2000);
         continue;
       }

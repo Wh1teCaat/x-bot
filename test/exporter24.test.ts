@@ -22,7 +22,9 @@ test('reads the two counts from the exporter24 result card', async () => {
       }),
     }),
   };
-  assert.deepEqual(await readExporter24Counts(page as any, 'alice'), { followers: 80500, following: 90 });
+  const oldToken = process.env.X_EXPORT_TOKEN;
+  delete process.env.X_EXPORT_TOKEN;
+  try { assert.deepEqual(await readExporter24Counts(page as any, 'alice'), { followers: 80500, following: 90 }); } finally { if (oldToken !== undefined) process.env.X_EXPORT_TOKEN = oldToken; }
 });
 
 test('returns null when the extension page cannot be opened', async () => {
@@ -42,15 +44,18 @@ test('detects the 5-star review, sign-in and credits gates', () => {
   assert.equal(exporter24Gate('Export Follower/Following Profiles\nHistory'), null);
 });
 
-test('keeps the page untouched when exporter24 shows no gate', async () => {
-  let touched = 0;
+test('logs in before use even when no gate is shown and reuses the verified session', async () => {
+  let stored: any = null, exchanges = 0, reloads = 0;
   const page = {
     locator: () => ({ innerText: async () => 'Export Follower/Following Profiles' }),
-    evaluate: async () => { touched++; },
-    reload: async () => { touched++; },
+    evaluate: async (_fn: any, arg: any) => typeof arg === 'string' ? stored : (stored = arg.value),
+    reload: async () => { reloads++; },
   };
-  assert.equal(await ensureExporter24Auth(page as any, undefined, { token: 'login-code' }), 'already');
-  assert.equal(touched, 0);
+  const options = { token: 'login-code', exchange: async () => { exchanges++; return { name: 'Alice', email: 'a@example.com', avatar: '', token: 'session' }; } };
+  assert.equal(await ensureExporter24Auth(page as any, undefined, options), 'logged-in');
+  assert.equal(await ensureExporter24Auth(page as any, undefined, options), 'already');
+  assert.equal(exchanges, 1);
+  assert.equal(reloads, 1);
 });
 
 test('logs in with X_EXPORT_TOKEN when the 5-star gate is shown', async () => {
@@ -75,17 +80,6 @@ test('logs in with X_EXPORT_TOKEN when the 5-star gate is shown', async () => {
   assert.equal(reloads, 1);
   assert.deepEqual(stored, account);
   assert.deepEqual(await readExporter24User(page as any), account);
-});
-
-test('leaves an existing login untouched when no gate is shown', async () => {
-  let stored: any = { name: 'Old', email: 'old@example.com', avatar: '', token: 'old-token' };
-  const page = {
-    locator: () => ({ innerText: async () => 'Export Follower/Following Profiles' }),
-    evaluate: async (_fn: any, arg: any) => typeof arg === 'string' ? stored : (stored = arg.value),
-    reload: async () => {},
-  };
-  assert.equal(await ensureExporter24Auth(page as any, undefined, { token: 'login-code' }), 'already');
-  assert.equal(stored.token, 'old-token');
 });
 
 test('reports the missing token instead of silently falling back', async () => {

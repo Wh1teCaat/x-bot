@@ -1,4 +1,4 @@
-import { open, readFile, unlink } from 'node:fs/promises';
+import { open, readFile, stat, unlink } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 /**
@@ -27,7 +27,11 @@ export async function acquireExporterLock({ timeoutMs = 15 * 60 * 1000, pollMs =
           try { process.kill(info.pid, 0); }
           catch (killError) { if (killError.code === 'ESRCH') stale = true; }
         }
-      } catch { stale = true; }
+      } catch {
+        // 另一个进程可能刚创建锁文件、尚未写入 JSON；不能把空文件当作过期锁。
+        try { stale = Date.now() - (await stat(lockPath)).mtimeMs > 30_000; }
+        catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; throw e; }
+      }
       if (stale) { await unlink(lockPath).catch(() => {}); continue; }
       if (Date.now() - started >= timeoutMs) throw new Error('等待 exporter 锁超时（另一个任务仍在运行）');
       await new Promise(resolveWait => setTimeout(resolveWait, pollMs));

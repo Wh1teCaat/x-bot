@@ -26,7 +26,7 @@ test('starts an isolated native browser and waits for explicit login confirmatio
   await mkdir(join(dir, '.data'), { recursive: true });
   await writeFile(bin, '#!/bin/sh\nprintf "%s\\n" "$@" > "$XBOT_TEST_BROWSER_ARGS"\nexec sleep 60\n', { mode: 0o700 });
   const script = fileURLToPath(new URL('../scripts/account/account-session.ts', import.meta.url));
-  const child = spawn(process.execPath, [script, '12345', 'Alice'], { cwd: dir, env: { ...process.env, X_BROWSER_EXECUTABLE: bin, XBOT_TEST_BROWSER_ARGS: argsFile }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [script, '12345', 'Alice'], { cwd: dir, env: { ...process.env, X_BROWSER_EXECUTABLE: bin, XBOT_TEST_BROWSER_ARGS: argsFile, X_PROFILE_TEMPLATE_SOURCE: join(dir, 'no-source'), X_PROFILE_TEMPLATE: join(dir, 'no-template') }, stdio: ['ignore', 'pipe', 'pipe'] });
   try {
     await Promise.race([once(child.stdout, 'data'), once(child, 'exit').then(() => { throw new Error('池位启动失败'); })]);
     const socket = join(dir, '.data', 'account-sessions', '12345.sock');

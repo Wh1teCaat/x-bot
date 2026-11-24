@@ -28,7 +28,7 @@ export class ExporterRetry {
     const sleep = options.sleep || (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
     for (;;) {
       const current = this.get();
-      if (current?.state === 'manual') throw new ExporterError('exporter24 重试次数已耗尽，需要人工检查', false);
+      if (current?.state === 'manual') throw new ExporterError(current.attempts >= 4 ? 'exporter24 重试次数已耗尽，需要人工检查' : 'exporter24 上次遇到登录、额度或任务状态异常，仍处于人工检查状态', false);
       while (current && current.next_at > this.now()) {
         await options.guard();
         await sleep(Math.min(30_000, current.next_at - this.now()));
@@ -41,7 +41,7 @@ export class ExporterRetry {
       } catch (error) {
         // X 的 guard 优先，绝不能把 X 熔断包装为 exporter 故障。
         await options.guard();
-        if (!isRetryableExporterError(error)) { this.stop(); throw new ExporterError('exporter24 需要人工检查登录、额度或任务状态', false, error); }
+        if (!isRetryableExporterError(error)) { console.error(`exporter24 原始错误：${error instanceof Error ? error.message : String(error)}`); this.stop(); throw new ExporterError('exporter24 需要人工检查登录、额度或任务状态', false, error); }
         if (options.safeToRetry && !await options.safeToRetry()) { this.stop(); throw new ExporterError('无法确认 exporter24 任务已停止，请人工检查后恢复', false, error); }
         const next = this.fail();
         if (next.state === 'manual') throw new ExporterError('exporter24 重试次数已耗尽，需要人工检查', false, error);
@@ -57,8 +57,15 @@ export class ExporterError extends Error {
   constructor(message: string, retryable: boolean, cause?: unknown) { super(message, { cause }); this.retryable = retryable; }
 }
 
+/** 登录接口的网络错误与身份、额度等需要人工处理的错误分开。 */
+export class ExporterTransientError extends Error {
+  readonly status?: number;
+  constructor(message: string, cause?: unknown, status?: number) { super(message, { cause }); this.name = 'ExporterTransientError'; this.status = status; }
+}
+
 /** 只对可识别的限流和暂时错误重试，登录、认证、额度及身份异常交人工检查。 */
 export function isRetryableExporterError(error: any): boolean {
+  if (error instanceof ExporterTransientError) return true;
   const message = String(error?.message || '');
   if (/登录|login|sign.?in|额度|quota|credit|captcha|验证|权限|unauthori[sz]ed|forbidden|身份不匹配|版本不支持/i.test(message)) return false;
   return error?.status === 429 || error?.status >= 500 || ['ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(error?.code) || /429|rate.?limit|too many|try again|限流|速率受限|超时|timeout|timed out|未完成本批|未返回关注\/粉丝数/i.test(message);

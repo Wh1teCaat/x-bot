@@ -4,6 +4,7 @@ import type { BrowserContext, Download, Page } from 'playwright';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { profileCountsFromText, type ProfileCounts } from '../replies/profile-counts.ts';
+import { ExporterTransientError } from './exporter-retry.ts';
 
 export const EXPORTER24_EXTENSION_ID =
   process.env.X_EXPORTER24_EXTENSION_ID || 'ebcejikneofoobengkjlojmbohgjacne';
@@ -60,10 +61,12 @@ export async function exchangeExporter24Token(code: string): Promise<Exporter24U
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: loginCode }),
+      signal: AbortSignal.timeout(15000),
     });
-  } catch {
-    throw new Error('无法连接 exporter24 登录接口');
+  } catch (error) {
+    throw new ExporterTransientError('无法连接 exporter24 登录接口', error);
   }
+  if (response.status === 429 || response.status >= 500) throw new ExporterTransientError(`exporter24 登录接口暂不可用（HTTP ${response.status}）`, undefined, response.status);
   const body = await response.json().catch(() => null) as
     { token?: unknown; user?: { name?: string; email?: string; image?: string } } | null;
   const email = body?.user?.email;
@@ -90,26 +93,28 @@ export async function loginExporter24(page: Page, user: Exporter24User): Promise
   if (stored?.token !== user.token) throw new Error('exporter24 登录未生效');
 }
 
-/**
- * 检测到 exporter24 要求 5 星评价、登录或额度不足时，用 X_EXPORT_TOKEN 自动登录。
- * 没有门槛时保持原状；没有配置令牌时抛出可直接展示的错误。
- */
+/** 每个页面首次使用前用配置的令牌登录；出现门槛时重新登录。 */
+const authenticatedPages = new WeakMap<Page, { code: string; session: string }>();
 export async function ensureExporter24Auth(
   page: Page,
   guard: () => void | Promise<void> = () => {},
   options: { token?: string; exchange?: (code: string) => Promise<Exporter24User> } = {},
 ): Promise<'already' | 'logged-in'> {
   const gate = await readExporter24Gate(page);
-  if (!gate) return 'already';
   const token = (options.token ?? process.env.X_EXPORT_TOKEN ?? '').trim();
+  if (!token && !gate) return 'already';
   if (!token) {
     const reason = gate === 'review' ? '要求 5 星评价' : gate === 'credits' ? '额度不足' : '需要登录';
     throw new Error(`exporter24 ${reason}；请在 .env 配置 X_EXPORT_TOKEN 以自动登录`);
   }
+  const cached = authenticatedPages.get(page);
+  if (!gate && cached?.code === token && (await readExporter24User(page))?.token === cached.session) return 'already';
   await guard();
   const user = await (options.exchange ?? exchangeExporter24Token)(token);
-  await loginExporter24(page, user);
-  console.log(`exporter24 ${gate === 'review' ? '需要 5 星评价' : gate === 'credits' ? '额度不足' : '需要登录'}，已用 X_EXPORT_TOKEN 登录。`);
+  const current = await readExporter24User(page);
+  if (gate || current?.token !== user.token) await loginExporter24(page, user);
+  authenticatedPages.set(page, { code: token, session: user.token });
+  console.log('exporter24 已用 X_EXPORT_TOKEN 登录。');
   return 'logged-in';
 }
 
@@ -124,19 +129,14 @@ export async function openExporter24(context: BrowserContext, options: { throwOn
       timeout: 10000,
     });
     loaded = true;
-    try {
-      await page.locator('input').first().waitFor({ state: 'visible', timeout: 3000 });
-    } catch {
-      // 未登录或 5 星评价弹窗会挡住搜索框；配置了 X_EXPORT_TOKEN 就先登录再等。
-      await ensureExporter24Auth(page);
-      await page.locator('input').first().waitFor({ state: 'visible', timeout: 10000 });
-    }
+    await ensureExporter24Auth(page);
+    await page.locator('input').first().waitFor({ state: 'visible', timeout: 10000 });
     return page;
   } catch (error) {
     await page?.close().catch(() => {});
     if (loaded && options.throwOnLoadedError) throw error;
-    // 扩展不存在时静默回退；页面已经打开却不可用（登录失败等）时给出原因。
-    if (loaded) console.warn(`exporter24 不可用：${error instanceof Error ? error.message : error}`);
+    // 文件存在并不代表 Chrome 已加载扩展；保留导航失败信息以便检查禁用或注册异常。
+    console.warn(`exporter24 ${loaded ? '页面不可用' : '扩展页无法打开（可能未加载或被 Chrome 禁用）'}：${error instanceof Error ? error.message : error}`);
     return null;
   }
 }

@@ -13,6 +13,7 @@ import { accountSocketPath } from './account-socket.ts';
 import { fingerprintFor } from '../browser/fingerprint.ts';
 import { ensureProfileFromChrome, ensureProfileFromTemplate, PROFILE_TEMPLATE_DIR } from '../browser/profile-template.ts';
 import { AccountStore } from '../../src/account-store.ts';
+import { acquireBrowserSlot } from '../browser/browser-slots.ts';
 
 const [accountId, username] = process.argv.slice(2);
 if (process.argv.length !== 4 || !/^\d{1,19}$/.test(accountId || '') || !/^[A-Za-z0-9_]{1,15}$/.test(username || '')) {
@@ -27,6 +28,7 @@ await mkdir(root, { recursive: true, mode: 0o700 });
 await mkdir(join('.data', 'account-sessions'), { recursive: true, mode: 0o700 });
 let ownsLock = false, closing = false;
 let browserProcess, worker, store;
+let releaseBrowserSlot: (() => void) | undefined;
 
 /** 原子获取账号锁，避免同一资料目录同时启动多个实例。 */
 async function acquireLock() {
@@ -126,6 +128,7 @@ process.once('SIGINT', shutdown);
 
 try {
   await acquireLock();
+  releaseBrowserSlot = await acquireBrowserSlot(accountId, { cancelled: () => closing, onWait: () => console.log('五个浏览器槽位均忙，等待空闲槽位。') });
   await unlink(socketPath).catch(error => { if (error.code !== 'ENOENT') throw error; });
   const port = await allocatePort();
   const chromeCopy = await ensureProfileFromChrome(profile);
@@ -170,6 +173,8 @@ try {
   console.error(`账号浏览器实例停止：${error.message}`); process.exitCode = 1;
 } finally {
   shutdown();
+  if (browserProcess && browserProcess.exitCode === null && browserProcess.signalCode === null) await new Promise<void>(resolve => browserProcess.once('exit', () => resolve()));
+  releaseBrowserSlot?.();
   if (ownsLock) {
     await unlink(socketPath).catch(() => {});
     await unlink(lockPath).catch(() => {});

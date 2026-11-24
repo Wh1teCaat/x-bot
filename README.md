@@ -2,43 +2,29 @@
 
 流程在 clone 完成后，以 clone 目标博主为采集对象：读取该博主最近 10 条有回复的帖子，按新到旧逐条用 CommentCrate 导出回复用户 CSV，补充关注/粉丝数并筛选关注；帖子全部处理完后，再用 exporter24 导出博主粉丝 CSV，按同一固定规则筛选关注。关注/粉丝数优先取自 CSV；缺失时用 exporter24 读取，扩展不可用或失败时再用 Playwright 打开候选主页读取。固定规则为两者都大于 50，且较大值不超过较小值的 3 倍。阿拉伯文字筛选和模型评估是可选路径，且只用于帖子回复；粉丝列表没有回复文本。最后通过 X 官方 API 关注每批入选用户。回复内容和公开关注数据不能证明用户所在地或国籍。
 
+控制台账号详情的“复制当前日志”会复制当前显示的一页日志；需要更早的记录时，可先点击“更早日志”。
+
 ## 授权与启动
 
 1. 参考 `.env.example` 配置 X 应用和模型，并将 `X_AUTO_START_LOOP` 设为 `false`。X 开发者控制台的 OAuth 回调须与 `X_REDIRECT_URI` 一致，默认为 `http://127.0.0.1:3000/oauth/callback`。
 2. 在一个终端运行 `npm start`，打开 [本机授权与 Cookie 页面](http://127.0.0.1:3000/)，完成账号授权并记下数字 ID；授权和 cookie 导入在同一个页面。运行任务期间保持该服务运行。
-3. 在另一个终端运行 `npm run loop -- <账号数字ID>`（可选追加 `--target <博主用户名>`、`--language ar`、`--evaluate`、`--loop-only`）。这是长时流程：必要时 clone → 启动 mirror 子进程监听 → 初始帖子/粉丝 loop → 父进程长时处理延迟回复任务。只想测试单轮 loop 时加 `--loop-only`。程序使用该账号独立资料打开正式版 Google Chrome；手动登录相同的 X 账号，安装 CommentCrate 并授予 X 访问权限。若希望用 exporter24 补充关注/粉丝数，必须在这个账号自己的浏览器资料中安装（只在默认 Chrome 安装不会生效）；未安装时会自动回退到主页读取。
-4. 关闭登录窗口；若关闭后终端未继续，按 Enter。程序会用 Playwright 重新打开同一份资料，检查账号和插件，然后自动执行一轮，进度直接显示在当前终端。下一次运行同一账号会复用这些资料；已登录并安装插件的账号会自动跳过登录与安装步骤，直接进入后续自动化流程。
+3. 安装 Playwright 的浏览器（首次运行一次）：
 
-每个账号使用独立的 `.data/browser-profiles/<账号数字ID>`；不同账号需要分别授权和登录。启动时会从本机已安装插件的 Chrome 资料复制插件配置，或手动安装。**单轮任务会实际发送关注请求。**
+   ```sh
+   PLAYWRIGHT_BROWSERS_PATH=.data/playwright-browsers npx playwright install --no-shell chromium
+   ```
 
-### 复制 Chrome 插件
+4. 打开比特浏览器并启用本地 API，从控制台启动账号，或运行 `npm run loop -- <账号数字ID>`。程序默认通过比特浏览器的窗口池，以导入的 Cookie 登录，并在使用 exporter24 前使用 `X_EXPORT_TOKEN` 登录。优先使用账号的首选窗口，窗口忙时使用其他空闲窗口；6 个窗口同时最多运行 5 个任务。**任务可能实际发送关注请求。**
 
-启动账号时，默认读取本机 `~/Library/Application Support/Google/Chrome` 的 `Default` 资料，要求源资料已安装并启用 CommentCrate。新账号直接复制插件资料；已有账号缺少插件注册时，复制源 Chrome 的 `Secure Preferences` 和插件文件，保留账号 Cookie、历史及扩展存储，并将被替换的配置备份在账号资料同级的 `*.extensions-backup-*` 目录。`Secure Preferences` 包含受保护的设置及所有插件注册，修复后其他插件可能需要重新检查。请先关闭该账号的 Chrome；插件授权及登录状态仍需实际检查。`X_PROFILE_TEMPLATE_SOURCE` 可指定其他 Chrome 用户数据根目录（包含 `Local State` 和 `Default`）。
+X Cookie 单独保存在 `.data/cookies/`。窗口在不同账号之间切换时，先备份上个账号的 exporter 历史并清理 X 登录资料，再恢复目标账号的历史和 Cookie；没有历史则从头抓取。正常关闭窗口时也会保存历史快照。首次使用未授权的窗口时会显示 CommentCrate 授权页，点击“授权访问 X”并允许后程序自动继续。检测到旧版 exporter 历史时，程序先提取独立快照；读取失败时保留原历史和断点。
 
-如果源 Chrome 不可用，仍可使用预先生成的插件模板作为新资料的后备来源：
+比特浏览器的 6 个窗口由 `npm run bitbrowser:pool -- prepare` 管理；使用 `npm run bitbrowser:pool -- open 1`（序号 1–6）打开时加载 CommentCrate 和 exporter24，`npm run bitbrowser:pool -- close 1` 关闭。直接从比特客户端打开不会自动携带这些启动参数。窗口关闭 Cookie 与扩展数据同步，并按运行时租约独占分配。
 
-先从一个已经安装好 CommentCrate / exporter24 的 Chrome 资料生成模板：
+账号的首选窗口保存在 `.data/bitbrowser-bindings.json`；它只是优先选择，忙时可借用其他窗口。窗口必须保持 Cookie、IndexedDB 和扩展数据同步关闭。比特浏览器客户端和本地 API 必须保持运行；账号历史快照保存在 `.data/account-data/<账号ID>/`。
 
-```sh
-npm run profile:template
-```
+Playwright 从 Chrome 官方更新服务下载扩展包，验证包签名和扩展 ID 后再加载。首次使用窗口时，CommentCrate 会显示授权页：点击“授权访问 X”，并在浏览器权限提示中选择允许。程序等待授权完成后自动继续。X Cookie 需保持有效；新账号启动前需先导入 Cookie。
 
-默认从本机 `~/Library/Application Support/Google/Chrome` 复制，只保留：
-
-- `Local State`
-- `Default/Preferences`、`Default/Secure Preferences`
-- `Default/Extensions`
-- `Default/Local Extension Settings`
-
-不会复制 cookie、登录数据、历史记录。模板默认在：
-
-```text
-.data/profile-template
-```
-
-新账号首次运行时，如果无法从源 Chrome 复制，则尝试复制此模板，然后注入账号 cookie。
-
-也可以手动运行 `npm run profile:repair -- <账号数字ID>`，从模板重建主账号资料并备份旧资料；该命令需要重新登录，且不会替换粉丝专用资料。
+旧版 `profile:template` 和 `profile:repair` 命令仅用于旧 Chrome 资料，不会修改新的 Chromium 资料。
 
 可用环境变量覆盖：
 
@@ -131,7 +117,7 @@ npm run loop -- <账号ID> --loop-only [--target <博主用户名>] [--language 
 npm run loop -- <账号ID> --loop-only --resume <任务ID>
 ```
 
-独立窗口为多账号隔离提供基础，但当前帖子与用户去重和 X 熔断仍为全局状态，因此同一时间只执行一轮；尚不支持多账号并行。不同账号可同时准备各自的浏览器资料。
+浏览器按账号隔离并最多运行五个；帖子与用户去重和 X 熔断仍是全局状态，多账号运行时会共享这些状态。
 
 单轮 loop 使用账号的 clone 目标作为博主（`--blogger` 仅作为未 clone 账号的手动兜底）。流程：
 
@@ -139,7 +125,7 @@ npm run loop -- <账号ID> --loop-only --resume <任务ID>
 2. 对每条帖子：CommentCrate 导出回复 CSV → exporter24/主页补充关注/粉丝数 → 固定规则筛选 → 可选语言/模型评估 → 关注入选用户。
 3. 所有帖子处理完后：exporter24 读取一批 200 名博主粉丝 → 同一固定规则筛选 → 入选者写入关注 Outbox。主 loop 在本批入队完成 15 分钟后，从断点处理下一批，直到粉丝读完；最后一批可以不足 200 人。
 
-粉丝断点按授权账号和博主保存在 `.data/loop.sqlite`，分页游标和已抓取记录保存在同一浏览器的 exporter24 历史任务中。扩展在完整分页边界暂停；本页超出 200 人的记录留给下一批，避免中途暂停漏人。不要删除扩展历史或更换浏览器配置。筛选入队成功才推进本地偏移；失败后保留断点，先检查扩展任务，再用 `--resume` 恢复。定时调度与延迟回复串行，忙碌时会顺延。
+粉丝断点按授权账号和博主保存在 `.data/loop.sqlite`，分页游标和已抓取记录保存在 exporter24 历史任务及账号快照中。每次抓取先查询该博主最近更新的粉丝历史：同一任务沿用本地偏移，另一条历史任务从该记录开头处理，确认没有历史或任务无法恢复时从头抓取；无法读取数据库时停止并保留原断点。扩展在完整分页边界暂停；本页超出 200 人的记录留给下一批，避免中途暂停漏人。筛选入队成功才推进本地偏移；失败后保留断点。定时调度会恢复尚未产生批次、没有关注操作的失败尝试；已有批次、运行状态不明或关注结果不明的任务仍需人工检查。恢复成功后，同一断点的旧失败尝试会标记为已替代并保留记录。帖子采集完成后才启动粉丝批次；粉丝批次与延迟回复任务串行，忙碌时会顺延。
 
 固定规则：关注数和粉丝数都大于 50，且较大值不超过较小值的 3 倍。阅读会串行并带随机延迟。`--language ar` 只影响帖子回复用户；`--evaluate` 只评估回复用户，粉丝列表不做模型评估。关注时优先使用 CSV 的用户数字 ID，缺失时才批量解析用户名。**该命令会实际发送关注请求。** 粉丝导出依赖 exporter24 的登录/额度；大粉丝量账号可能超时。
 
@@ -149,7 +135,7 @@ exporter24 粉丝批次及资料补数的暂时故障独立使用持久化退避
 
 CommentCrate 免费版每个帖子只扫描一级评论（不展开楼中楼和“疑似垃圾”回复），最多导出 200 条；X 帖子上显示的回复数包含这些未导出的回复，因此本地 CSV 往往明显少于页面数字。需要楼中楼和更完整的回复列表时，需要使用 CommentCrate Pro 或另做页面补抓。程序会在日志里同时打印导出条数和帖子显示的回复数。
 
-exporter24 免费账号累计导出 100 条后会弹出“Leave us a 5-star review”提示。程序在打开扩展页、读取计数和粉丝分批抓取时都会检测 5 星评价、登录页或额度弹窗：一旦检测到，就用 `.env` 的 `X_EXPORT_TOKEN` 调用 exporter24 的登录接口换取会话并写入扩展存储（等价于扩展的 “sign with token”），随后重新加载页面继续；粉丝任务从已保存的历史断点继续。建议把 `X_EXPORT_TOKEN` 配成有 unlimited 权益的账号。未配置令牌时不会尝试登录，计数读取回退到主页读取，粉丝分批抓取保留断点并报出需要登录的错误。
+exporter24 免费账号累计导出 100 条后会弹出“Leave us a 5-star review”提示。配置 `.env` 的 `X_EXPORT_TOKEN` 后，程序在每个扩展页面首次使用前调用 exporter24 的登录接口换取会话并写入扩展存储（等价于扩展的 “sign with token”）；出现 5 星评价、登录页或额度弹窗时再次登录。登录需要重新加载页面时，粉丝任务从已保存的历史断点继续。建议把 `X_EXPORT_TOKEN` 配成有 unlimited 权益的账号。未配置令牌时不会尝试登录，计数读取回退到主页读取，粉丝分批抓取保留断点并报出需要登录的错误。
 
 ### 关注 Outbox
 

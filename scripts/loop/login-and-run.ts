@@ -4,27 +4,45 @@ import { monitorProcess } from '../../src/runtime-monitor.ts';
 
 import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
-import { access, mkdir, open, readFile, unlink } from 'node:fs/promises';
+import { access, mkdir, open, readFile, unlink, writeFile, rename } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { resolve, join } from 'node:path';
+import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { accountReadiness } from '../account/account-readiness.ts';
-import { cookieFileCandidates, loadCookieJar, type CookieJar } from '../browser/cookies.ts';
+import { cookieFileCandidates, defaultCookiePath, loadCookieJar, type CookieJar } from '../browser/cookies.ts';
 import { fingerprintFor } from '../browser/fingerprint.ts';
-import { ensureProfileFromChrome, ensureProfileFromTemplate, PROFILE_TEMPLATE_DIR } from '../browser/profile-template.ts';
 import { AccountStore } from '../../src/account-store.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { FollowerCheckpoints } from '../browser/follower-batch.ts';
 import { XPageCircuit } from '../browser/x-page-circuit.ts';
+import { acquireBrowserSlot, type BrowserSlotRelease } from '../browser/browser-slots.ts';
+import { prepareRuntimeProfile } from '../browser/runtime-profile.ts';
+import { downloadExtension } from '../browser/download-extension.ts';
+import { findExtensionPackage, COMMENTCRATE_EXTENSION_ID } from '../browser/extension-packages.ts';
+import { EXPORTER24_EXTENSION_ID } from '../browser/exporter24.ts';
+import { ensureCommentCratePermission } from '../browser/commentcrate-permission.ts';
+import { prepareInstrumentedExporter } from '../browser/exporter-instrumentation.ts';
+import { ensureBitBinding } from '../browser/bitbrowser-binding.ts';
 
 const args = process.argv.slice(2);
 const accountId = args[0];
+if (/^\d{1,19}$/.test(accountId || '')) {
+  await ensureBitBinding(accountId);
+  const child = spawn(process.execPath, ['scripts/loop/bitbrowser-login-and-run.ts', ...args], { cwd: process.cwd(), stdio: 'inherit', env: process.env });
+  const forwardStop = (signal: NodeJS.Signals) => { if (child.exitCode === null) child.kill(signal); };
+  process.once('SIGINT', () => forwardStop('SIGINT'));
+  process.once('SIGTERM', () => forwardStop('SIGTERM'));
+  const code = await new Promise<number>(resolveCode => { child.once('error', () => resolveCode(1)); child.once('exit', code => resolveCode(code ?? 1)); });
+  process.exit(code);
+}
 const telemetry = monitorProcess(accountId, 'login');
 telemetry.stage('检查登录与浏览器');
 const checkOnly = args.includes('--check-only');
 const followerLoop = args.includes('--follower-loop');
-const forwarded = args.slice(1).filter(argument => !['--check-only', '--follower-loop'].includes(argument));
+const followerProfile = followerLoop || args.includes('--follower-profile');
+const forwarded = args.slice(1).filter(argument => !['--check-only', '--follower-loop', '--follower-profile'].includes(argument));
 const bloggerArgIndex = forwarded.indexOf('--blogger');
 const followerBlogger = followerLoop && bloggerArgIndex >= 0 ? String(forwarded[bloggerArgIndex + 1] || '').replace(/^@/, '') : '';
 if (followerLoop && !/^[A-Za-z0-9_]{1,15}$/.test(followerBlogger)) { console.error('--follower-loop 需要 --blogger <博主用户名>'); process.exit(1); }
@@ -36,12 +54,18 @@ const portText = process.env.PORT || '3000';
 if (!/^\d{1,5}$/.test(portText) || +portText < 1 || +portText > 65535) { console.error('PORT 无效'); process.exit(1); }
 const origin = `http://127.0.0.1:${portText}`;
 const root = resolve('.data', 'browser-profiles');
-const profileSuffix = followerLoop ? '-follow' : '';
-const profile = join(root, accountId + profileSuffix);
+const profileSuffix = followerProfile ? '-follow' : '';
+let profile = join(root, accountId + profileSuffix);
 const lockPath = join(root, `${accountId}${profileSuffix}.lock`);
-const executable = process.env.X_BROWSER_EXECUTABLE || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const defaultBrowserRoot = join(homedir(), 'Library', 'Caches', 'ms-playwright');
+const bundledPath = chromium.executablePath();
+const executable = process.env.X_BROWSER_EXECUTABLE || bundledPath.replace(defaultBrowserRoot, resolve('.data/playwright-browsers'));
 let lockOwned = false, loginBrowser, context, worker, store;
 let pageCircuit: XPageCircuit | undefined;
+let releaseBrowserSlot: BrowserSlotRelease | undefined;
+let runtimeProfile: Awaited<ReturnType<typeof prepareRuntimeProfile>> | undefined;
+let contextClosing: Promise<void> | undefined;
+let contextCloseFailed = false;
 let stopping = false;
 
 async function acquireLock() {
@@ -79,7 +103,7 @@ function stop() {
     try { process.kill(-worker.pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') console.error(error.message); }
   }
   if (loginBrowser?.exitCode === null) loginBrowser.kill('SIGTERM');
-  void context?.close().catch(() => {});
+  if (context && !contextClosing) contextClosing = context.close().catch(() => { contextCloseFailed = true; });
 }
 process.once('SIGINT', stop);
 process.once('SIGTERM', stop);
@@ -95,23 +119,36 @@ try {
   if (!username || !/^[A-Za-z0-9_]{1,15}$/.test(username)) throw new Error(`未找到账号 ${accountId}，请先在 ${origin} 完成 X 授权`);
   const scopes = (account.scope || '').split(/\s+/);
   if (!scopes.includes('users.read') || !scopes.includes('follows.write')) throw new Error('账号缺少读取或关注授权，请重新授权');
-  await access(executable, constants.X_OK);
+  await access(executable, constants.X_OK).catch(() => { throw new Error('未安装 Playwright Chromium；请运行 PLAYWRIGHT_BROWSERS_PATH=.data/playwright-browsers npx playwright install --no-shell chromium'); });
   await mkdir(root, { recursive: true, mode: 0o700 });
   await acquireLock();
-  const chromeCopy = await ensureProfileFromChrome(profile);
-  const templateCopied = chromeCopy ? false : await ensureProfileFromTemplate(profile, process.env.X_PROFILE_TEMPLATE || PROFILE_TEMPLATE_DIR);
-  const profileCopied = chromeCopy === 'created' || templateCopied;
-  if (chromeCopy) console.log('已从本机 Chrome 复制插件配置和文件，请检查插件授权。');
-  else if (templateCopied) console.log('已从插件模板复制账号浏览器资料，请检查插件授权。');
+  releaseBrowserSlot = await acquireBrowserSlot(accountId, { cancelled: () => stopping, onWait: () => console.log('五个浏览器槽位均忙，等待空闲槽位。') });
+  runtimeProfile = await prepareRuntimeProfile(accountId, profileSuffix, resolve('.data'), releaseBrowserSlot.slot);
+  profile = runtimeProfile.path;
+  const source = process.env.X_PROFILE_TEMPLATE_SOURCE || join(homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
+  const extensionPaths: string[] = [];
+  for (const id of [COMMENTCRATE_EXTENSION_ID, EXPORTER24_EXTENSION_ID]) {
+    try {
+      const path = await downloadExtension(id);
+      extensionPaths.push(id === EXPORTER24_EXTENSION_ID ? await prepareInstrumentedExporter(path) : path);
+    }
+    catch (error) {
+      if (id !== COMMENTCRATE_EXTENSION_ID || !(error instanceof Error) || !/HTTP 204/.test(error.message)) throw error;
+      const local = await findExtensionPackage(source, id);
+      if (!local) throw error;
+      console.warn(`扩展 ${id} 无法从商店下载，使用本机已验证的安装包：${error instanceof Error ? error.message : String(error)}`);
+      extensionPaths.push(local);
+    }
+  }
   await mkdir(profile, { recursive: true, mode: 0o700 });
   store = new AccountStore(resolve('.data'));
   const fp = fingerprintFor(accountId);
-  const chromeReady = !profileCopied && (store.getByUuid(accountId)?.chromeReady ?? false);
-  const needsCheck = followerLoop || !chromeReady || checkOnly || chromeCopy === 'repaired';
-  // cookie 文件只用于首次登录：已标记就绪的账号直接复用资料中的登录态，避免旧 cookie 覆盖有效会话。
+  const chromeReady = store.getByUuid(accountId)?.chromeReady ?? false;
+  const needsCheck = true;
+  // 用户配置 Cookie 时每次注入对应账号的 Cookie；其余情况复用资料登录态。
   let cookiePath: string | null = null;
   let cookieJar: CookieJar | null = null;
-  if (!chromeReady) {
+  {
     for (const candidate of cookieFileCandidates(accountId)) {
       try { await access(candidate, constants.R_OK); cookiePath = candidate; break; } catch {}
     }
@@ -121,8 +158,8 @@ try {
     for (const warning of cookieJar.warnings) console.warn(warning);
     console.log(`正在用 ${cookiePath} 中的 cookie 登录 @${username}，跳过手动登录窗口。`);
   }
-  if (!chromeReady && !cookieJar) {
-    console.log(`正在打开 @${username} 的登录窗口，请登录 X 并安装、授权 CommentCrate。`);
+  if (!cookieJar) {
+    console.log(`正在打开 @${username} 的登录窗口，请登录 X。`);
     loginBrowser = spawn(executable, [`--user-data-dir=${profile}`, '--no-first-run', 'https://x.com/home', `--lang=${fp.locale}`, `--window-size=${fp.viewport.width},${fp.viewport.height}`], { stdio: 'ignore' });
     await new Promise<void>((resolve, reject) => { loginBrowser.once('spawn', resolve); loginBrowser.once('error', reject); });
     const loginExit = new Promise<void>(resolve => loginBrowser.once('exit', () => resolve()));
@@ -187,8 +224,11 @@ async function runFollowerLoop() {
   pageCircuit = new XPageCircuit();
   context = await chromium.launchPersistentContext(profile, {
     headless, executablePath: executable,
+    // 正式版 Chrome 158 在 --no-sandbox 下会在启动约 15 秒后清除商店安装的扩展
+    // （exporter24 / CommentCrate），因此必须保留 Chrome 沙箱。
+    chromiumSandbox: true,
     ignoreDefaultArgs: ['--disable-extensions', '--use-mock-keychain', '--password-store=basic'],
-    args: [`--remote-debugging-port=${cdpPort}`, '--no-first-run'],
+    args: [`--remote-debugging-port=${cdpPort}`, '--no-first-run', `--disable-extensions-except=${extensionPaths.join(',')}`, `--load-extension=${extensionPaths.join(',')}`],
     locale: fp.locale, timezoneId: fp.timezoneId, viewport: fp.viewport, screen: fp.screen, colorScheme: fp.colorScheme,
     extraHTTPHeaders: { 'Accept-Language': fp.acceptLanguage },
   });
@@ -198,7 +238,7 @@ async function runFollowerLoop() {
   if (xBlockedAtStartup) {
     console.log('X 页面熔断中，跳过启动时的页面读取，交由采集调度器执行冷却和恢复探测。');
   } else if (needsCheck) {
-    if (!chromeReady && cookieJar) await context.addCookies(cookieJar.cookies);
+    if (cookieJar) await context.addCookies(cookieJar.cookies);
     const page = context.pages()[0] || await context.newPage();
     pageCircuit.guard(); await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
     pageCircuit.guard();
@@ -206,23 +246,27 @@ async function runFollowerLoop() {
     const readiness = accountReadiness(href, username, false);
     if (readiness === 'login') {
       if (cookieJar) throw new Error(`cookie 无效或已过期（${cookiePath}），请从已登录 @${username} 的浏览器重新导出 auth_token 与 ct0；删除该文件则回到手动登录`);
-      if (chromeReady) throw new Error(`账号 @${username} 的资料登录已失效；删除 .data/browser-profiles/${accountId} 后重跑，或放入 .data/cookies/${accountId}.json`);
+      if (chromeReady) throw new Error(`账号 @${username} 的资料登录已失效；请更新 .data/cookies/${accountId}.json 后重试，保留浏览器资料以免丢失插件历史`);
       throw new Error(`请先在登录窗口登录 @${username} 后重试`);
     }
     if (readiness === 'wrong_account') throw new Error(`浏览器登录账号与 @${username} 不一致`);
-    if (!followerLoop) {
+    // 手工登录产生的 Cookie 单独保存在账号文件，后续浏览器实例均可导入。
+    if (!cookieJar) {
+      const cookies = (await context.cookies()).filter(cookie => /^(?:\.)?(?:x|twitter)\.com$/i.test(cookie.domain));
+      if (!cookies.some(cookie => cookie.name === 'auth_token') || !cookies.some(cookie => cookie.name === 'ct0')) throw new Error('无法保存账号登录 Cookie');
+      const path = defaultCookiePath(accountId), temporary = `${path}.tmp-${process.pid}`;
+      await mkdir(resolve(path, '..'), { recursive: true, mode: 0o700 });
+      await writeFile(temporary, JSON.stringify({ cookies }), { mode: 0o600 });
+      await rename(temporary, path);
+      console.log('账号登录 Cookie 已独立保存。');
+    }
+    if (!followerLoop && !forwarded.includes('--followers-only')) {
       const helper = await context.newPage();
       try {
         await helper.goto('chrome-extension://haaahmifcccbgagmopbhbkgabgblmcbl/popup/popup.html', { timeout: 5000 });
-        const granted = await helper.evaluate(async () => {
-          const api = (globalThis as any).chrome, crate = (globalThis as any).CommentCrate;
-          const platform = crate?.platformsMeta?.PLATFORMS?.find(p => p.id === 'x');
-          return !!platform && await crate.permissions.create(api).has(platform);
-        });
-        if (!granted) throw new Error('请授予 CommentCrate 对 X 的访问权限');
+        await ensureCommentCratePermission(helper, { headless });
       } catch (error) {
-        const hint = cookieJar ? '（cookie 只代替登录，CommentCrate 仍需安装在该账号的浏览器资料中）' : '';
-        throw new Error(`CommentCrate 未就绪：${error.message}${hint}`);
+        throw new Error(`CommentCrate 未就绪：${error.message}`);
       } finally { await helper.close().catch(() => {}); }
     }
     store.upsert({ uuid: accountId, username, chromeReady: true });
@@ -255,7 +299,16 @@ async function runFollowerLoop() {
 } finally {
   stop();
   store?.close();
-  await context?.close().catch(() => {});
+  await contextClosing;
+  if (runtimeProfile && contextCloseFailed) {
+    console.error('浏览器未确认关闭，运行资料已保留，插件历史未覆盖。');
+    process.exitCode = 1;
+  }
+  if (runtimeProfile && !contextCloseFailed) {
+    try { await runtimeProfile.saveAndRemove(); }
+    catch (error) { console.error(`保存插件历史失败，运行资料已保留：${error.message}`); process.exitCode = 1; }
+  }
   pageCircuit?.close();
+  releaseBrowserSlot?.();
   if (lockOwned) await unlink(lockPath).catch(() => {});
 }

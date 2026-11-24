@@ -110,13 +110,14 @@ export async function ensureFollowSubscription(api: ActivityHttp, accountId: str
 export async function receiveFollowEvents(api: ActivityHttp, controller: AbortController, onFollow: (event: FollowEvent) => void, onState: (state: string) => void = () => {}, onDm: (event: DmEvent) => void = () => {}, onChat: (event: ChatEvent) => void = () => {}): Promise<void> {
   let retry = 1;
   while (!controller.signal.aborted) {
+    let connectedAt = 0;
     try {
       onState('连接关注事件流');
       const response = await api('/stream');
       if (!response.body) throw new Error('X 未返回流数据');
       onState('监听关注与回关事件');
       console.log('Activity 流已连接。');
-      retry = 1;
+      connectedAt = Date.now();
       const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
       let buffer = '';
       try {
@@ -159,13 +160,16 @@ export async function receiveFollowEvents(api: ActivityHttp, controller: AbortCo
       if (controller.signal.aborted) break;
       const message = error instanceof Error ? error.message : String(error);
       if (/X API HTTP (400|401|403|404):/.test(message)) throw error;
-      console.error(`连接失败：${message}`);
+      const causeCode = (error as any)?.cause?.code;
+      const detail = typeof causeCode === 'string' && /^[A-Z0-9_]{1,40}$/.test(causeCode) ? `（${causeCode}）` : '';
+      console.error(`Activity 流连接中断：${message}${detail}；准备重连，断线期间可能漏事件。`);
       if (/X API HTTP 429/.test(message)) {
         onState('X API 限流，等待熔断冷却');
         try { await delay(15 * 60_000, undefined, { signal: controller.signal }); } catch { break; }
         continue;
       }
     }
+    if (connectedAt && Date.now() - connectedAt >= 60_000) retry = 1;
     onState('连接断开，等待重连');
     try { await delay(retry * 1000, undefined, { signal: controller.signal }); } catch { break; }
     retry = Math.min(retry * 2, 60);

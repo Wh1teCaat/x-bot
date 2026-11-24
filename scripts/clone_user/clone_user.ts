@@ -2,7 +2,7 @@ import '../../src/runtime-config.ts';
 import { monitorProcess } from '../../src/runtime-monitor.ts';
 /** 独立运行：复制用户资料到当前手动登录的 X 账号。 */
 import { chromium, type Page, type Locator } from 'playwright';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, open, unlink, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
@@ -13,6 +13,15 @@ import { loadCookieJar, findCookieFile } from '../browser/cookies.ts';
 import { fingerprintFor } from '../browser/fingerprint.ts';
 import { AccountStore } from '../../src/account-store.ts';
 import { XPageCircuit } from '../browser/x-page-circuit.ts';
+import { acquireBrowserSlot } from '../browser/browser-slots.ts';
+import { getBitBinding, setBitPreferredWindow } from '../browser/bitbrowser-binding.ts';
+import { BitBrowserClient } from '../browser/bitbrowser-client.ts';
+import { downloadExtension } from '../browser/download-extension.ts';
+import { COMMENTCRATE_EXTENSION_ID } from '../browser/extension-packages.ts';
+import { EXPORTER24_EXTENSION_ID } from '../browser/exporter24.ts';
+import { prepareInstrumentedExporter } from '../browser/exporter-instrumentation.ts';
+import { acquireBitWindow } from '../browser/bitbrowser-window-lease.ts';
+import { prepareBitWindowAccount, saveBitWindowAccount } from '../browser/bitbrowser-window-state.ts';
 
 const telemetry = monitorProcess(process.env.X_RUNTIME_ACCOUNT_ID, 'clone');
 telemetry.stage('复制目标账号资料');
@@ -47,6 +56,34 @@ const input = createInterface({ input: stdin, output: stdout });
 let context;
 let accountStore;
 let xCircuit: XPageCircuit | undefined;
+let releaseBrowserSlot: (() => void) | undefined;
+let bitClient: BitBrowserClient | undefined, bitWindow: string | undefined, bitBrowser: Awaited<ReturnType<typeof chromium.connectOverCDP>> | undefined;
+let bitLease: Awaited<ReturnType<typeof acquireBitWindow>> | undefined;
+let bitStateReady = false;
+const accountLocks: string[] = [];
+async function cleanBrowser() {
+  if (bitStateReady && context && bitWindow && process.env.X_RUNTIME_ACCOUNT_ID) {
+    bitStateReady = false;
+    try { await saveBitWindowAccount(context, bitWindow, process.env.X_RUNTIME_ACCOUNT_ID); } catch (error) { console.error(`保存 exporter 历史失败：${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  }
+  if (bitClient && bitWindow) await bitClient.close(bitWindow).catch(() => { console.error('比特窗口关闭失败，请在比特浏览器检查'); process.exitCode = 1; });
+  await bitBrowser?.close().catch(() => {});
+  if (!bitClient) await context?.close().catch(() => {});
+  await bitLease?.release(); bitLease = undefined;
+  for (const path of accountLocks.splice(0).reverse()) await unlink(path).catch(() => {});
+}
+async function acquireAccountLock(path: string) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { const handle = await open(path, 'wx', 0o600); accountLocks.push(path); try { await handle.writeFile(String(process.pid)); } finally { await handle.close(); } return; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || attempt) throw error;
+      const pid = (await readFile(path, 'utf8')).trim();
+      if (!/^\d+$/.test(pid)) throw new Error('账号浏览器锁无效');
+      try { process.kill(Number(pid), 0); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ESRCH') { await unlink(path); continue; } throw e; }
+      throw new Error('账号浏览器正在使用，请先停止该账号');
+    }
+  }
+}
 async function pause(prompt: string) {
   if (!stdin.isTTY) throw new Error('未检测到 X 登录态。后台运行无法等待终端输入，请更新 .data/cookies/<账号ID>.json（或 .txt）中的 Cookie 后重试。');
   await input.question(prompt);
@@ -114,15 +151,51 @@ async function firstVisible(page: Page, selectors: string[]) {
   throw new Error(`找不到页面控件：${selectors.join(' / ')}；X 页面可能已改版`);
 }
 try {
+  const accountId = process.env.X_RUNTIME_ACCOUNT_ID;
+  const binding = accountId ? await getBitBinding(accountId) : null;
+  if (binding) {
+    const root = resolve('.data/browser-profiles'); await mkdir(root, { recursive: true, mode: 0o700 });
+    await acquireAccountLock(resolve(root, `${accountId}.lock`));
+    await acquireAccountLock(resolve(root, `${accountId}-follow.lock`));
+  }
+  releaseBrowserSlot = await acquireBrowserSlot(process.env.X_RUNTIME_ACCOUNT_ID || profileName, { onWait: () => console.log('五个浏览器槽位均忙，等待空闲槽位。') });
   xCircuit = new XPageCircuit();
   xCircuit.guard();
   cookiePath = await findCookieFile(process.env.X_RUNTIME_ACCOUNT_ID, cookiePath);
-  await mkdir(profile, { recursive: true, mode: 0o700 });
-  const fp = fingerprintFor(profileName);
-  context = await chromium.launchPersistentContext(profile, { executablePath: executable, headless: false,
+  if (binding) {
+    bitClient = new BitBrowserClient(binding.apiUrl);
+    await bitClient.health();
+    bitLease = await acquireBitWindow(accountId!, binding.windowId, binding.apiUrl, { onWait: () => console.log('比特窗口均在使用，等待空闲。') });
+    const selected = bitLease.windowId;
+    if (!await bitClient.isolated(selected)) throw new Error('比特窗口的数据同步未关闭');
+    if (await bitClient.isOpen(selected)) throw new Error('比特窗口正在使用，请先关闭');
+    const crate = await downloadExtension(COMMENTCRATE_EXTENSION_ID);
+    const exporter = await prepareInstrumentedExporter(await downloadExtension(EXPORTER24_EXTENSION_ID));
+    let opened: Awaited<ReturnType<BitBrowserClient['open']>>;
+    try { opened = await bitClient.open(selected, [crate, exporter]); bitWindow = selected; }
+    catch (error) {
+      try { if (await bitClient.isOpen(selected)) await bitClient.close(selected); }
+      catch { console.warn('未能确认或关闭启动失败的比特窗口，下次分配时会避开仍在运行的窗口。'); }
+      throw error;
+    }
+    bitBrowser = await chromium.connectOverCDP(opened.ws, { timeout: 30000 });
+    context = bitBrowser.contexts()[0];
+    if (!context) throw new Error('比特窗口没有浏览器上下文');
+    if (!cookiePath) throw new Error('账号尚未导入 X Cookie');
+    const jar = await loadCookieJar(cookiePath);
+    await prepareBitWindowAccount(context, selected, accountId!, jar.cookies.find(cookie => cookie.name === 'auth_token')?.value);
+    bitStateReady = true;
+  } else {
+    if (accountId) throw new Error('账号未绑定比特窗口');
+    await mkdir(profile, { recursive: true, mode: 0o700 });
+    const fp = fingerprintFor(profileName);
+    context = await chromium.launchPersistentContext(profile, { executablePath: executable, headless: false,
+    // 正式版 Chrome 在 --no-sandbox 下会清除已安装的商店扩展，clone 要用 CommentCrate。
+    chromiumSandbox: true,
     ignoreDefaultArgs: ['--disable-extensions', '--use-mock-keychain', '--password-store=basic'],
     locale: fp.locale, timezoneId: fp.timezoneId, viewport: fp.viewport, screen: fp.screen, colorScheme: fp.colorScheme,
     extraHTTPHeaders: { 'Accept-Language': fp.acceptLanguage } });
+  }
   xCircuit.attach(context);
   if (cookiePath) {
     const jar = await loadCookieJar(resolve(cookiePath));
@@ -143,10 +216,11 @@ try {
   if (process.env.X_RUNTIME_ACCOUNT_ID && (!expectedAccount || expectedAccount.username.toLowerCase() !== owner.toLowerCase())) {
     throw new Error('Cookie 或浏览器登录账号与本次运行账号不一致，已停止复制资料');
   }
+  if (binding && bitWindow && bitWindow !== binding.windowId) await setBitPreferredWindow(accountId!, binding, bitWindow, false);
   if (accountStore.getByUsername(owner)?.cloned && !dryRun && !updateOnly) {
     console.log(`账号 @${owner} 已克隆，跳过。`);
     input.close();
-    await context?.close().catch(() => {});
+    await cleanBrowser();
     accountStore.close();
     process.exit(0);
   }
@@ -187,7 +261,7 @@ try {
     console.log('dry-run：已读取目标资料、头像和横幅，不修改账号。');
     input.close();
     accountStore.close();
-    await context.close().catch(() => {});
+    await cleanBrowser();
     process.exit(0);
   }
   telemetry.stage('复制头像、显示名称和简介');
@@ -303,6 +377,7 @@ try {
 } finally {
   input.close();
   accountStore?.close();
-  await context?.close().catch(() => {});
+  await cleanBrowser();
   xCircuit?.close();
+  releaseBrowserSlot?.();
 }

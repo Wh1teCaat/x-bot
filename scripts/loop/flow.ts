@@ -14,6 +14,9 @@ import { AccountStore } from '../../src/account-store.ts';
 import { MirrorStore } from '../../src/mirror-store.ts';
 import { resolveFlowTarget } from './flow-target.ts';
 import { discoverFashionTarget, parseFashionQueries } from '../clone_user/fashion-target.ts';
+import { planFollowerRecovery, supersedeFollowerAttempts } from './follower-recovery.ts';
+import { followerBatchFailure, nextFollowerBrowserRetry, FOLLOWER_BROWSER_MAX_RETRIES } from './follower-schedule-retry.ts';
+import { ensureBitBinding } from '../browser/bitbrowser-binding.ts';
 
 const raw = process.argv.slice(2);
 const accountId = raw[0];
@@ -68,9 +71,11 @@ const readAccount = () => {
 };
 let account = readAccount();
 if (!account) { console.error(`未找到账号 ${accountId}，请先完成 X 授权`); process.exit(1); }
+const bitBinding = await ensureBitBinding(accountId, dataDir, cookiePath);
 const loginEnv = { ...process.env, ...(cookiePath ? { X_COOKIE_FILE: resolve(cookiePath) } : {}) };
 /** 粉丝常驻 loop 用独立资料：首次启动时从主资料复制（必须没有 Chrome 占用）。 */
 async function ensureFollowerProfile() {
+  if (bitBinding) return;
   const source = join(dataDir, 'browser-profiles', accountId);
   const destination = `${source}-follow`;
   if (existsSync(destination)) return;
@@ -91,8 +96,6 @@ let restartTimer: ReturnType<typeof setTimeout> | null = null;
 let replyChild: ChildProcess | null = null;
 let replyTimer: ReturnType<typeof setInterval> | null = null;
 let mirrorStore: MirrorStore | null = null;
-let followerLoopChild: ChildProcess | null = null;
-let followerLoopUsed = false;
 let resolveStop: (() => void) | null = null;
 const stopPromise = new Promise<void>((resolveSignal) => { resolveStop = resolveSignal; });
 let stopTask: Promise<void> | null = null;
@@ -115,6 +118,12 @@ if (checkOnly) {
   const code = await run(['scripts/loop/login-and-run.ts', accountId, '--check-only'], loginEnv);
   process.exitCode = code;
   process.exit();
+}
+
+if (bitBinding.needsAuthorization) {
+  console.log('首次使用该比特窗口，先检查 X 登录和插件授权。');
+  const code = await run(['scripts/loop/login-and-run.ts', accountId, '--check-only'], loginEnv);
+  if (code !== 0) { console.error('比特窗口授权检查失败，账号任务未启动。'); await stop('failed'); process.exit(code); }
 }
 
 let chosenTarget = target;
@@ -140,6 +149,15 @@ if (!account.cloned && !chosenTarget) {
   });
 }
 let resolvedTarget = resolveFlowTarget(account, chosenTarget);
+let resumeFollower = false;
+if (resumeId && existsSync(resolve(dataDir, 'loop.sqlite'))) {
+  const db = new DatabaseSync(resolve(dataDir, 'loop.sqlite'), { readOnly: true });
+  try {
+    const row = db.prepare('SELECT stage,state FROM runs WHERE id=?').get(resumeId);
+    if (row) resumeFollower = row.stage === 'followers-export' || JSON.parse(String(row.state)).phase === 'followers';
+  } finally { db.close(); }
+}
+if (followersOnly || resumeFollower) await ensureFollowerProfile();
 if (loopOnly) {
   console.log(`--loop-only：跳过 clone 和 mirror，目标 @${resolvedTarget}`);
   const code = await run(loopArgs(resolvedTarget), loginEnv);
@@ -158,15 +176,6 @@ if (account.cloned) {
   console.log(`clone 完成并持久化：目标 @${resolvedTarget}`);
 }
 
-
-if (!loopOnly && !postUrl && !followersOnly) {
-  await ensureFollowerProfile();
-  followerLoopUsed = true;
-  followerLoopChild = spawn(process.execPath, ['scripts/loop/login-and-run.ts', accountId, '--follower-loop', '--blogger', resolvedTarget, ...(yes ? ['--yes'] : [])], { cwd: process.cwd(), stdio: 'inherit', env: loginEnv });
-  followerLoopChild.once('error', error => console.error(`粉丝常驻 loop 启动失败：${error.message}`));
-  followerLoopChild.once('exit', (code, signal) => { followerLoopChild = null; if (!stopping) console.error(`粉丝常驻 loop 已停止（code=${code}, signal=${signal}）；请检查日志。`); });
-  console.log('粉丝常驻 loop 已启动（独立资料，与帖子 loop 并发）。');
-}
 
 outboxChild = spawn(process.execPath, ['scripts/follow/outbox-worker.ts', accountId, ...(confirmFollow ? ['--confirm-follow'] : [])], { cwd: process.cwd(), stdio: 'inherit' });
 outboxChild.once('error', error => console.error(`关注 Outbox 子进程启动失败：${error.message}`));
@@ -227,35 +236,55 @@ console.log(`loop 进入长时运行；每 ${Math.round(schedulerMs / 1000)} 秒
 
 /** 处理到期的单帖回复任务；串行，避免与当前 loop 争用账号。 */
 let followerScheduleBlocked = loopCode !== 0;
+let followerRetryAt = 0;
+let followerBrowserFailures = 0;
 const processDueFollowerBatch = async (): Promise<boolean> => {
-  if (followerLoopUsed || followerScheduleBlocked || postUrl) return false;
+  if (followerScheduleBlocked || postUrl) return false;
+  if (Date.now() < followerRetryAt) return false;
   const db = new DatabaseSync(resolve(dataDir, 'loop.sqlite'));
   db.exec('PRAGMA busy_timeout=10000');
-  let checkpoint;
+  let checkpoint, recovery;
   try {
     checkpoint = new FollowerCheckpoints(db).get(accountId, resolvedTarget);
-    // 上次失败/中断的粉丝任务须先恢复，不能另起任务跳过尚未入队的批次。
-    const pending = db.prepare("SELECT state FROM runs WHERE status != 'completed'").all().some(row => {
-      const state = JSON.parse(String(row.state));
-      return state.followAccountId === accountId && state.blogger?.toLowerCase() === resolvedTarget.toLowerCase() && state.phase === 'followers';
-    });
-    if (pending) { followerScheduleBlocked = true; console.error('存在未完成粉丝任务，请先用 --resume 恢复；定时抓取暂停。'); return false; }
+    recovery = planFollowerRecovery(db, accountId, resolvedTarget);
+    if (recovery.kind === 'blocked') { followerScheduleBlocked = true; console.error(`存在需要人工检查的粉丝任务 ${recovery.id}；定时抓取暂停。`); return false; }
   } finally { db.close(); }
   if (checkpoint.done || checkpoint.due > Date.now()) return false;
+  await ensureFollowerProfile();
   telemetry.stage('执行粉丝定时续抓');
-  console.log(`开始粉丝定时续抓（每 ${Math.round(FOLLOWER_INTERVAL_MS / 60_000)} 分钟一批）：本批最多 200 人。`);
-  replyChild = spawn(process.execPath, [...loopArgs(resolvedTarget).filter(arg => arg !== '--followers-only'), '--followers-only'], { cwd: process.cwd(), stdio: 'inherit', env: loginEnv });
+  console.log(recovery.kind === 'resume' ? `恢复未完成粉丝任务 ${recovery.id}，继续已保存断点。` : `开始粉丝定时续抓（每 ${Math.round(FOLLOWER_INTERVAL_MS / 60_000)} 分钟一批）：本批最多 200 人。`);
+  const batchArgs = [...loopArgs(resolvedTarget).filter(arg => arg !== '--followers-only' && arg !== '--no-followers' && arg !== '--follower-profile'), '--followers-only', '--follower-profile', ...(recovery.kind === 'resume' ? ['--resume', recovery.id] : [])];
+  replyChild = spawn(process.execPath, batchArgs, { cwd: process.cwd(), stdio: 'inherit', env: loginEnv });
   const code = await new Promise<number>(resolveCode => {
     replyChild!.once('error', () => resolveCode(1));
     replyChild!.once('exit', code => resolveCode(code ?? 1));
   });
   replyChild = null;
-  if (code !== 0) { followerScheduleBlocked = true; console.error('粉丝续抓失败，断点保留；请检查并恢复后重启定时调度。'); }
+  const failure = followerBatchFailure(code);
+  if (failure === 'retry-browser') {
+    const retry = nextFollowerBrowserRetry(followerBrowserFailures, Date.now());
+    followerBrowserFailures = retry.failures;
+    if (retry.blocked) {
+      followerScheduleBlocked = true;
+      console.error(`比特浏览器连续 ${followerBrowserFailures} 次无法启动，尚未开始采集；断点保留，请检查比特客户端和网络后重新启动定时任务。`);
+    } else {
+      followerRetryAt = retry.retryAt;
+      console.error(`比特浏览器未能启动，尚未开始采集；断点保留，5 分钟后自动重试（${followerBrowserFailures}/${FOLLOWER_BROWSER_MAX_RETRIES}）。`);
+    }
+  } else if (failure === 'blocked') { followerScheduleBlocked = true; console.error('粉丝续抓失败，断点保留；请检查并恢复后重启定时调度。'); }
+  else { followerRetryAt = 0; followerBrowserFailures = 0; }
+  if (code === 0 && recovery.kind === 'resume' && recovery.supersede.length) {
+    const recoveryDb = new DatabaseSync(resolve(dataDir, 'loop.sqlite'));
+    try { recoveryDb.exec('PRAGMA busy_timeout=10000'); supersedeFollowerAttempts(recoveryDb, recovery.supersede, recovery.id); } finally { recoveryDb.close(); }
+  }
   telemetry.stage('等待定时任务', 'waiting');
   return true;
 };
+let scheduling = false;
 const processDueReplyJob = async () => {
-  if (stopping || replyChild || !mirrorStore) return;
+  if (stopping || replyChild || !mirrorStore || scheduling) return;
+  scheduling = true;
+  try {
   if (await processDueFollowerBatch()) return;
   if (stopping) return;
   const [job] = mirrorStore.dueReplyJobs(Date.now(), 1);
@@ -282,6 +311,7 @@ const processDueReplyJob = async () => {
   } catch (error) {
     if (!stopping) console.error(`记录回复任务结果失败：${error instanceof Error ? error.message : String(error)}`);
   }
+  } finally { scheduling = false; }
 };
 replyTimer = setInterval(() => {
   void processDueReplyJob().catch((error) => console.error(`延迟回复任务调度失败：${error instanceof Error ? error.message : String(error)}`));
@@ -296,12 +326,13 @@ process.exit(0);
 
 function loopArgs(blogger: string): string[] {
   return ['scripts/loop/login-and-run.ts', accountId, '--blogger', blogger,
+    ...(followersOnly || resumeFollower ? ['--follower-profile'] : []),
     ...(followersOnly ? ['--followers-only'] : []), ...(!followersOnly ? ['--no-followers'] : []), ...(language ? ['--language', language] : []), ...(evaluate ? ['--evaluate'] : []),
     ...(yes ? ['--yes'] : []), ...(postUrl ? ['--post', postUrl] : []), ...(resumeId ? ['--resume', resumeId] : [])];
 }
 
 async function run(args: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
-  telemetry.stage(args[0].includes('clone_user') ? '复制目标账号资料' : '登录并执行采集流程');
+  telemetry.stage(args[0].includes('authorize-slots') ? '初始化浏览器授权' : args[0].includes('clone_user') ? '复制目标账号资料' : '登录并执行采集流程');
   const code = await new Promise<number>((resolveCode) => {
     const child = spawn(process.execPath, args, { stdio: 'inherit', cwd: process.cwd(), env: { ...env, X_RUNTIME_ACCOUNT_ID: accountId } });
     child.once('error', error => { console.error(`子进程启动失败：${error.message}`); resolveCode(1); });

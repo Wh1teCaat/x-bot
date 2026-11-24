@@ -1,9 +1,10 @@
 import '../../src/runtime-config.ts';
 /** 从已安装插件的 Chrome 资料生成最小模板，并为每个账号复制一份隔离资料。 */
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, lstat } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, lstat, readlink, unlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
+import { EXPORTER24_EXTENSION_ID } from './exporter24.ts';
 
 export const PROFILE_TEMPLATE_DIR = resolve('.data', 'profile-template');
 const TEMPLATE_FILES = ['Local State', 'Default/Preferences', 'Default/Secure Preferences'];
@@ -16,15 +17,40 @@ const TEMPLATE_DIRS = [
 ];
 const COMMENTCRATE = 'haaahmifcccbgagmopbhbkgabgblmcbl';
 
-async function hasCommentCrate(root: string): Promise<boolean> {
+async function hasExtension(root: string, id: string): Promise<boolean> {
   try {
     const settings = JSON.parse(await readFile(join(root, 'Default/Secure Preferences'), 'utf8')).extensions.settings;
-    const extension = settings[COMMENTCRATE];
+    const extension = settings[id];
     const extensions = resolve(root, 'Default/Extensions');
     const extensionPath = resolve(extensions, extension?.path || '');
     return !!extension && !extension.disable_reasons?.length && extensionPath.startsWith(extensions + '/') &&
       existsSync(join(extensionPath, 'manifest.json'));
   } catch { return false; }
+}
+
+/** 只清理本机已退出进程留下的 Chrome 锁，其他情况保守地视为占用。 */
+async function assertProfileUnlocked(profileDir: string): Promise<void> {
+  const lock = join(profileDir, 'SingletonLock');
+  const info = await lstat(lock).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (!info) return;
+  const target = info.isSymbolicLink() ? await readlink(lock).catch(() => '') : '';
+  const match = target.match(/^(.*)-(\d+)$/);
+  let stale = false;
+  if (match && match[1] === hostname() && Number(match[2]) > 0) {
+    try { process.kill(Number(match[2]), 0); }
+    catch (error) { stale = (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+  }
+  if (stale) {
+    const current = await lstat(lock).catch(() => null);
+    if (current && current.dev === info.dev && current.ino === info.ino && await readlink(lock).catch(() => '') === target) {
+      await unlink(lock);
+      return;
+    }
+  }
+  throw new Error('账号 Chrome 资料存在 SingletonLock，请先关闭浏览器并检查锁状态');
 }
 
 /** 从本机已安装插件的 Chrome 复制受保护的插件配置；已有资料仅在插件缺失时修复。 */
@@ -36,11 +62,22 @@ export async function ensureProfileFromChrome(
   profileDir = resolve(profileDir);
   if (source === profileDir || source.startsWith(profileDir + '/') || profileDir.startsWith(source + '/'))
     throw new Error('源 Chrome 和账号资料目录不能相同或互相包含');
-  if (await hasCommentCrate(profileDir)) return null;
-  if (!await hasCommentCrate(source)) return null;
-  // Chrome 持有资料时不能修改其配置；即使锁已失效也要求先人工确认。
-  if (await lstat(join(profileDir, 'SingletonLock')).then(() => true, () => false))
-    throw new Error('账号 Chrome 资料存在 SingletonLock，请先关闭浏览器并检查锁状态');
+  if (!await hasExtension(source, COMMENTCRATE)) return null;
+  const required = [COMMENTCRATE];
+  if (await hasExtension(source, EXPORTER24_EXTENSION_ID)) required.push(EXPORTER24_EXTENSION_ID);
+  if ((await Promise.all(required.map(id => hasExtension(profileDir, id)))).every(Boolean)) return null;
+  // Chrome may reject copied protected registrations. Replacing them on every launch
+  // would undo a user's attempt to repair the affected profile in Chrome itself.
+  try {
+    const prefs = JSON.parse(await readFile(join(profileDir, 'Default/Secure Preferences'), 'utf8'));
+    const disabled = prefs.extensions?.settings?.[EXPORTER24_EXTENSION_ID]?.disable_reasons;
+    if (Array.isArray(disabled) && disabled.length) {
+      console.warn('账号资料中的 exporter24 已被 Chrome 禁用；请在该账号的 Chrome 扩展程序页面启用或从 Chrome 应用商店重新安装。');
+      return null;
+    }
+  } catch { /* 资料尚未初始化时继续复制 */ }
+  // Chrome 持有资料时不能修改其配置。
+  await assertProfileUnlocked(profileDir);
   const entries = await readdir(profileDir).catch(() => [] as string[]);
   if (!entries.length) {
     await createProfileTemplate(source, profileDir);

@@ -8,6 +8,7 @@ test('console expands account logs, preserves expansion on refresh, filters and 
   const executablePath = existsSync(chromium.executablePath()) ? chromium.executablePath() : '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
   const browser = await chromium.launch({ headless: true, executablePath });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1050 } });
+  await page.addInitScript(() => { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (text: string) => { (window as any).__copiedLogs = text; } } }); });
   const now = Date.now();
   const alice = { id: '1', username: 'alice', name: 'Alice Studio', status: 'running', stats: { following: 128, mutual: 36, queued: 72, pending: 3, uncertain: 0, manual: 0, inbound: 41 }, sessions: [
     { worker: 'loop', stage: '抓取粉丝（200 人）', status: 'running', stageStatus: 'running' },
@@ -63,6 +64,9 @@ test('console expands account logs, preserves expansion on refresh, filters and 
     await page.locator('#settings-close').click();
     await page.locator('details[data-id="1"] summary').click();
     await page.waitForSelector('.logs .log');
+    await page.getByRole('button', { name: '复制当前日志' }).click();
+    assert.match(await page.evaluate(() => (window as any).__copiedLogs), /粉丝本批 200 人/);
+    assert.match(await page.locator('.detail-error').innerText(), /已复制当前 1 条日志/);
     assert.match(await page.locator('.table-wrap').innerText(), /帖子扫描并关注/);
     assert.match(await page.locator('.table-wrap').innerText(), /1 分 0 秒/);
     assert.equal(await page.locator('img,script[src]').count(), 0);
@@ -73,15 +77,16 @@ test('console expands account logs, preserves expansion on refresh, filters and 
     if (process.env.XBOT_CONSOLE_SCREENSHOT) await page.screenshot({ path: process.env.XBOT_CONSOLE_SCREENSHOT, fullPage: true });
     await page.getByRole('button', { name: '更早日志' }).click();
     await page.waitForFunction(() => document.querySelector('.logs')?.textContent?.includes('更早的日志'));
+    await page.getByRole('button', { name: '复制当前日志' }).click();
+    assert.match(await page.evaluate(() => (window as any).__copiedLogs), /更早的日志/);
     await page.getByRole('button', { name: '返回最新' }).click();
     await page.waitForFunction(() => document.querySelector('.logs')?.textContent?.includes('粉丝本批'));
     await page.locator('details[data-id="2"] summary').click();
     await page.locator('details[data-id="2"] button[data-action="start"]').click();
     await page.locator('#start-target').fill('@fashion');
     await page.locator('#start-submit').click();
-    await page.waitForFunction(() => document.querySelector('#start-status')?.textContent?.includes('已启动'));
+    await page.locator('#start-dialog').waitFor({ state: 'hidden' });
     assert.equal(starts, 1);
-    await page.locator('#start-cancel').click();
     assert.equal(await page.locator('details[data-id="1"] button[data-action="start"]').isDisabled(), true);
     await page.locator('#filter').selectOption('running');
     assert.equal(await page.locator('details:visible').count(), 1);
@@ -90,10 +95,8 @@ test('console expands account logs, preserves expansion on refresh, filters and 
     await page.locator('#start-all').click();
     assert.equal(await page.locator('#start-target').isVisible(), false);
     await page.locator('#start-submit').click();
-    await page.waitForFunction(() => document.querySelector('#start-status')?.textContent?.includes('跳过 1 个'));
-    assert.match(await page.locator('#start-status').innerText(), /@bob：长 loop 已启动/);
+    await page.locator('#start-dialog').waitFor({ state: 'hidden' });
     assert.equal(batchStarts, 1);
-    await page.locator('#start-cancel').click();
     await page.locator('#search').fill('');
     await page.setViewportSize({ width: 390, height: 844 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);

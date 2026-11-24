@@ -7,7 +7,7 @@ import { connectTestingBrowser } from '../browser/browser-connection.ts';
 import { actionDelay, createProfileVisitDelay } from '../browser/action-delay.ts';
 import { openExporter24, readExporter24Counts, EXPORTER24_EXTENSION_ID } from '../browser/exporter24.ts';
 import { withExporterLock, withExporterRetryLock } from '../browser/exporter-lock.ts';
-import { FollowerCheckpoints, readFollowerBatch, stopFollowerBatchForRetry, FOLLOWER_INTERVAL_MS } from '../browser/follower-batch.ts';
+import { FollowerCheckpoints, readFollowerBatch, stopFollowerBatchForRetry, FOLLOWER_INTERVAL_MS, FollowerHistoryError } from '../browser/follower-batch.ts';
 import { ExporterRetry, ExporterError } from '../browser/exporter-retry.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
@@ -24,6 +24,7 @@ import { FollowOutbox } from '../../src/follow-outbox.ts';
 import { ResilienceStore, classifyFailure, retryTransient } from './resilience.ts';
 import { parseLoopArguments } from './loop-arguments.ts';
 import { AccountStore } from '../../src/account-store.ts';
+import { ProcessedPosts } from './processed-posts.ts';
 
 let args;
 try { args = parseLoopArguments(process.argv.slice(2), true); }
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS posts(id TEXT PRIMARY KEY, run_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS evaluated_users(username TEXT PRIMARY KEY, run_id TEXT NOT NULL);`);
 const resilience = new ResilienceStore(db);
 const followerCheckpoints = new FollowerCheckpoints(db);
+const processedPosts = new ProcessedPosts(db);
 let telemetry = monitorProcess(args.accountId, 'loop');
 telemetry.stage('准备采集任务');
 const followProbe = args.followProbe;
@@ -91,6 +93,7 @@ try {
     if (!row) throw new Error('未找到任务');
     assertNotRunning(row);
     if (row.status === 'completed') throw new Error('该轮已完成');
+    if (row.status === 'superseded') throw new Error('该粉丝任务已由其他任务恢复，不能重复执行');
     if (row.stage === 'export' || (row.stage === 'followers-export' && !JSON.parse(row.state).followerBatchMode)) throw new Error('导出阶段曾中断，无法确认插件是否停止；请先检查 Chrome 中的插件状态');
     runId = row.id; stage = row.stage; state = JSON.parse(row.state); runPersisted = true;
     if (!args.accountId && state.followAccountId) telemetry = monitorProcess(state.followAccountId, 'loop');
@@ -115,7 +118,7 @@ try {
   } else {
     if (!handle.test(blogger)) throw new Error('未找到 clone 来源博主；请先 clone，或用 --blogger <用户名> 指定');
     if (args.accountId && !args.postUrl && !args.noFollowers && !args.ignorePendingFollowers) {
-      const pending = db.prepare("SELECT id,state FROM runs WHERE status!='completed'").all().find(row => {
+      const pending = db.prepare("SELECT id,state FROM runs WHERE status NOT IN ('completed','superseded')").all().find(row => {
         const saved = JSON.parse(String(row.state));
         return saved.followAccountId === args.accountId && saved.blogger?.toLowerCase() === blogger.toLowerCase() && saved.phase === 'followers';
       });
@@ -195,9 +198,15 @@ try {
   while (stage !== 'done') {
   // 采集博主最近 10 条有回复的帖子，按新到旧处理。
   if (stage === 'search') {
+    processedPosts.importHistory(state.followAccountId);
     if (state.singlePost) {
       const postUrl = state.singlePostUrl || args.postUrl;
       if (!postUrl) throw new Error('单帖任务缺少帖子链接');
+      if (processedPosts.has(state.followAccountId, postUrl)) {
+        stage = 'done'; persist('completed');
+        console.log(`帖子已处理，跳过：${postUrl}`);
+        continue;
+      }
       state.posts = [{ url: postUrl, replies: null }];
       state.postIndex = 0;
       state.phase = 'replies';
@@ -213,14 +222,28 @@ try {
         posts.filter(post => typeof post.replies === 'number' && post.replies > 0),
       ).slice(0, 10);
       if (!withReplies.length) throw new Error(`博主 @${state.blogger} 最近的帖子都没有回复`);
-      state.posts = withReplies;
+      state.posts = withReplies.filter(post => !processedPosts.has(state.followAccountId, post.url));
+      const skipped = withReplies.length - state.posts.length;
+      if (skipped) console.log(`最近帖子中 ${skipped} 条已处理，跳过；剩余 ${state.posts.length} 条。`);
+      if (!state.posts.length) {
+        resilience.resolve(runId, 'search');
+        if (args.noFollowers) {
+          stage = 'done'; persist('completed');
+          console.log('最近帖子均已处理，粉丝任务由定时调度串行处理。');
+        } else {
+          state.phase = 'followers'; state.post = null;
+          stage = 'followers-export'; persist('running');
+          console.log('最近帖子均已处理，转入博主粉丝导出。');
+        }
+        continue;
+      }
       state.postIndex = 0;
       state.phase = 'replies';
-      state.post = withReplies[0];
+      state.post = state.posts[0];
       state.results = [];
       resilience.resolve(runId, 'search');
       stage = 'export'; persist('running');
-      console.log(`博主 @${state.blogger}：选择 ${withReplies.length} 条有回复的最近帖子，按新到旧处理。`);
+      console.log(`博主 @${state.blogger}：选择 ${state.posts.length} 条有回复的最近帖子，按新到旧处理。`);
     }
   }
   if (stage === 'export') {
@@ -267,6 +290,7 @@ try {
             followerCheckpoints.save(state.followAccountId, state.blogger, checkpoint);
           }, guardX, { recoverTimeout: (retry.get()?.attempts || 0) > 0 });
         } catch (error) {
+          if (error instanceof FollowerHistoryError) throw error;
           if (!await stopFollowerBatchForRetry(exporterPage)) throw new ExporterError('无法确认 exporter24 任务已停止，请人工检查后恢复', false, error);
           throw error;
         }
@@ -389,7 +413,7 @@ try {
         }
         persist('running');
       } else {
-        console.log('未检测到 exporter24 扩展，改用主页读取。');
+        console.log('无法打开 exporter24 扩展页，改用主页读取；请检查前面的错误和该账号 Chrome 的扩展状态。');
       }
 
       needCounts = allCandidates.filter(candidate => !hasBoth(candidate));
@@ -527,6 +551,7 @@ try {
         break;
       } else {
         resilience.resolve(runId, 'follow');
+        if (state.phase === 'replies' && !state.followSkipped) processedPosts.mark(state.followAccountId, state.post?.url, runId);
         if (state.followSkipped) console.log('本批关注已跳过，继续下一批。');
         state.followConfirmation = undefined;
         state.followSkipped = false;
@@ -549,7 +574,7 @@ try {
             console.log(`转入下一条帖子 ${state.postIndex + 1}/${state.posts.length}：${state.post.url}`);
           } else if (args.noFollowers) {
             stage = 'done'; persist('completed');
-            console.log(`所有帖子处理完毕；粉丝由独立常驻 loop 负责。结果 ${output}`);
+            console.log(`所有帖子处理完毕；粉丝任务由定时调度串行处理。结果 ${output}`);
           } else {
             state.phase = 'followers';
             state.post = null;
