@@ -11,6 +11,7 @@ import { findBloggerPosts, getCollectorPage } from '../replies/reply-export.ts';
 import { ResilienceStore } from './resilience.ts';
 import { createLoopOrchestrator } from './loop-orchestrator.ts';
 import { parseLoopArguments } from './loop-arguments.ts';
+import { acquireCollectionSlots } from './collection-slots.ts';
 
 let args;
 try { args = parseLoopArguments(process.argv.slice(2)); }
@@ -25,15 +26,15 @@ const telemetry = monitorProcess(args.accountId || (args.resumeId ? JSON.parse(S
 telemetry.stage('准备采集调度');
 if (args.resumeId && !db.prepare('SELECT id FROM runs WHERE id=?').get(runId)) { console.error('未找到任务'); db.close(); process.exit(1); }
 console.log(`队列任务 ID：${runId}`);
-/** 启动单轮子进程；探测模式只允许一次新的关注请求。 */
-const execute = ({ resume, probe = false }) => new Promise<number>((resolve, reject) => {
-  telemetry.stage(probe ? '执行限流恢复探测' : '等待采集步骤完成', 'waiting');
+/** 启动或恢复单轮子进程。 */
+const execute = ({ resume }) => new Promise<number>((resolve, reject) => {
+  telemetry.stage('等待采集步骤完成', 'waiting');
   const childArgs = ['scripts/loop/loop-run.ts', ...(resume ? ['--resume', runId] : ['--run-id', runId]),
     ...(args.accountId ? ['--account-id', args.accountId] : []), ...(args.username ? ['--username', args.username] : []),
     ...(args.blogger ? ['--blogger', args.blogger] : []), ...(args.language ? ['--language', args.language] : []),
     ...(args.followersOnly ? ['--followers-only'] : []), ...(args.evaluate ? ['--evaluate'] : []), ...(args.yes ? ['--yes'] : []), ...(args.postUrl ? ['--post', args.postUrl] : []),
     ...(args.keepBrowser ? ['--keep-browser'] : []), ...(args.noFollowers ? ['--no-followers'] : []), ...(args.ignorePendingFollowers ? ['--ignore-pending-followers'] : []),
-    ...(args.cdpPort ? ['--cdp-port', String(args.cdpPort)] : []), ...(probe ? ['--follow-probe'] : [])];
+    ...(args.cdpPort ? ['--cdp-port', String(args.cdpPort)] : [])];
   const child = spawn(process.execPath, childArgs, { stdio: 'inherit' });
   child.once('error', reject);
   child.once('exit', code => resolve(code ?? 1));
@@ -78,8 +79,19 @@ async function hasUncertain(row) {
   finally { follows?.close(); }
 }
 const loop = createLoopOrchestrator({ db, runId, execute, probe, hasUncertain, onLog: message => {
-  telemetry.stage(message, /冷却|分钟后|等待/.test(message) ? 'waiting' : 'running');
+  telemetry.stage(message, /冷却|后重试|等待/.test(message) ? 'waiting' : 'running');
   console.log(message);
 } });
-try { const result = await loop.start(); if (result !== 'completed') { console.error(`任务停止：${result}；任务 ID：${runId}`); process.exitCode = 1; } }
-finally { loop.close(); db.close(); }
+let releaseCollection: (() => void) | undefined;
+try {
+  if (process.env.XBOT_COLLECTION_SLOT_OWNER !== String(process.ppid)) {
+    releaseCollection = await acquireCollectionSlots(args, lane => {
+      telemetry.stage(`等待${lane}采集槽位`, 'waiting');
+      console.log(`${lane}采集槽位正在使用，本轮已排队。`);
+    });
+  }
+  const result = await loop.start();
+  if (result !== 'completed') { console.error(`任务停止：${result}；任务 ID：${runId}`); process.exitCode = 1; }
+} finally {
+  try { loop.close(); } finally { db.close(); releaseCollection?.(); }
+}

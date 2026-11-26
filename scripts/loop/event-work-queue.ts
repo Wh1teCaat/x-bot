@@ -66,7 +66,7 @@ export class EventWorkQueue<Job> {
       if (!this.closed) {
         const next = await this.store.nextDue();
         if (this.wakePending) { this.wakePending = false; this.wake(); }
-        else if (next != null) this.timer = this.setTimer(() => { this.timer = null; this.wake(); }, Math.max(0, next - this.now()));
+        else if (next != null) this.timer = this.setTimer(() => { this.timer = null; this.wake(); }, Math.min(2_147_483_647, Math.max(0, next - this.now())));
       }
     }
   }

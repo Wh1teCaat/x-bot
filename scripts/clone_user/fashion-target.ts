@@ -49,6 +49,8 @@ type DiscoverOptions = {
   requiredPosts?: number;
   maxCandidates?: number;
   fetchImpl?: typeof fetch;
+  isAvailable?: (candidate: FashionCandidate) => boolean;
+  reserve?: (candidate: FashionCandidate) => boolean;
 };
 
 const DEFAULT_QUERIES = ['fashion', 'fashion blogger', 'fashion influencer', 'ootd', 'street style'];
@@ -63,6 +65,8 @@ export async function discoverFashionTarget({
   requiredPosts = 2,
   maxCandidates = 40,
   fetchImpl = fetch,
+  isAvailable = () => true,
+  reserve = () => true,
 }: DiscoverOptions): Promise<string> {
   const seen = new Set<string>();
   let examined = 0;
@@ -80,6 +84,11 @@ export async function discoverFashionTarget({
       seen.add(user.id);
       const followers = Number(user.public_metrics?.followers_count ?? 0);
       if (!(followers > minFollowers)) continue;
+      const candidate = { id: user.id, username: user.username, followers };
+      if (!isAvailable(candidate)) {
+        console.log(`目标 @${candidate.username} 已有子账号，继续检查下一位。`);
+        continue;
+      }
       examined++;
       const timelineUrl = `${origin}/api/accounts/${accountId}/users/${user.id}/tweets?${new URLSearchParams({
         max_results: '5',
@@ -103,14 +112,15 @@ export async function discoverFashionTarget({
         requiredPosts,
       });
       console.log(`时尚候选 @${user.username}：粉丝 ${followers}，最近回复 [${replies.join(', ')}] -> ${evaluation.reason}`);
-      if (evaluation.pass) {
+      if (evaluation.pass && reserve(candidate)) {
         console.log(`自动选择时尚博主 @${user.username}（${user.id}）。`);
         return user.username;
       }
+      if (evaluation.pass) console.log(`目标 @${candidate.username} 已有子账号，继续检查下一位。`);
     }
     if (examined >= maxCandidates) break;
   }
-  throw new Error(`未找到满足条件的时尚博主（粉丝 > ${minFollowers}，最近 3 条至少 ${requiredPosts} 条回复 >= ${minReplies}）；请用 --target 指定`);
+  throw new Error(`未找到符合条件且可用的时尚博主（粉丝 > ${minFollowers}，最近 3 条至少 ${requiredPosts} 条回复 >= ${minReplies}）；可用 --target 指定其他目标`);
 }
 
 /** 解析逗号分隔的搜索词；保留 X 用户搜索允许的字符。 */

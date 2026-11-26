@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { safeLog } from './runtime-monitor.ts';
 
 type Account = { uuid?: string | null; username?: string; name?: string | null; authenticated?: boolean };
-export const stageLabels: Record<string, string> = { search: '搜索博主帖子', export: '抓取帖子回复', 'followers-export': '抓取粉丝（200 人）', filter: '整理候选用户', qualify: '筛选关注/粉丝比例', evaluate: '模型评估', follow: '写入关注队列', done: '本轮完成' };
+export const stageLabels: Record<string, string> = { search: '搜索博主帖子', export: '抓取帖子回复', 'followers-export': '抓取粉丝（200 人）', filter: '整理候选用户', qualify: '筛选关注/粉丝比例', evaluate: '模型评估', 'follow-lookup': '解析候选用户 ID', follow: '写入关注队列', done: '本轮完成' };
 function open(path: string) { return existsSync(path) ? new DatabaseSync(path, { readOnly: true }) : null; }
 function table(db: DatabaseSync | null, name: string) { return Boolean(db?.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name)); }
 export function processAlive(pid: number) { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } }
@@ -14,7 +14,7 @@ function sessionStatus(session: any, now: number, alive: (pid: number) => boolea
   return now - session.updated_at <= 45000 && alive(session.pid) ? 'running' : 'interrupted';
 }
 /** 采集流程中属于“帖子扫描并关注”的阶段；名称来自 stageLabels。 */
-const postStages = new Set(['搜索博主帖子', '抓取帖子回复', '整理候选用户', '筛选关注/粉丝比例', '模型评估', '写入关注队列']);
+const postStages = new Set(['搜索博主帖子', '抓取帖子回复', '整理候选用户', '筛选关注/粉丝比例', '模型评估', '解析候选用户 ID', '写入关注队列']);
 /** clone 各细步骤都归入“预处理”。 */
 const cloneStages = new Set(['复制目标账号资料', '复制头像、显示名称和简介', '核对资料保存结果', '保存并核对用户名']);
 

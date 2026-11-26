@@ -53,10 +53,8 @@ const processedPosts = new ProcessedPosts(db);
 let telemetry = monitorProcess(args.accountId, 'loop');
 telemetry.stage('准备采集任务');
 const followProbe = args.followProbe;
-/** 只允许对应任务在半开状态下执行受控关注探测。 */
 const ensureX = () => {
   const circuit = resilience.circuit('x');
-  if (followProbe && stage === 'follow' && circuit?.state === 'half_open') return;
   if (circuit?.state === 'half_open') throw new Error('X 熔断处于半开探测中');
   resilience.ensureClosed('x');
 };
@@ -139,7 +137,7 @@ try {
     db.exec('BEGIN IMMEDIATE');
     try {
       // 非 lane 模式（手工启动）仍保持原来的全局串行限制。
-      if (!args.followersOnly && !args.noFollowers && !args.ignorePendingFollowers) {
+      if (!args.followersOnly && !args.noFollowers && !args.postUrl && !args.ignorePendingFollowers) {
         for (const job of db.prepare("SELECT owner_pid FROM loop_jobs WHERE id<>? AND status IN ('running','cooldown') AND owner_pid IS NOT NULL").all(runId)) {
           try { process.kill(Number(job.owner_pid), 0); throw new Error('已有其他账号的任务运行或冷却，当前版本不支持并行'); }
           catch (error) { if (error.code !== 'ESRCH') throw error; }
@@ -492,8 +490,8 @@ try {
     resilience.resolve(runId, 'evaluate');
     state.resultPath = output; stage = 'follow'; persist('running');
   }
-  // 使用固定规则入选的用户调用本地授权服务进行 API 关注。
-  if (stage === 'follow') {
+  // 只读的用户 ID 解析与 Outbox 入队分别保存断点。
+  if (stage === 'follow' || stage === 'follow-lookup') {
     const selected = selectFollowCandidates({
       qualifiedDirect: state.qualify?.qualifiedDirect || [],
       qualifiedCandidates: state.qualify?.qualifiedCandidates || [],
@@ -514,10 +512,14 @@ try {
     }
     const missingIds = selected.filter(candidate => !ids[candidate.username.toLowerCase()]);
     if (missingIds.length) {
-      ensureX();
-      Object.assign(ids, await client.lookup(account.id, missingIds));
+      stage = 'follow-lookup';
+      state.followTargetIds = ids;
       persist('running');
+      Object.assign(ids, await client.lookup(account.id, missingIds));
     }
+    resilience.resolve(runId, 'follow-lookup');
+    stage = 'follow';
+    delete state.lookupRetryAt;
     state.followTargetIds = ids;
     persist('running');
     const ready = selected.filter(candidate => ids[candidate.username.toLowerCase()] && ids[candidate.username.toLowerCase()] !== account.id);
@@ -600,6 +602,7 @@ try {
   // 不完整的模型结果仍保存为降级文件，外部操作失败则保留状态等待核实。
   if (runPersisted && runId && state) {
     const classification = classifyFailure(error, stage);
+    if (stage === 'follow-lookup' && classification.kind === 'rate_limit') state.lookupRetryAt = error?.retryAt;
     if (stage === 'evaluate' && state.qualify) {
       // Keep qualified users available for review, but do not follow or treat
       // the unassessed users as irrelevant while the model is unavailable.
@@ -615,7 +618,7 @@ try {
     try {
       db.exec('BEGIN IMMEDIATE');
       if (stage === 'evaluate' && (classification.kind === 'rate_limit' || classification.kind === 'transient')) resilience.open('llm', classification.reason);
-      if (['search', 'export', 'followers-export', 'qualify', 'follow'].includes(stage) && classification.kind === 'rate_limit') resilience.open('x', classification.reason);
+      if (['search', 'export', 'followers-export', 'qualify'].includes(stage) && classification.kind === 'rate_limit') resilience.open('x', classification.reason);
       resilience.failure(runId, stage, classification);
       persist('failed', `${classification.reason}（${classification.kind}）`);
       db.exec('COMMIT');

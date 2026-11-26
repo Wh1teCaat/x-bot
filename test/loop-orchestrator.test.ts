@@ -73,34 +73,36 @@ test('restarts a persisted cooldown without launching the failed run early', asy
   await clock.advance(900000); assert.equal(await done, 'completed'); assert.equal(executions, 1); db.close();
 });
 
-test('follow rate limit uses one half-open probe, cools again on failure and resumes after success', async () => {
+test('lookup rate limit persists the deadline and retries the same run without probing the page or writing follows', async () => {
   const { db, resilience, clock } = setup(); let calls = 0, probes = 0;
-  const loop = createLoopOrchestrator({ db, runId: 'follow', ...clock, probe: async () => { throw Error('must not use search probe'); }, execute: async ({ probe }) => {
+  const makeLoop = () => createLoopOrchestrator({ db, runId: 'follow', ...clock, probe: async () => { probes++; return false; }, execute: async ({ resume }) => {
     calls++;
     if (calls === 1) {
-      db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?)').run('follow', 'failed', 'follow', '{}');
-      resilience.open('x', '429'); resilience.failure('follow', 'follow', { kind: 'rate_limit', reason: '429', retryable: false }); return 1;
+      assert.equal(resume, false);
+      db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?)').run('follow', 'failed', 'follow-lookup', '{"lookupRetryAt":1200000}');
+      resilience.failure('follow', 'follow-lookup', { kind: 'rate_limit', reason: '429', retryable: false }); return 1;
     }
-    if (probe) {
-      assert.equal(resilience.circuit('x').state, 'half_open');
-      if (++probes === 1) { resilience.open('x', '429'); return 1; }
-      db.prepare("UPDATE runs SET status='probe_succeeded'").run(); return 0;
-    }
-    assert.equal(resilience.circuit('x').state, 'closed');
+    assert.equal(resume, true);
     db.prepare("UPDATE runs SET status='completed',stage='done'").run(); return 0;
   } });
-  const done = loop.start(); await tick(); assert.equal(calls, 1);
-  await clock.advance(900000); assert.equal(probes, 1); assert.equal(resilience.circuit('x').state, 'open'); assert.equal(calls, 2);
-  await clock.advance(900000); assert.equal(await done, 'completed'); assert.equal(probes, 2); assert.equal(calls, 4); db.close();
+  const first = makeLoop();
+  const stopped = first.start(); await tick(); first.close();
+  assert.equal(await stopped, 'stopped');
+  const second = makeLoop();
+  const done = second.start();
+  await clock.advance(1199999); assert.equal(calls, 1);
+  await clock.advance(1); assert.equal(await done, 'completed');
+  assert.equal(probes, 0); assert.equal(calls, 2); assert.equal(resilience.circuit('x'), undefined); db.close();
 });
 
-test('an uncertain follow result stops instead of repeating the action', async () => {
-  const { db, resilience, clock } = setup(); let calls = 0, uncertain = false;
-  const loop = createLoopOrchestrator({ db, runId: 'uncertain', ...clock, probe: async () => false, hasUncertain: async () => uncertain, execute: async ({ probe }) => {
-    calls++;
-    if (!probe) { db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?)').run('uncertain', 'failed', 'follow', '{}'); resilience.open('x', '429'); return 1; }
-    uncertain = true; return 1;
+test('a legacy cooldown with uncertain follow results stops for review', async () => {
+  const { db, resilience, clock } = setup(); let calls = 0;
+  const loop = createLoopOrchestrator({ db, runId: 'uncertain', ...clock, probe: async () => false, hasUncertain: async () => true, execute: async () => {
+    calls++; return 1;
   } });
-  const done = loop.start(); await tick(); await clock.advance(900000);
-  assert.equal(await done, 'manual'); await clock.advance(3600000); assert.equal(calls, 2); assert.equal(resilience.circuit('x').state, 'open'); db.close();
+  db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?)').run('uncertain', 'failed', 'follow', '{"version":5}');
+  db.prepare("INSERT INTO loop_jobs(id,status) VALUES ('uncertain','cooldown')").run();
+  resilience.open('x', '429');
+  assert.equal(await loop.start(), 'manual');
+  await clock.advance(3600000); assert.equal(calls, 0); assert.equal(resilience.circuit('x').state, 'open'); db.close();
 });

@@ -17,6 +17,7 @@ import { discoverFashionTarget, parseFashionQueries } from '../clone_user/fashio
 import { planFollowerRecovery, supersedeFollowerAttempts } from './follower-recovery.ts';
 import { followerBatchFailure, nextFollowerBrowserRetry, FOLLOWER_BROWSER_MAX_RETRIES } from './follower-schedule-retry.ts';
 import { ensureBitBinding } from '../browser/bitbrowser-binding.ts';
+import { LocalFollowClient } from '../follow/api-follow.ts';
 
 const raw = process.argv.slice(2);
 const accountId = raw[0];
@@ -126,28 +127,7 @@ if (bitBinding.needsAuthorization) {
   if (code !== 0) { console.error('比特窗口授权检查失败，账号任务未启动。'); await stop('failed'); process.exit(code); }
 }
 
-let chosenTarget = target;
-if (!account.cloned && !chosenTarget) {
-  const positiveInt = (name: string, fallback: number) => {
-    const value = Number(process.env[name]);
-    return Number.isInteger(value) && value > 0 ? value : fallback;
-  };
-  const requiredPosts = Math.min(3, positiveInt('CLONE_TARGET_REQUIRED_POSTS', 2));
-  const minReplies = positiveInt('CLONE_TARGET_MIN_REPLIES', 50);
-  const minFollowers = positiveInt('CLONE_TARGET_MIN_FOLLOWERS', 1000);
-  const maxCandidates = positiveInt('CLONE_TARGET_MAX_CANDIDATES', 40);
-  const origin = `http://127.0.0.1:${process.env.PORT || 3000}`;
-  console.log('未指定 --target，使用 X API 搜索时尚相关博主。');
-  chosenTarget = await discoverFashionTarget({
-    accountId,
-    origin,
-    queries: parseFashionQueries(process.env.FASHION_SEARCH_QUERIES),
-    minReplies,
-    minFollowers,
-    requiredPosts,
-    maxCandidates,
-  });
-}
+const chosenTarget = account.cloned || (loopOnly && target) ? target : await chooseTarget(account.id);
 let resolvedTarget = resolveFlowTarget(account, chosenTarget);
 let resumeFollower = false;
 if (resumeId && existsSync(resolve(dataDir, 'loop.sqlite'))) {
@@ -227,7 +207,8 @@ if (mirror === 'once') {
 }
 
 mirrorStore = new MirrorStore(resolve(dataDir, 'mirror.sqlite'));
-mirrorStore.recoverStaleReplyJobs(new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString());
+const startedAt = Date.now();
+mirrorStore.recoverStaleReplyJobs(new Date(startedAt - 6 * 60 * 60 * 1000).toISOString(), startedAt, accountId);
 const schedulerMs = Math.max(1000, Number(process.env.MIRROR_REPLY_SCHEDULER_MS) || 60_000);
 const retryMs = Math.max(1000, Number(process.env.MIRROR_REPLY_RETRY_MS) || 10 * 60 * 1000);
 const autoYes = /^(1|true|yes)$/i.test(process.env.MIRROR_REPLY_AUTO_YES || '');
@@ -235,7 +216,7 @@ telemetry.stage('等待定时任务', 'waiting');
 console.log(`loop 进入长时运行；每 ${Math.round(schedulerMs / 1000)} 秒检查延迟回复任务。`);
 
 /** 处理到期的单帖回复任务；串行，避免与当前 loop 争用账号。 */
-let followerScheduleBlocked = loopCode !== 0;
+let followerScheduleBlocked = false;
 let followerRetryAt = 0;
 let followerBrowserFailures = 0;
 const processDueFollowerBatch = async (): Promise<boolean> => {
@@ -243,14 +224,15 @@ const processDueFollowerBatch = async (): Promise<boolean> => {
   if (Date.now() < followerRetryAt) return false;
   const db = new DatabaseSync(resolve(dataDir, 'loop.sqlite'));
   db.exec('PRAGMA busy_timeout=10000');
-  let checkpoint, recovery;
+  let recovery;
   try {
-    checkpoint = new FollowerCheckpoints(db).get(accountId, resolvedTarget);
+    const checkpoint = new FollowerCheckpoints(db).get(accountId, resolvedTarget);
+    if (checkpoint.done || checkpoint.due > Date.now()) return false;
     recovery = planFollowerRecovery(db, accountId, resolvedTarget);
     if (recovery.kind === 'blocked') { followerScheduleBlocked = true; console.error(`存在需要人工检查的粉丝任务 ${recovery.id}；定时抓取暂停。`); return false; }
   } finally { db.close(); }
-  if (checkpoint.done || checkpoint.due > Date.now()) return false;
   await ensureFollowerProfile();
+  if (stopping) return false;
   telemetry.stage('执行粉丝定时续抓');
   console.log(recovery.kind === 'resume' ? `恢复未完成粉丝任务 ${recovery.id}，继续已保存断点。` : `开始粉丝定时续抓（每 ${Math.round(FOLLOWER_INTERVAL_MS / 60_000)} 分钟一批）：本批最多 200 人。`);
   const batchArgs = [...loopArgs(resolvedTarget).filter(arg => arg !== '--followers-only' && arg !== '--no-followers' && arg !== '--follower-profile'), '--followers-only', '--follower-profile', ...(recovery.kind === 'resume' ? ['--resume', recovery.id] : [])];
@@ -285,32 +267,28 @@ const processDueReplyJob = async () => {
   if (stopping || replyChild || !mirrorStore || scheduling) return;
   scheduling = true;
   try {
-  if (await processDueFollowerBatch()) return;
-  if (stopping) return;
-  const [job] = mirrorStore.dueReplyJobs(Date.now(), 1);
-  if (!job || !mirrorStore.claimReplyJob(job)) return;
-  telemetry.stage('执行延迟回复任务');
-  console.log(`开始延迟回复爬取：${job.postUrl}（第 ${job.attempts + 1}/3 次）`);
-  const args = ['scripts/loop/flow.ts', job.posterId, '--loop-only', '--post', job.postUrl, '--target', job.targetUsername,
-    ...(yes || autoYes ? ['--yes'] : []), ...(cookiePath ? ['--cookie', cookiePath] : [])];
-  replyChild = spawn(process.execPath, args, { cwd: process.cwd(), stdio: 'inherit' });
-  const code = await new Promise<number>((resolveCode) => {
-    replyChild!.once('error', () => resolveCode(1));
-    replyChild!.once('exit', (exitCode) => resolveCode(exitCode ?? 1));
-  });
-  replyChild = null;
-  telemetry.stage('等待定时任务', 'waiting');
-  try {
+    if (await processDueFollowerBatch() || stopping) return;
+    const now = Date.now();
+    const [job] = mirrorStore.dueReplyJobs(now, 1, accountId);
+    if (!job || !mirrorStore.claimReplyJob(job, now)) return;
+    telemetry.stage('执行延迟回复任务');
+    console.log(`开始延迟回复爬取：${job.postUrl}（第 ${job.attempts + 1}/3 次）`);
+    const args = ['scripts/loop/flow.ts', accountId, '--loop-only', '--post', job.postUrl, '--target', job.targetUsername,
+      ...(yes || autoYes ? ['--yes'] : []), ...(cookiePath ? ['--cookie', cookiePath] : [])];
+    replyChild = spawn(process.execPath, args, { cwd: process.cwd(), stdio: 'inherit' });
+    const code = await new Promise<number>((resolveCode) => {
+      replyChild!.once('error', () => resolveCode(1));
+      replyChild!.once('exit', (exitCode) => resolveCode(exitCode ?? 1));
+    });
+    replyChild = null;
+    telemetry.stage('等待定时任务', 'waiting');
     if (code === 0) {
-      mirrorStore.finishReplyJob(job, 'done', null);
-      console.log(`延迟回复爬取完成：${job.tweetId}`);
+      if (mirrorStore.finishReplyJob(job, 'done', null)) console.log(`延迟回复爬取完成：${job.tweetId}`);
     } else {
-      mirrorStore.finishReplyJob(job, 'failed', `exit ${code}`, Date.now() + retryMs);
-      console.log(`延迟回复爬取失败：${job.tweetId}，${Math.round(retryMs / 60_000)} 分钟后重试。`);
+      const retry = job.attempts + 1 < 3;
+      if (mirrorStore.finishReplyJob(job, 'failed', `exit ${code}`, retry ? Date.now() + retryMs : undefined))
+        console.log(`延迟回复爬取失败：${job.tweetId}，${retry ? `${Math.round(retryMs / 60_000)} 分钟后重试` : '已达到重试上限'}。`);
     }
-  } catch (error) {
-    if (!stopping) console.error(`记录回复任务结果失败：${error instanceof Error ? error.message : String(error)}`);
-  }
   } finally { scheduling = false; }
 };
 replyTimer = setInterval(() => {
@@ -329,6 +307,50 @@ function loopArgs(blogger: string): string[] {
     ...(followersOnly || resumeFollower ? ['--follower-profile'] : []),
     ...(followersOnly ? ['--followers-only'] : []), ...(!followersOnly ? ['--no-followers'] : []), ...(language ? ['--language', language] : []), ...(evaluate ? ['--evaluate'] : []),
     ...(yes ? ['--yes'] : []), ...(postUrl ? ['--post', postUrl] : []), ...(resumeId ? ['--resume', resumeId] : [])];
+}
+
+async function chooseTarget(childId: number): Promise<string> {
+  const store = new AccountStore(dataDir);
+  try {
+    const client = new LocalFollowClient();
+    const reserved = loopOnly ? undefined : store.getCloneTarget(childId);
+    if (reserved) {
+      const ids = await client.lookup(accountId, [{ username: reserved.username }]);
+      const id = ids[reserved.username.toLowerCase()];
+      if (!id || id === accountId || (reserved.id && id !== reserved.id) ||
+        !store.reserveCloneTarget(childId, { id, username: reserved.username }))
+        throw new Error(`已分配的目标 @${reserved.username} 无法通过身份核对，请检查后再继续复制`);
+      console.log(`继续使用已分配的 clone 目标 @${reserved.username}。`);
+      return reserved.username;
+    }
+    if (target) {
+      const ids = await client.lookup(accountId, [{ username: target }]);
+      const id = ids[target.toLowerCase()];
+      if (!id) throw new Error(`无法解析指定博主 @${target} 的数字 ID`);
+      if (id === accountId) throw new Error('目标博主与当前子账号相同');
+      if (store.reserveCloneTarget(childId, { id, username: target })) return target;
+      console.log(`指定目标 @${target} 已有子账号，继续自动查找。`);
+    } else {
+      console.log('使用 X API 搜索时尚相关博主。');
+    }
+    const positiveInt = (name: string, fallback: number) => {
+      const value = Number(process.env[name]);
+      return Number.isInteger(value) && value > 0 ? value : fallback;
+    };
+    return await discoverFashionTarget({
+      accountId,
+      origin: client.origin,
+      queries: parseFashionQueries(process.env.FASHION_SEARCH_QUERIES),
+      minReplies: positiveInt('CLONE_TARGET_MIN_REPLIES', 50),
+      minFollowers: positiveInt('CLONE_TARGET_MIN_FOLLOWERS', 1000),
+      requiredPosts: Math.min(3, positiveInt('CLONE_TARGET_REQUIRED_POSTS', 2)),
+      maxCandidates: positiveInt('CLONE_TARGET_MAX_CANDIDATES', 40),
+      isAvailable: candidate => loopOnly || !store.cloneTargetTaken(childId, candidate),
+      reserve: candidate => loopOnly || store.reserveCloneTarget(childId, candidate),
+    });
+  } finally {
+    store.close();
+  }
 }
 
 async function run(args: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {

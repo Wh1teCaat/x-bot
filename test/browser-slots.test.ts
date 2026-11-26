@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { acquireBrowserSlot } from '../scripts/browser/browser-slots.ts';
+import { acquireCollectionSlots } from '../scripts/loop/collection-slots.ts';
+import { parseLoopArguments } from '../scripts/loop/loop-arguments.ts';
 
 test('enforces capacity, waits for release, and recovers stale slots', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'xbot-slots-'));
@@ -25,4 +27,23 @@ test('enforces capacity, waits for release, and recovers stale slots', async () 
     assert.equal((db.prepare('SELECT account FROM browser_slots WHERE slot=1').get() as any).account, 'd');
     d(); db.close();
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('overlapping post runs wait while the follower lane can still run', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'xbot-collection-slots-'));
+  const acquire = (flags: string[], onWait = (_lane: string) => {}) =>
+    acquireCollectionSlots(parseLoopArguments(flags), onWait, undefined, dir);
+  try {
+    const first = await acquire(['--account-id', '1', '--no-followers']);
+    let notifyWait: (lane: string) => void;
+    const waiting = new Promise<string>(resolve => { notifyWait = resolve; });
+    const second = acquire(['--account-id', '2', '--no-followers'], notifyWait!);
+    assert.equal(await waiting, '帖子');
+    const followers = await acquire(['--account-id', '3', '--followers-only']);
+    first();
+    const arrived = await second;
+    arrived(); followers();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

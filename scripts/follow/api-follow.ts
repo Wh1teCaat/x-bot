@@ -1,4 +1,5 @@
 import '../../src/runtime-config.ts';
+import { rateLimitDelay } from '../../src/x-api-circuit.ts';
 /** 通过本地授权服务解析用户并使用 X API 处理关注。 */
 /** 判断输入是否为合法的 X 数字用户 ID。 */
 const validId = (value: unknown): value is string => typeof value === 'string' && /^\d{1,19}$/.test(value);
@@ -29,8 +30,15 @@ export class LocalFollowClient {
     catch { throw new Error('无法连接本地授权服务，请先运行 npm start；如关注请求已发出，请核实结果'); }
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const error = new Error(body.error || `本地服务错误 (${response.status})`) as Error & { status: number; retryAfter: string | null };
-      error.status = response.status; error.retryAfter = response.headers.get('retry-after'); throw error;
+      const error = new Error(body.error || `本地服务错误 (${response.status})`) as Error & { status: number; retryAfter: string | null; retryAt?: number };
+      error.status = response.status;
+      error.retryAfter = response.headers.get('retry-after');
+      if (response.status === 429) {
+        const now = Date.now();
+        const delay = rateLimitDelay(response.headers, now);
+        if (Number.isFinite(delay) && delay <= 8.64e15 - now) error.retryAt = now + delay;
+      }
+      throw error;
     }
     return body;
   }

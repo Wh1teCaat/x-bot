@@ -176,7 +176,7 @@ npm run loop -- <账号ID> --target <博主用户名>
 - 粉丝数 > `CLONE_TARGET_MIN_FOLLOWERS`（默认 1000）
 - 最近 3 条非转推/非回复帖子中，至少 `CLONE_TARGET_REQUIRED_POSTS` 条（默认 2）回复数 >= `CLONE_TARGET_MIN_REPLIES`（默认 50）
 
-第一个满足条件的博主会被选为 clone 目标，并持久化。可用参数：
+第一个满足条件且未被其他子账号占用的博主会在复制前持久化分配。自动搜索和手动 `--target` 遇到重复时，都会继续搜索下一个可用博主。中断后重新启动同一个子账号会沿用已分配的目标。可用参数：
 
 ```sh
 CLONE_TARGET_MIN_REPLIES=50

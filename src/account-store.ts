@@ -89,7 +89,14 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS accounts (
   copied_at TEXT,
   keywords TEXT,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS clone_targets (
+  account_id INTEGER PRIMARY KEY REFERENCES accounts(id),
+  target_id TEXT UNIQUE,
+  username TEXT NOT NULL COLLATE NOCASE
 );`;
+
+type CloneTarget = { id: string | null; username: string };
 
 export class AccountStore {
   private db: DatabaseSync;
@@ -229,6 +236,56 @@ export class AccountStore {
 
   list(): AccountRecord[] {
     return (this.db.prepare("SELECT * FROM accounts ORDER BY id").all() as Row[]).map((row) => this.toRecord(row));
+  }
+
+  getCloneTarget(accountId: number): CloneTarget | undefined {
+    return this.db.prepare("SELECT target_id AS id, username FROM clone_targets WHERE account_id=?")
+      .get(accountId) as CloneTarget | undefined;
+  }
+
+  cloneTargetTaken(accountId: number, { id, username }: CloneTarget): boolean {
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM accounts WHERE cloned=1 AND accounts.id<>?
+        AND (copied_from_uuid=? OR ((copied_from_uuid IS NULL OR ? IS NULL) AND copied_from_username=? COLLATE NOCASE))
+      UNION ALL
+      SELECT 1 FROM clone_targets WHERE account_id<>?
+        AND (target_id=? OR ((target_id IS NULL OR ? IS NULL) AND username=?))
+      LIMIT 1
+    `).get(accountId, id, id, username, accountId, id, id, username));
+  }
+
+  /** 先占用再复制，进程中断后由同一子账号继续使用原目标。 */
+  reserveCloneTarget(accountId: number, target: CloneTarget): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.getCloneTarget(accountId);
+      const sameTarget = !current || (current.id && target.id
+        ? current.id === target.id
+        : current.username.toLowerCase() === target.username.toLowerCase());
+      const available = sameTarget && !this.cloneTargetTaken(accountId, target);
+      if (available) {
+        this.db.prepare(`INSERT INTO clone_targets (account_id, target_id, username) VALUES (?,?,?)
+          ON CONFLICT(account_id) DO UPDATE SET target_id=COALESCE(excluded.target_id, clone_targets.target_id), username=excluded.username`)
+          .run(accountId, target.id, target.username);
+      }
+      this.db.exec("COMMIT");
+      return available;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** 使用稳定的本地行 ID 写回，未授权的子账号改名后也保留原占用。 */
+  completeClone(accountId: number, { username, name }: { username: string; name: string }): void {
+    const now = new Date().toISOString();
+    const result = this.db.prepare(`UPDATE accounts SET username=?, cloned=1,
+      copied_from_uuid=(SELECT target_id FROM clone_targets WHERE account_id=accounts.id),
+      copied_from_username=(SELECT username FROM clone_targets WHERE account_id=accounts.id),
+      copied_from_name=?, copied_at=?, updated_at=?
+      WHERE id=? AND EXISTS (SELECT 1 FROM clone_targets WHERE account_id=accounts.id)`)
+      .run(username, name, now, now, accountId);
+    if (!result.changes) throw new Error("未找到该账号的 clone 目标占用");
   }
 
   private getById(id: number): AccountRecord | undefined {

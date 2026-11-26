@@ -28,6 +28,8 @@ import { acquireBitWindow } from '../browser/bitbrowser-window-lease.ts';
 import { prepareBitWindowAccount, saveBitWindowAccount } from '../browser/bitbrowser-window-state.ts';
 import { sortPostsNewestFirst } from '../replies/post-order.ts';
 import { browserFailureExitCode } from './follower-schedule-retry.ts';
+import { parseLoopArguments } from './loop-arguments.ts';
+import { acquireCollectionSlots } from './collection-slots.ts';
 
 const args = process.argv.slice(2), accountId = args[0];
 if (!/^\d{1,19}$/.test(accountId || '')) throw new Error('账号 ID 无效');
@@ -45,6 +47,7 @@ let slot: BrowserSlotRelease | undefined, browser: Browser | undefined, context:
 let windowLease: Awaited<ReturnType<typeof acquireBitWindow>> | undefined;
 let opened = false, stopping = false, pageCircuit: XPageCircuit | undefined;
 let windowReady = false;
+let releaseCollection: (() => void) | undefined;
 async function lock(path: string) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try { const handle = await open(path, 'wx', 0o600); locks.push(path); try { await handle.writeFile(String(process.pid)); } finally { await handle.close(); } return; }
@@ -72,6 +75,14 @@ try {
   if (!['users.read', 'follows.write'].every(scope => (account.scope || '').split(/\s+/).includes(scope))) throw new Error('账号缺少读取或关注授权');
   const root = resolve('.data/browser-profiles'); await mkdir(root, { recursive: true, mode: 0o700 });
   await lock(resolve(root, `${accountId}.lock`)); await lock(resolve(root, `${accountId}-follow.lock`));
+  if (!checkOnly) {
+    const collection = parseLoopArguments(['--account-id', accountId, ...forwarded]);
+    releaseCollection = await acquireCollectionSlots(collection, lane => {
+      telemetry.stage(`等待${lane}采集槽位`, 'waiting');
+      console.log(`${lane}采集槽位正在使用，本轮已排队。`);
+    }, () => stopping);
+  }
+  telemetry.stage('检查登录与比特浏览器');
   slot = await acquireBrowserSlot(accountId, { cancelled: () => stopping, onWait: () => console.log('浏览器槽位已满，等待空闲。') });
   await client.health();
   windowLease = await acquireBitWindow(accountId, preferred.windowId, preferred.apiUrl, { cancelled: () => stopping, onWait: () => console.log('比特窗口均在使用，等待空闲。') });
@@ -200,7 +211,7 @@ try {
   } else {
     if (stopping) throw new Error('任务已取消');
     telemetry.stage('等待采集任务完成', 'waiting');
-    const env = { ...process.env, XBOT_BIT_WINDOW_ID: binding.windowId, XBOT_BIT_API_URL: binding.apiUrl, XBOT_BIT_CDP_PORT: String(port) };
+    const env = { ...process.env, XBOT_COLLECTION_SLOT_OWNER: String(process.pid), XBOT_BIT_WINDOW_ID: binding.windowId, XBOT_BIT_API_URL: binding.apiUrl, XBOT_BIT_CDP_PORT: String(port) };
     const command = ['scripts/loop/run-loop.ts', '--account-id', accountId, '--username', username, '--cdp-port', String(port), '--keep-browser', ...forwarded];
     worker = spawn(process.execPath, command, { cwd: process.cwd(), env, stdio: 'inherit', detached: true });
     const code = await new Promise<number>(done => { worker!.once('error', () => done(1)); worker!.once('exit', code => done(code ?? 1)); });
@@ -221,6 +232,7 @@ finally {
     try { if (await client.isOpen(binding.windowId)) { console.error('比特窗口仍在运行，请关闭后重试'); process.exitCode = 1; } } catch { process.exitCode = 1; }
   }
   slot?.();
+  releaseCollection?.();
   await windowLease?.release();
   for (const path of locks.reverse()) await unlink(path).catch(() => {});
 }

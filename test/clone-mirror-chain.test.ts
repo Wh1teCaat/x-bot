@@ -9,6 +9,31 @@ import { MirrorStore } from "../src/mirror-store.ts";
 import { mirrorNewPosts, mirrorTweet, type MirrorTweet } from "../scripts/mirror/mirror-core.ts";
 import { createStreamParser } from "../scripts/mirror/mirror-stream.ts";
 
+test("a clone source stays exclusive across account stores, aliases and unfinished runs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "x-clone-targets-"));
+  try {
+    const accounts = new AccountStore(dir);
+    const otherProcess = new AccountStore(dir);
+    const child = accounts.upsert({ uuid: '1', username: 'child_one' });
+    const other = accounts.upsert({ uuid: '2', username: 'child_two' });
+    accounts.upsert({ username: 'legacy_child', cloned: true, copiedFromUsername: 'LegacyParent' });
+    assert.equal(otherProcess.reserveCloneTarget(other.id, { id: '11', username: 'legacyparent' }), false);
+    assert.equal(accounts.reserveCloneTarget(child.id, { id: '12', username: 'Parent' }), true);
+    assert.equal(otherProcess.reserveCloneTarget(other.id, { id: '12', username: 'RenamedParent' }), false);
+    assert.equal(otherProcess.reserveCloneTarget(other.id, { id: null, username: 'pArEnT' }), false);
+    assert.deepEqual({ ...otherProcess.getCloneTarget(child.id) }, { id: '12', username: 'Parent' });
+    assert.equal(accounts.reserveCloneTarget(child.id, { id: null, username: 'Parent' }), true);
+    accounts.completeClone(child.id, { username: 'child_renamed', name: 'Parent' });
+    assert.equal(otherProcess.getByUuid('1')?.copiedFromUuid, '12');
+    assert.equal(otherProcess.getByUuid('1')?.username, 'child_renamed');
+    assert.equal(otherProcess.reserveCloneTarget(other.id, { id: '13', username: 'NextParent' }), true);
+    otherProcess.close();
+    accounts.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("clone result feeds the mirror watch, backfills and then mirrors streamed posts", async () => {
   const dir = mkdtempSync(join(tmpdir(), "x-chain-"));
   try {
@@ -33,7 +58,7 @@ test("clone result feeds the mirror watch, backfills and then mirrors streamed p
     const targetUsername = clone.copiedFromUsername!;
     const targetId = "1111111111111111111"; // 模拟 users/by 解析结果
     mirrors.registerWatch({ targetUsername, targetId, posterId: "9999999999999999999" });
-    const watch = mirrors.getWatch(targetUsername)!;
+    const watch = mirrors.getWatch("9999999999999999999", targetId)!;
     assert.equal(watch.targetId, targetId);
 
     // 3) 回填最新 3 条（文本+图片；纯图帖也要复制），并去重。
@@ -58,10 +83,10 @@ test("clone result feeds the mirror watch, backfills and then mirrors streamed p
     assert.deepEqual(posted[0].mediaIds, ["m_b.jpg"]);
     assert.deepEqual(posted[1].mediaIds, ["m_a.jpg"]);
     assert.deepEqual(posted[2].mediaIds, []);
-    mirrors.setSinceId(targetUsername, backfill.newestId!);
+    mirrors.setSinceId("9999999999999999999", targetId, backfill.newestId!);
 
     // 重复同步不重发（水位线之后没有新帖）。
-    const again = await mirrorNewPosts({ store: mirrors, watch: mirrors.getWatch(targetUsername)!, client });
+    const again = await mirrorNewPosts({ store: mirrors, watch: mirrors.getWatch("9999999999999999999", targetId)!, client });
     assert.equal(again.posted, 0);
     assert.equal(again.skipped, 0);
 
@@ -74,7 +99,7 @@ test("clone result feeds the mirror watch, backfills and then mirrors streamed p
     assert.equal(streamed.length, 1);
 
     const outcome = await mirrorTweet({
-      store: mirrors, watch: mirrors.getWatch(targetUsername)!, tweet: streamed[0],
+      store: mirrors, watch: mirrors.getWatch("9999999999999999999", targetId)!, tweet: streamed[0],
       postTweet: async (text, mediaIds) => { posted.push({ text, mediaIds }); return { id: "p_live" }; },
       uploadImage: async () => ({ media_id: "m_new" }),
     });

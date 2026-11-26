@@ -92,7 +92,6 @@ const noReplyScheduler = rawArgs.includes('--no-reply-scheduler');
 const positionals = rawArgs.filter((a) => !a.startsWith('--'));
 const [command, arg1, ...extra] = positionals;
 const store = new MirrorStore(resolve('.data', 'mirror.sqlite'));
-store.recoverStaleReplyJobs(new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString());
 let replyScheduler: ReturnType<typeof setInterval> | null = null;
 let replyChild: ReturnType<typeof spawn> | null = null;
 const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
@@ -157,7 +156,7 @@ try {
   };
   const onPost = (tweetId: string, postedId: string) => {
     console.log(`复制发帖 ${tweetId} -> ${postedId}`);
-    const watch = store.getWatch(targetUsername);
+    const watch = store.getWatch(posterId, targetId);
     if (!watch?.targetId) return;
     const dueAt = Date.now() + replyDelayMs;
     store.enqueueReplyJob({
@@ -173,12 +172,12 @@ try {
 
   /** 镜像一条推文（文本+图片）；单条失败只记录，不中断监听。 */
   async function mirrorOne(tweet: MirrorTweet) {
-    const watch = store.getWatch(targetUsername);
+    const watch = store.getWatch(posterId, targetId);
     if (!watch) return;
     telemetry.stage(`镜像帖子 ${tweet.id}`);
     try {
       const outcome = await mirrorTweet({ store, watch, tweet, postTweet: (t, m) => client.postTweet(t, m), uploadImage: (u) => client.uploadImage(u), onPost, beforePost });
-      if (outcome === 'posted') { store.setSinceId(targetUsername, tweet.id); console.log(`已镜像 @${targetUsername} 的推文 ${tweet.id}`); }
+      if (outcome === 'posted') { store.setSinceId(posterId, targetId, tweet.id); console.log(`已镜像 @${targetUsername} 的推文 ${tweet.id}`); }
     } catch (error) {
       if (rateLimited(error)) cooldownUntil = Date.now() + 15 * 60 * 1000;
       console.error(`镜像 ${tweet.id} 失败：${error instanceof Error ? error.message : String(error)}`);
@@ -188,7 +187,7 @@ try {
 
   /** 启动回填：复制目标最新 3 条帖子（文本+图片）。 */
   async function backfill() {
-    const watch = store.getWatch(targetUsername);
+    const watch = store.getWatch(posterId, targetId);
     if (!watch || !watch.targetId) return;
     telemetry.stage('回填最近帖子');
     const mirrorClient: MirrorClient = {
@@ -198,7 +197,7 @@ try {
     };
     try {
       const result = await mirrorNewPosts({ store, watch, client: mirrorClient, onPost, limit: 3, beforePost });
-      if (result.newestId && result.newestId !== watch.sinceId) store.setSinceId(targetUsername, result.newestId);
+      if (result.newestId && result.newestId !== watch.sinceId) store.setSinceId(posterId, targetId, result.newestId);
       console.log(`启动回填完成：复制 ${result.posted} 条，跳过 ${result.skipped} 条。`);
     } catch (error) {
       console.error(`启动回填失败（继续监听）：${error instanceof Error ? error.message : String(error)}`);
@@ -276,10 +275,10 @@ try {
       const now = Date.now();
       if (now < cooldownUntil) { await sleep(Math.min(cooldownUntil - now, 1000)); continue; }
       try {
-        const watch = store.getWatch(targetUsername);
+        const watch = store.getWatch(posterId, targetId);
         if (!watch) throw new Error('监控已被移除');
         const result = await mirrorNewPosts({ store, watch, client: mirrorClient, onPost, beforePost });
-        if (result.newestId && result.newestId !== watch.sinceId) store.setSinceId(targetUsername, result.newestId);
+        if (result.newestId && result.newestId !== watch.sinceId) store.setSinceId(posterId, targetId, result.newestId);
         if (result.posted) console.log(`已同步 ${result.posted} 条新帖；跳过 ${result.skipped} 条。`);
         if (once) break;
         await sleep(nextPollDelay());
@@ -295,8 +294,9 @@ try {
   /** 检查到期的回复爬取任务；串行启动 loop --loop-only --post。 */
   const processReplyJobs = async () => {
     if (stopping || replyChild) return;
-    const [job] = store.dueReplyJobs(Date.now(), 1);
-    if (!job || !store.claimReplyJob(job)) return;
+    const now = Date.now();
+    const [job] = store.dueReplyJobs(now, 1, posterId);
+    if (!job || !store.claimReplyJob(job, now)) return;
     console.log(`开始延迟回复爬取：${job.postUrl}（第 ${job.attempts + 1}/3 次）`);
     const args = ['scripts/loop/flow.ts', job.posterId, '--loop-only', '--post', job.postUrl, '--target', job.targetUsername,
       ...(replyAutoYes ? ['--yes'] : [])];
@@ -308,17 +308,19 @@ try {
     replyChild = null;
     try {
       if (code === 0) {
-        store.finishReplyJob(job, 'done', null);
-        console.log(`延迟回复爬取完成：${job.tweetId}`);
+        if (store.finishReplyJob(job, 'done', null)) console.log(`延迟回复爬取完成：${job.tweetId}`);
       } else {
-        store.finishReplyJob(job, 'failed', `exit ${code}`, Date.now() + replyRetryMs);
-        console.log(`延迟回复爬取失败：${job.tweetId}，${Math.round(replyRetryMs / 60_000)} 分钟后重试。`);
+        const retry = job.attempts + 1 < 3;
+        if (store.finishReplyJob(job, 'failed', `exit ${code}`, retry ? Date.now() + replyRetryMs : undefined))
+          console.log(`延迟回复爬取失败：${job.tweetId}，${retry ? `${Math.round(replyRetryMs / 60_000)} 分钟后重试` : '已达到重试上限'}。`);
       }
     } catch (error) {
       if (!stopping) console.error(`记录回复任务结果失败：${error instanceof Error ? error.message : String(error)}`);
     }
   };
   if (!backfillOnly && !once && !noReplyScheduler) {
+    const now = Date.now();
+    store.recoverStaleReplyJobs(new Date(now - 6 * 60 * 60 * 1000).toISOString(), now, posterId);
     replyScheduler = setInterval(() => {
       void processReplyJobs().catch((error) => console.error(`延迟回复任务调度失败：${error instanceof Error ? error.message : String(error)}`));
     }, replySchedulerMs);

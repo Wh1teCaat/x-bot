@@ -22,6 +22,7 @@ import { EXPORTER24_EXTENSION_ID } from '../browser/exporter24.ts';
 import { prepareInstrumentedExporter } from '../browser/exporter-instrumentation.ts';
 import { acquireBitWindow } from '../browser/bitbrowser-window-lease.ts';
 import { prepareBitWindowAccount, saveBitWindowAccount } from '../browser/bitbrowser-window-state.ts';
+import { LocalFollowClient } from '../follow/api-follow.ts';
 
 const telemetry = monitorProcess(process.env.X_RUNTIME_ACCOUNT_ID, 'clone');
 telemetry.stage('复制目标账号资料');
@@ -217,12 +218,27 @@ try {
     throw new Error('Cookie 或浏览器登录账号与本次运行账号不一致，已停止复制资料');
   }
   if (binding && bitWindow && bitWindow !== binding.windowId) await setBitPreferredWindow(accountId!, binding, bitWindow, false);
-  if (accountStore.getByUsername(owner)?.cloned && !dryRun && !updateOnly) {
+  const ownerRecord = expectedAccount ?? accountStore.getByUsername(owner);
+  if (ownerRecord?.cloned && !dryRun && !updateOnly) {
     console.log(`账号 @${owner} 已克隆，跳过。`);
     input.close();
     await cleanBrowser();
     accountStore.close();
     process.exit(0);
+  }
+  let childId: number | undefined;
+  if (!dryRun) {
+    childId = (ownerRecord ?? accountStore.upsert({ username: owner })).id;
+    const assigned = accountStore.getCloneTarget(childId);
+    const historicTarget = ownerRecord?.copiedFromUsername?.toLowerCase() === target.toLowerCase();
+    if (assigned?.username.toLowerCase() !== target.toLowerCase() && !historicTarget) {
+      const ids = ownerRecord?.authenticated && ownerRecord.uuid
+        ? await new LocalFollowClient().lookup(ownerRecord.uuid, [{ username: target }])
+        : {};
+      const targetId = ids[target.toLowerCase()] ?? null;
+      if (!accountStore.reserveCloneTarget(childId, { id: targetId, username: target }))
+        throw new Error(`目标 @${target} 已有子账号，或当前子账号已分配其他目标`);
+    }
   }
   xCircuit.guard(); await page.goto(`https://x.com/${target}`, { waitUntil: 'domcontentloaded' });
   const heading = page.getByTestId('UserName').first();
@@ -359,17 +375,7 @@ try {
   }
   if (actual.toLowerCase() !== suggestion.toLowerCase()) throw new Error(`无法确认用户名是否修改成功，当前显示 ${actual ? `@${actual}` : '未知'}；请人工检查`);
   console.log(`用户名已修改并核对：@${actual}`);
-  // 优先按授权行（旧用户名）找到已有 uuid，把 clone 结果合进同一行，避免令牌与 clone 信息分到两行。
-  const authorized = accountStore.getByUsername(owner);
-  accountStore.upsert({
-    uuid: authorized?.uuid ?? null,
-    username: actual,
-    cloned: true,
-    copiedFromUuid: null,
-    copiedFromUsername: target,
-    copiedFromName: name,
-    copiedAt: new Date().toISOString(),
-  });
+  accountStore.completeClone(childId!, { username: actual, name });
   }
 
 } catch (error) {
